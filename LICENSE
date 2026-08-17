@@ -1,0 +1,170 @@
+DSC Systems Non-Commercial Source-Available License
+Version 1.0
+
+Copyright (c) 2026 Ricardo Olsen / DSC Systems. All rights reserved.
+
+This software and the accompanying documentation ("the Software") are made
+available in source form under the terms set out below. The Software is not
+open source: it is source-available and restricted to non-commercial use.
+
+
+1. DEFINITIONS
+
+1.1 "Licensor" means Ricardo Olsen and DSC Systems, the copyright holders.
+
+1.2 "You" means the individual or legal entity exercising the rights granted
+    by this License.
+
+1.3 "Non-Commercial Use" means use that is not primarily intended for, or
+    directed towards, commercial advantage or monetary compensation. It
+    includes:
+      (a) personal use, study and experimentation;
+      (b) academic teaching and non-funded academic research;
+      (c) evaluation of the Software for a period of not more than ninety (90)
+          days, including evaluation by a commercial entity considering a
+          Commercial Licence;
+      (d) use by a registered charity or non-profit organisation in the direct
+          pursuit of its charitable or non-profit purpose.
+
+1.4 "Commercial Use" means any use that is not Non-Commercial Use. Without
+    limiting that, Commercial Use includes: use in or with any product,
+    device, system or service that is sold, leased, licensed or otherwise
+    supplied for a fee; use in the operation of a business, utility,
+    substation, plant or network; use in providing paid consulting,
+    engineering, integration, testing or support services; and use in funded
+    contract research.
+
+1.5 "Derivative Work" means any work that is based on, adapted from, or
+    incorporates any part of the Software.
+
+
+2. GRANT OF RIGHTS
+
+Subject to Your compliance with this License, the Licensor grants You a
+worldwide, royalty-free, non-exclusive, non-transferable, non-sublicensable
+licence to:
+
+  (a) use, reproduce and run the Software for Non-Commercial Use;
+  (b) study and modify the Software, and create Derivative Works, for
+      Non-Commercial Use;
+  (c) distribute the Software and Derivative Works, in source or binary form,
+      for Non-Commercial Use only, subject to Section 4.
+
+
+3. COMMERCIAL USE REQUIRES A SEPARATE LICENCE
+
+No right to Commercial Use is granted by this License. Any Commercial Use
+requires a separate written commercial licence from the Licensor. To obtain
+one, contact:
+
+    Ricardo Olsen / DSC Systems
+    https://www.linkedin.com/in/ricardo-olsen/
+
+4. CONDITIONS ON DISTRIBUTION
+
+If You distribute the Software or any Derivative Work, You must:
+
+  (a) include a complete, unmodified copy of this License with every copy;
+  (b) retain all copyright, patent, trademark and attribution notices present
+      in the Software;
+  (c) state prominently that the recipient's use is restricted to
+      Non-Commercial Use and that Commercial Use requires a separate licence
+      from the Licensor;
+  (d) clearly mark any files You have changed as modified, with the date of
+      modification;
+  (e) not impose any additional or different terms that conflict with, or
+      purport to remove, the restrictions in this License.
+
+You may not sublicense the Software. Each recipient receives their licence
+directly from the Licensor on these terms.
+
+
+5. RESTRICTIONS
+
+You may not:
+
+  (a) make any Commercial Use of the Software without a separate commercial
+      licence;
+  (b) remove, obscure or alter any notice of copyright, authorship or
+      licensing;
+  (c) use the names "DSC Systems", "Ricardo Olsen", or any trademark or logo
+      of the Licensor to endorse or promote products derived from the
+      Software, without prior written permission;
+  (d) assert or authorise the assertion of any patent claim against the
+      Licensor or any user of the Software in respect of the Software.
+
+
+6. THIRD-PARTY AND STANDARDS NOTICE
+
+The Software is an independent implementation of the publicly documented
+IEC 61850 protocol family. It is not derived from, and contains no code
+copied or mechanically translated from, any other IEC 61850 implementation.
+Interoperability with other implementations has been established by observing
+protocol behaviour on the wire only.
+
+The IEC 61850 standards are published by the International Electrotechnical
+Commission and are subject to their own copyright. This License grants no
+rights in the standards themselves, and no part of the standard text is
+reproduced here beyond short factual references. Users requiring the normative
+text must obtain it from the IEC.
+
+This Software is not certified, endorsed or conformance-tested by the IEC, by
+UCA International Users Group, or by any certification body.
+
+
+7. TERMINATION
+
+7.1 This License terminates automatically and immediately if You breach any of
+    its terms.
+
+7.2 If Your licence terminates, You must cease all use of the Software and
+    destroy all copies in Your possession or control.
+
+7.3 If You cure a breach within thirty (30) days of becoming aware of it, and
+    it is the first time You have been notified of a breach by the Licensor,
+    Your licence is reinstated provisionally.
+
+7.4 Sections 5, 6, 8, 9 and 10 survive termination.
+
+
+8. NO WARRANTY
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE, TITLE AND NON-INFRINGEMENT.
+
+
+9. LIMITATION OF LIABILITY
+
+IN NO EVENT SHALL THE LICENSOR BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+
+10. SAFETY-CRITICAL AND OPERATIONAL TECHNOLOGY DISCLAIMER
+
+The Software implements protocols used in electrical substation automation and
+other operational technology. It is provided for engineering, integration and
+research purposes. The Licensor does not warrant that the Software is suitable
+for controlling live electrical plant or any other safety-critical, real-time
+or life-critical system.
+
+YOU ARE SOLELY RESPONSIBLE FOR VALIDATING THE SOFTWARE FOR YOUR APPLICATION,
+FOR ANY SAFETY, PROTECTION AND INTERLOCKING FUNCTIONS, AND FOR COMPLIANCE WITH
+ALL APPLICABLE REGULATIONS AND SITE PROCEDURES BEFORE ANY OPERATIONAL USE.
+
+
+11. GENERAL
+
+11.1 This License is the entire agreement between You and the Licensor
+     concerning the Software.
+
+11.2 If any provision is held unenforceable, it shall be modified to the
+     minimum extent necessary to make it enforceable, and the remaining
+     provisions shall remain in full force.
+
+11.3 Failure by the Licensor to enforce any provision is not a waiver of it.
+
+11.4 This License is governed by the laws of Brazil, without regard to its
+     conflict of law provisions.

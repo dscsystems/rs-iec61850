@@ -1,0 +1,243 @@
+name: release
+
+# Cutting a release is pushing a tag. Everything else follows from that: the
+# binaries are built from the tagged commit and attached to a release of the
+# same name.
+#
+# The manual trigger rebuilds and re-uploads an existing tag, which is what a
+# transient runner failure needs; it never invents a tag of its own.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build and release, for example v0.1.0"
+        required: true
+      dry_run:
+        description: "Build every target but publish nothing"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+# Two runs for the same tag would race on the same release assets.
+concurrency:
+  group: release-${{ inputs.tag || github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  # Release binaries carry the terminal UI. TLS stays off: rustls pulls in
+  # aws-lc-rs, whose C build would need a working cross toolchain for every
+  # target below, and none of these tools speak TLS anyway.
+  FEATURES: tui
+  # Debug symbols would multiply the download size for no benefit here. Set as
+  # an environment variable rather than in Cargo.toml so a local release build
+  # keeps its symbols.
+  CARGO_PROFILE_RELEASE_STRIP: symbols
+
+jobs:
+  # Nothing is published before the suite passes: a tagged binary is the one
+  # artefact nobody re-checks, so it must not be the first thing to run.
+  verify:
+    name: verify
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      prerelease: ${{ steps.tag.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: resolve the tag and check it against Cargo.toml
+        id: tag
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.tag || github.ref_name }}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+          # A hyphen marks a pre-release under semver: v0.2.0-rc.1.
+          if [ "${TAG#*-}" != "$TAG" ]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          # The binaries report the crate version, so a tag that disagrees with
+          # Cargo.toml would ship binaries that name a different release than
+          # the one they are attached to.
+          VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          if [ "$TAG" != "v$VERSION" ]; then
+            echo "::error::tag $TAG does not match the Cargo.toml version $VERSION"
+            exit 1
+          fi
+
+      - run: rustup update stable --no-self-update && rustup default stable
+      - run: cargo test --locked --features "$FEATURES"
+      - run: cargo clippy --locked --all-targets --features "$FEATURES" -- -D warnings
+
+  build:
+    name: ${{ matrix.target }}
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    # The wider targets are built on the same terms as the rest but are not
+    # allowed to hold up a release: an architecture nobody downloads must not
+    # be able to block the ones everybody does. A leg that fails here is
+    # reported and simply contributes no archive.
+    continue-on-error: ${{ matrix.optional || false }}
+    strategy:
+      # One target failing to link should not hide the state of the others.
+      fail-fast: false
+      matrix:
+        include:
+          # ---- required: the platforms this project is deployed on ----------
+          #
+          # Linux is cross-compiled from the x86_64 runner. Each non-native
+          # target needs its linker: rustc emits the objects, but only the
+          # matching binutils can link them.
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-latest }
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-latest, apt: musl-tools }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-latest, apt: gcc-aarch64-linux-gnu, linker: aarch64-linux-gnu-gcc }
+          # musl has no cross gcc in the Ubuntu archive, but the target's std
+          # ships self-contained startup objects, so rustc's bundled lld links
+          # it without any system toolchain. This crate is pure Rust, so there
+          # is nothing else for a C compiler to do.
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-latest, linker: rust-lld }
+          # 32-bit ARM covers the gateway class of substation hardware.
+          - { target: armv7-unknown-linux-gnueabihf, os: ubuntu-latest, apt: gcc-arm-linux-gnueabihf, linker: arm-linux-gnueabihf-gcc }
+
+          # macOS. The runner is Apple silicon and Xcode carries both slices,
+          # so the Intel build needs no extra setup.
+          - { target: aarch64-apple-darwin, os: macos-14 }
+          - { target: x86_64-apple-darwin, os: macos-14 }
+
+          - { target: x86_64-pc-windows-msvc, os: windows-latest }
+
+          # ---- optional: breadth, allowed to fail --------------------------
+          #
+          # Everything below is a tier-2 target with a prebuilt std. They are
+          # built when their toolchain cooperates and skipped when it does not.
+          - { target: armv7-unknown-linux-musleabihf, os: ubuntu-latest, linker: rust-lld, optional: true }
+          - { target: i686-unknown-linux-gnu, os: ubuntu-latest, apt: gcc-multilib, optional: true }
+          - { target: riscv64gc-unknown-linux-gnu, os: ubuntu-latest, apt: gcc-riscv64-linux-gnu, linker: riscv64-linux-gnu-gcc, optional: true }
+          - { target: powerpc64le-unknown-linux-gnu, os: ubuntu-latest, apt: gcc-powerpc64le-linux-gnu, linker: powerpc64le-linux-gnu-gcc, optional: true }
+          - { target: s390x-unknown-linux-gnu, os: ubuntu-latest, apt: gcc-s390x-linux-gnu, linker: s390x-linux-gnu-gcc, optional: true }
+          # The x64 Windows image carries the ARM64 MSVC tools, so this
+          # cross-links from the same runner when they are present.
+          - { target: aarch64-pc-windows-msvc, os: windows-latest, optional: true }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: install the cross toolchain
+        if: matrix.apt != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y ${{ matrix.apt }}
+
+      - name: point cargo at the cross linker
+        if: matrix.linker != ''
+        shell: bash
+        run: |
+          # CARGO_TARGET_<TARGET>_LINKER, with the target upper-cased and its
+          # hyphens turned into underscores.
+          VAR="CARGO_TARGET_$(echo '${{ matrix.target }}' | tr 'a-z-' 'A-Z_')_LINKER"
+          echo "$VAR=${{ matrix.linker }}" >> "$GITHUB_ENV"
+
+      - name: install the rust target
+        shell: bash
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+          rustup target add ${{ matrix.target }}
+
+      # --bins builds every binary whose required features are on, so iedx is
+      # included by the tui feature and nothing else has to be named.
+      - name: build
+        run: cargo build --locked --release --features ${{ env.FEATURES }} --bins --target ${{ matrix.target }}
+
+      - name: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          STAGE="rs-iec61850-${{ needs.verify.outputs.tag }}-${{ matrix.target }}"
+          BIN="target/${{ matrix.target }}/release"
+          mkdir "$STAGE"
+          for tool in ied-server ied-client goose-sniff iedx; do
+            for f in "$BIN/$tool" "$BIN/$tool.exe"; do
+              if [ -f "$f" ]; then
+                cp "$f" "$STAGE/"
+              fi
+            done
+          done
+          # The licence travels with the binaries: this is not permissive code,
+          # and whoever downloads an archive should find the terms inside it.
+          cp README.md LICENSE "$STAGE/"
+
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            7z a "$STAGE.zip" "$STAGE" >/dev/null
+            echo "ASSET=$STAGE.zip" >> "$GITHUB_ENV"
+          else
+            tar czf "$STAGE.tar.gz" "$STAGE"
+            echo "ASSET=$STAGE.tar.gz" >> "$GITHUB_ENV"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: ${{ env.ASSET }}
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: release
+    needs: [verify, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: checksum the archives
+        run: |
+          set -euo pipefail
+          cd dist
+          # find rather than a glob per extension, so removing a platform from
+          # the matrix does not leave an unmatched glob to fail on.
+          find . -maxdepth 1 -type f -name 'rs-iec61850-*' -printf '%f\0' \
+            | sort -z | xargs -0 sha256sum > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      # Creating the release last means a tag never has a half-populated
+      # release attached to it. Re-running a tag replaces the assets rather
+      # than failing on the release that is already there.
+      - name: publish
+        # A dry run proves the matrix still builds without touching a release,
+        # which is the only way to exercise this workflow without spending a
+        # tag on it.
+        if: ${{ !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.verify.outputs.tag }}
+          PRERELEASE: ${{ needs.verify.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            FLAGS=(--verify-tag --generate-notes --title "$TAG")
+            if [ "$PRERELEASE" = "true" ]; then
+              FLAGS+=(--prerelease)
+            fi
+            gh release create "$TAG" "${FLAGS[@]}" dist/*
+          fi

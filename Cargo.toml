@@ -1,0 +1,81 @@
+[package]
+name = "rs-iec61850"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+authors = ["Ricardo Olsen", "DSC Systems"]
+description = "A pure-Rust implementation of the IEC 61850 protocol family: MMS client/server, GOOSE, Sampled Values and SCL."
+readme = "README.md"
+repository = "https://github.com/dscsystems/rs-iec61850"
+license-file = "LICENSE"
+keywords = ["iec61850", "mms", "goose", "scada", "substation"]
+categories = ["network-programming", "embedded"]
+publish = false
+
+[lib]
+name = "iec61850"
+path = "src/lib.rs"
+
+[dependencies]
+thiserror = "2"
+tokio = { version = "1", features = [
+    "rt",
+    "rt-multi-thread",
+    "net",
+    "io-util",
+    "sync",
+    "time",
+    "macros",
+    # The bundled tools wait on ctrl-c; the library itself does not use it.
+    "signal",
+] }
+tokio-util = { version = "0.7", features = ["codec"] }
+bytes = "1"
+tracing = "0.1"
+quick-xml = "0.37"
+
+# TLS (IEC 62351-3) support.
+tokio-rustls = { version = "0.26", optional = true }
+rustls = { version = "0.23", optional = true }
+
+# Raw layer-2 access (AF_PACKET) on Linux.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[features]
+default = []
+tls = ["dep:tokio-rustls", "dep:rustls"]
+# Terminal UI client (iedx).
+tui = ["dep:ratatui", "dep:crossterm"]
+
+[dependencies.ratatui]
+version = "0.29"
+optional = true
+
+[dependencies.crossterm]
+version = "0.28"
+optional = true
+
+[[bin]]
+name = "ied-server"
+path = "src/bin/ied-server.rs"
+
+[[bin]]
+name = "ied-client"
+path = "src/bin/ied-client/main.rs"
+
+[[bin]]
+name = "goose-sniff"
+path = "src/bin/goose-sniff.rs"
+[[bin]]
+name = "iedx"
+path = "src/bin/iedx/main.rs"
+required-features = ["tui"]
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
