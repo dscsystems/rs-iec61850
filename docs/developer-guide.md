@@ -237,10 +237,16 @@ Points worth knowing before changing it:
   working cross toolchain for every target in the matrix. Leaving it off keeps
   the build pure Rust, which is what makes cross-compiling to a dozen targets a
   matter of naming a linker.
-- **Cross-compiling uses the Ubuntu cross gcc packages**, not a container.
-  musl targets have no cross gcc in the archive, so they link with rustc's
+- **Cross-compiling uses the Ubuntu cross gcc packages**, not a container. Each
+  one needs its `libc6-dev-<arch>-cross` named alongside it: that package is
+  only a *Recommends* of the compiler, so with `--no-install-recommends` the
+  crate compiles and then fails to link for want of `crt1.o`.
+- **musl targets have no cross gcc in the archive**, so they link with rustc's
   bundled `rust-lld` against the self-contained startup objects that ship with
   the target's std.
+- **The 32-bit targets are the ones that catch portability bugs.** `libc`
+  widths differ there (`timeval` is the usual offender), and a host-only clippy
+  run will not see it, so armv7 is in the required set deliberately.
 - A manual run (`workflow_dispatch`) rebuilds an existing tag; with `dry_run`
   it builds everything and publishes nothing, which is how to test a change to
   the workflow without spending a tag.

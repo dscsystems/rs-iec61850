@@ -17,6 +17,20 @@ const READ_BUFFER: usize = 9216;
 /// task would outlive its interface.
 const READ_TIMEOUT_MS: i64 = 200;
 
+/// The `timeval` for the read timeout.
+///
+/// Its fields are 64-bit on a 64-bit Linux and 32-bit on arm and x86, and musl
+/// is in the middle of widening its own. The casts are therefore written as
+/// `as _`, inferred from the field: naming `time_t` and `suseconds_t` builds
+/// everywhere too, but they are deprecated aliases on 32-bit musl and the
+/// warning would only show up on a target the host build never sees.
+fn read_timeout() -> libc::timeval {
+    libc::timeval {
+        tv_sec: (READ_TIMEOUT_MS / 1000) as _,
+        tv_usec: ((READ_TIMEOUT_MS % 1000) * 1000) as _,
+    }
+}
+
 #[derive(Debug)]
 pub struct AfPacket {
     fd: std::os::fd::RawFd,
@@ -81,10 +95,7 @@ impl AfPacket {
             return Err(Error::Frame(format!("bind {ifname}: {e}")));
         }
 
-        let tv = libc::timeval {
-            tv_sec: READ_TIMEOUT_MS / 1000,
-            tv_usec: (READ_TIMEOUT_MS % 1000) * 1000,
-        };
+        let tv = read_timeout();
         // SAFETY: tv is a valid timeval of the length given.
         let rc = unsafe {
             libc::setsockopt(

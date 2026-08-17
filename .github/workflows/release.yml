@@ -49,7 +49,7 @@ jobs:
       tag: ${{ steps.tag.outputs.tag }}
       prerelease: ${{ steps.tag.outputs.prerelease }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.tag || github.ref }}
 
@@ -101,14 +101,14 @@ jobs:
           # matching binutils can link them.
           - { target: x86_64-unknown-linux-gnu, os: ubuntu-latest }
           - { target: x86_64-unknown-linux-musl, os: ubuntu-latest, apt: musl-tools }
-          - { target: aarch64-unknown-linux-gnu, os: ubuntu-latest, apt: gcc-aarch64-linux-gnu, linker: aarch64-linux-gnu-gcc }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-latest, apt: gcc-aarch64-linux-gnu libc6-dev-arm64-cross, linker: aarch64-linux-gnu-gcc }
           # musl has no cross gcc in the Ubuntu archive, but the target's std
           # ships self-contained startup objects, so rustc's bundled lld links
           # it without any system toolchain. This crate is pure Rust, so there
           # is nothing else for a C compiler to do.
           - { target: aarch64-unknown-linux-musl, os: ubuntu-latest, linker: rust-lld }
           # 32-bit ARM covers the gateway class of substation hardware.
-          - { target: armv7-unknown-linux-gnueabihf, os: ubuntu-latest, apt: gcc-arm-linux-gnueabihf, linker: arm-linux-gnueabihf-gcc }
+          - { target: armv7-unknown-linux-gnueabihf, os: ubuntu-latest, apt: gcc-arm-linux-gnueabihf libc6-dev-armhf-cross, linker: arm-linux-gnueabihf-gcc }
 
           # macOS. The runner is Apple silicon and Xcode carries both slices,
           # so the Intel build needs no extra setup.
@@ -122,15 +122,15 @@ jobs:
           # Everything below is a tier-2 target with a prebuilt std. They are
           # built when their toolchain cooperates and skipped when it does not.
           - { target: armv7-unknown-linux-musleabihf, os: ubuntu-latest, linker: rust-lld, optional: true }
-          - { target: i686-unknown-linux-gnu, os: ubuntu-latest, apt: gcc-multilib, optional: true }
-          - { target: riscv64gc-unknown-linux-gnu, os: ubuntu-latest, apt: gcc-riscv64-linux-gnu, linker: riscv64-linux-gnu-gcc, optional: true }
-          - { target: powerpc64le-unknown-linux-gnu, os: ubuntu-latest, apt: gcc-powerpc64le-linux-gnu, linker: powerpc64le-linux-gnu-gcc, optional: true }
-          - { target: s390x-unknown-linux-gnu, os: ubuntu-latest, apt: gcc-s390x-linux-gnu, linker: s390x-linux-gnu-gcc, optional: true }
+          - { target: i686-unknown-linux-gnu, os: ubuntu-latest, apt: gcc-multilib libc6-dev-i386, optional: true }
+          - { target: riscv64gc-unknown-linux-gnu, os: ubuntu-latest, apt: gcc-riscv64-linux-gnu libc6-dev-riscv64-cross, linker: riscv64-linux-gnu-gcc, optional: true }
+          - { target: powerpc64le-unknown-linux-gnu, os: ubuntu-latest, apt: gcc-powerpc64le-linux-gnu libc6-dev-ppc64el-cross, linker: powerpc64le-linux-gnu-gcc, optional: true }
+          - { target: s390x-unknown-linux-gnu, os: ubuntu-latest, apt: gcc-s390x-linux-gnu libc6-dev-s390x-cross, linker: s390x-linux-gnu-gcc, optional: true }
           # The x64 Windows image carries the ARM64 MSVC tools, so this
           # cross-links from the same runner when they are present.
           - { target: aarch64-pc-windows-msvc, os: windows-latest, optional: true }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.tag || github.ref }}
 
@@ -138,6 +138,10 @@ jobs:
         if: matrix.apt != ''
         run: |
           sudo apt-get update
+          # The target's libc is only a Recommends of the cross gcc, so with
+          # --no-install-recommends it has to be asked for by name: without it
+          # the compiler installs, the crate compiles, and the link then fails
+          # for want of crt1.o.
           sudo apt-get install --no-install-recommends -y ${{ matrix.apt }}
 
       - name: point cargo at the cross linker
@@ -187,7 +191,7 @@ jobs:
             echo "ASSET=$STAGE.tar.gz" >> "$GITHUB_ENV"
           fi
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.target }}
           path: ${{ env.ASSET }}
@@ -199,11 +203,11 @@ jobs:
     needs: [verify, build]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.tag || github.ref }}
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
