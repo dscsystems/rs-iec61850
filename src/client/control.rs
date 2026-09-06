@@ -422,17 +422,13 @@ impl ControlObject<'_> {
             Value::int8(opts.or_cat.code() as i8),
             Value::octet_string(opts.or_ident.clone()),
         ]);
-        let mut check = Value::bit_string(2);
-        check.set_bit(0, opts.interlock_check);
-        check.set_bit(1, opts.synchro_check);
-
         Value::structure(vec![
             value,
             origin,
             Value::uint8(ctl_num),
             Value::utc_time(SystemTime::now(), TimeQuality::accuracy(10)),
             Value::boolean(opts.test),
-            check,
+            check_bits(opts),
         ])
     }
 
@@ -462,10 +458,46 @@ fn component_spec(ts: &TypeSpec, name: &str) -> Option<TypeSpec> {
         .map(|c| c.spec.clone())
 }
 
+/// Builds the operate `Check` bit string.
+///
+/// Check is the ordered packed list of IEC 61850-7-2 Table 51: synchrocheck
+/// first, interlock-check second, so bit 0 — the first transmitted bit — is
+/// synchrocheck.
+fn check_bits(opts: &ControlOptions) -> Value {
+    let mut check = Value::bit_string(2);
+    check.set_bit(0, opts.synchro_check);
+    check.set_bit(1, opts.interlock_check);
+    check
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::mms::Component;
+
+    /// Pins Check to the ordering of IEC 61850-7-2 Table 51, whose packed
+    /// list runs synchrocheck then interlock-check, so synchrocheck takes
+    /// bit 0 — the first transmitted bit. Client and server agree with each
+    /// other under either assignment, so no round-trip test can catch a
+    /// transposition here; assert the encoding itself.
+    #[test]
+    fn the_operate_check_bits_follow_table_51() {
+        for (name, synchro, interlock, lead) in [
+            ("neither", false, false, 0x00u8),
+            ("synchro", true, false, 0x80),
+            ("interlock", false, true, 0x40),
+            ("both", true, true, 0xc0),
+        ] {
+            let opts = ControlOptions::new()
+                .with_synchro_check(synchro)
+                .with_interlock_check(interlock);
+            let check = check_bits(&opts);
+            assert_eq!(check.bit_len(), 2, "{name}: check is a 2-bit string");
+            assert_eq!(check.bit(0), synchro, "{name}: bit 0 is synchrocheck");
+            assert_eq!(check.bit(1), interlock, "{name}: bit 1 is interlock-check");
+            assert_eq!(check.bytes()[0], lead, "{name}: leading octet");
+        }
+    }
 
     #[test]
     fn control_errors_prefer_the_devices_own_diagnosis() {

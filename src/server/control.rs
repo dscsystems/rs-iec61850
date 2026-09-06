@@ -133,8 +133,9 @@ pub fn decode_oper(
         ctx.test = t.as_bool();
     }
     if let Some(check) = v.index(5) {
-        ctx.interlock_check = check.bit(0);
-        ctx.synchro_check = check.bit(1);
+        // Check per IEC 61850-7-2 Table 51: synchrocheck is bit 0.
+        ctx.synchro_check = check.bit(0);
+        ctx.interlock_check = check.bit(1);
     }
     ctx
 }
@@ -345,7 +346,7 @@ mod tests {
 
     fn oper_value(ctl_val: Value, ctl_num: u8) -> Value {
         let mut check = Value::bit_string(2);
-        check.set_bit(0, true); // interlock
+        check.set_bit(1, true); // interlock-check; bit 0 is synchrocheck
         Value::structure(vec![
             ctl_val,
             Value::structure(vec![
@@ -357,6 +358,35 @@ mod tests {
             Value::boolean(true), // test
             check,
         ])
+    }
+
+    /// The receiving half of the Check ordering of IEC 61850-7-2 Table 51:
+    /// bit 0 is synchrocheck, bit 1 interlock-check. A client-to-server test
+    /// cannot catch a transposition because both ends would move together, so
+    /// decode a bit string built by hand.
+    #[test]
+    fn decode_oper_reads_check_in_table_51_order() {
+        for (name, bit0, bit1) in [
+            ("neither", false, false),
+            ("synchro", true, false),
+            ("interlock", false, true),
+            ("both", true, true),
+        ] {
+            let mut check = Value::bit_string(2);
+            check.set_bit(0, bit0);
+            check.set_bit(1, bit1);
+            let oper = Value::structure(vec![
+                Value::boolean(true),
+                Value::structure(vec![Value::int8(2), Value::octet_string(Vec::new())]),
+                Value::uint8(1),
+                Value::utc_time_parts(0, 0, crate::mms::TimeQuality(0)),
+                Value::boolean(false),
+                check,
+            ]);
+            let ctx = decode_oper("LD/GGIO1.SPCSO1".into(), &oper, ConnId(1), None);
+            assert_eq!(ctx.synchro_check, bit0, "{name}: synchro from bit 0");
+            assert_eq!(ctx.interlock_check, bit1, "{name}: interlock from bit 1");
+        }
     }
 
     #[test]

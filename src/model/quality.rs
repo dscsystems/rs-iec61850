@@ -31,6 +31,10 @@ fn from_bits(v: &Value, width: usize) -> u32 {
 }
 
 /// The validity field of a [`Quality`] (bits 0 and 1).
+///
+/// The encoding is (bit 0, bit 1) as transmitted: good 00, invalid 01,
+/// reserved 10, questionable 11. Bit `i` of a [`Quality`] mask is bit-string
+/// position `i`, so "invalid" is the value with bit 1 set, not bit 0.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Validity {
     #[default]
@@ -44,8 +48,8 @@ impl Validity {
     pub fn from_bits(b: u16) -> Validity {
         match b & 3 {
             0 => Validity::Good,
-            1 => Validity::Invalid,
-            2 => Validity::Reserved,
+            1 => Validity::Reserved,
+            2 => Validity::Invalid,
             _ => Validity::Questionable,
         }
     }
@@ -53,8 +57,8 @@ impl Validity {
     pub fn bits(self) -> u16 {
         match self {
             Validity::Good => 0,
-            Validity::Invalid => 1,
-            Validity::Reserved => 2,
+            Validity::Reserved => 1,
+            Validity::Invalid => 2,
             Validity::Questionable => 3,
         }
     }
@@ -461,6 +465,27 @@ impl std::fmt::Display for ReasonCode {
 mod tests {
     use super::*;
 
+    /// Pins each validity to the bits it puts on the wire, per IEC 61850-7-3:
+    /// good 00, invalid 01, reserved 10, questionable 11, read as
+    /// (bit 0, bit 1) in transmission order. A round-trip test cannot catch a
+    /// transposition of invalid and reserved, so assert the encoding directly.
+    #[test]
+    fn each_validity_maps_to_its_wire_bits() {
+        for (name, v, bit0, bit1, lead) in [
+            ("good", Validity::Good, false, false, 0x00u8),
+            ("invalid", Validity::Invalid, false, true, 0x40),
+            ("reserved", Validity::Reserved, true, false, 0x80),
+            ("questionable", Validity::Questionable, true, true, 0xc0),
+        ] {
+            let value = Quality::GOOD.with_validity(v).value();
+            assert_eq!(value.bit(0), bit0, "{name}: bit 0");
+            assert_eq!(value.bit(1), bit1, "{name}: bit 1");
+            assert_eq!(value.bytes()[0], lead, "{name}: leading octet");
+            assert_eq!(Quality::from_value(&value).validity(), v, "{name}: decodes");
+            assert_eq!(v.to_string(), name, "{name}: Display");
+        }
+    }
+
     #[test]
     fn quality_round_trips_through_its_bit_string() {
         let q = Quality::GOOD.with_validity(Validity::Questionable) | Quality::OLD_DATA;
@@ -577,15 +602,15 @@ mod tests {
         assert_eq!(ReasonCode::from_value(&Value::None), ReasonCode(0));
         assert_eq!(Dbpos::from_value(&Value::None), Dbpos::Intermediate);
 
-        // A two-bit quality carries only the validity. Bit 0 is the low bit
-        // of that field, so it alone is invalid(01) and bit 1 alone is
-        // reserved(10).
+        // A two-bit quality carries only the validity, read as (bit 0, bit 1)
+        // in transmission order, so bit 0 alone is reserved(10) and bit 1
+        // alone is invalid(01).
         let mut short = Value::bit_string(2);
         short.set_bit(0, true);
-        assert_eq!(Quality::from_value(&short).validity(), Validity::Invalid);
+        assert_eq!(Quality::from_value(&short).validity(), Validity::Reserved);
 
         let mut short = Value::bit_string(2);
         short.set_bit(1, true);
-        assert_eq!(Quality::from_value(&short).validity(), Validity::Reserved);
+        assert_eq!(Quality::from_value(&short).validity(), Validity::Invalid);
     }
 }

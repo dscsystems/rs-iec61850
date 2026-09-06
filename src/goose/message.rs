@@ -56,26 +56,27 @@ impl Message {
             Some(t) => Value::utc_time(t, TimeQuality::accuracy(10)),
             None => Value::UtcTime([0; 8]),
         };
-        let pdu = cons(
-            pdu_tag(),
-            [
-                prim(context_primitive(0), self.go_cb_ref.as_bytes().to_vec()),
-                uint_elem(context_primitive(1), u64::from(self.time_allowed_to_live)),
-                prim(context_primitive(2), self.dat_set.as_bytes().to_vec()),
-                prim(context_primitive(3), self.go_id.as_bytes().to_vec()),
-                prim(context_primitive(4), t.bytes().to_vec()),
-                uint_elem(context_primitive(5), u64::from(self.st_num)),
-                uint_elem(context_primitive(6), u64::from(self.sq_num)),
-                bool_elem(context_primitive(7), self.test),
-                uint_elem(context_primitive(8), u64::from(self.conf_rev)),
-                bool_elem(context_primitive(9), self.nds_com),
-                uint_elem(
-                    context_primitive(10),
-                    u64::from(self.num_dat_set_entries),
-                ),
-                all_data,
-            ],
-        );
+        let mut fields = vec![
+            prim(context_primitive(0), self.go_cb_ref.as_bytes().to_vec()),
+            uint_elem(context_primitive(1), u64::from(self.time_allowed_to_live)),
+            prim(context_primitive(2), self.dat_set.as_bytes().to_vec()),
+        ];
+        // goID [3] is OPTIONAL in 8-1: an unset identifier is absent, not a
+        // zero-length VisibleString.
+        if !self.go_id.is_empty() {
+            fields.push(prim(context_primitive(3), self.go_id.as_bytes().to_vec()));
+        }
+        fields.extend([
+            prim(context_primitive(4), t.bytes().to_vec()),
+            uint_elem(context_primitive(5), u64::from(self.st_num)),
+            uint_elem(context_primitive(6), u64::from(self.sq_num)),
+            bool_elem(context_primitive(7), self.test),
+            uint_elem(context_primitive(8), u64::from(self.conf_rev)),
+            bool_elem(context_primitive(9), self.nds_com),
+            uint_elem(context_primitive(10), u64::from(self.num_dat_set_entries)),
+            all_data,
+        ]);
+        let pdu = cons(pdu_tag(), fields);
         let length = HEADER_LEN + pdu.size();
         let mut buf = Vec::with_capacity(length);
         buf.extend_from_slice(&self.app_id.to_be_bytes());
@@ -194,6 +195,49 @@ mod tests {
             app_id: 0x1000,
             anomalies: Anomalies::default(),
         }
+    }
+
+    /// Returns the top-level tag numbers of the goosePdu in `apdu`.
+    fn pdu_tags(apdu: &[u8]) -> Vec<u32> {
+        let content = Decoder::new(&apdu[HEADER_LEN..])
+            .expect(pdu_tag())
+            .expect("decodes a goosePdu");
+        let mut d = Decoder::new(content);
+        let mut tags = Vec::new();
+        while d.more() {
+            let (tag, _) = d.read_tlv().expect("reads a goosePdu field");
+            tags.push(tag.number);
+        }
+        tags
+    }
+
+    /// `goID [3]` is OPTIONAL in 8-1: unset means absent, not a zero-length
+    /// VisibleString. A subscriber filtering on goID must see it missing
+    /// rather than blank.
+    #[test]
+    fn an_unset_go_id_is_omitted_rather_than_sent_empty() {
+        let mut m = sample();
+        m.go_id = String::new();
+        let apdu = m.marshal();
+        assert!(
+            !pdu_tags(&apdu).contains(&3),
+            "an empty goID must not be encoded as [3]"
+        );
+
+        // Every other field still decodes with the optional one absent.
+        let back = parse(&apdu).expect("decodes");
+        assert_eq!(back.go_id, "");
+        assert_eq!(back.go_cb_ref, m.go_cb_ref);
+        assert_eq!(back.dat_set, m.dat_set);
+        assert_eq!(back.st_num, m.st_num);
+        assert_eq!(back.sq_num, m.sq_num);
+        assert_eq!(back.conf_rev, m.conf_rev);
+        assert_eq!(back.num_dat_set_entries, m.num_dat_set_entries);
+        assert_eq!(back.values.len(), 2);
+
+        // A set goID is still present.
+        m.go_id = "events".into();
+        assert!(pdu_tags(&m.marshal()).contains(&3));
     }
 
     #[test]
