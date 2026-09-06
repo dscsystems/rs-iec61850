@@ -242,11 +242,16 @@ mod tests {
         assert_eq!(format_rfc3339(0, 1), "1970-01-01T00:00:00.000000001Z");
     }
 
+    /// The offset is a microsecond rather than a nanosecond because
+    /// `SystemTime` does not resolve a nanosecond everywhere: on Windows it
+    /// ticks in 100 ns units, so `UNIX_EPOCH - 1ns` truncates back to the
+    /// epoch and the borrow under test never happens. A microsecond is
+    /// representable on every platform and exercises the same path.
     #[test]
     fn times_before_the_epoch_keep_a_positive_nanosecond_part() {
-        let t = UNIX_EPOCH - Duration::from_nanos(1);
+        let t = UNIX_EPOCH - Duration::from_micros(1);
         let (secs, nanos) = unix_parts(t);
-        assert_eq!((secs, nanos), (-1, 999_999_999));
+        assert_eq!((secs, nanos), (-1, 999_999_000));
         assert_eq!(from_unix(secs, nanos), t);
     }
 

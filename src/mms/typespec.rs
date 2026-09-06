@@ -177,9 +177,63 @@ impl TypeSpec {
     }
 }
 
+/// Bounds on a decoded `TypeSpecification`.
+///
+/// A type specification comes from a peer and
+/// [`default_value`](TypeSpec::default_value) materialises it, so every
+/// declared size is an allocation request from an untrusted source. The
+/// absurd ones are rejected at the decode boundary: a `Vec` of a trillion
+/// elements does not fail gracefully, it aborts the process.
+const MAX_ARRAY_ELEMENTS: usize = 1 << 16; // one declared array dimension
+const MAX_BIT_STRING_BITS: i64 = 1 << 16; // declared bit-string width
+const MAX_DEFAULT_VALUES: usize = 1 << 20; // total Values default_value may create
+
+/// Saturates just past [`MAX_DEFAULT_VALUES`], so that a deeply nested array
+/// cannot overflow the very count it is being checked against.
+const VALUE_CEILING: usize = MAX_DEFAULT_VALUES + 1;
+
+impl TypeSpec {
+    /// Returns how many [`Value`]s [`default_value`](TypeSpec::default_value)
+    /// would allocate, saturating at [`VALUE_CEILING`].
+    fn value_count(&self) -> usize {
+        match self.kind {
+            Some(Type::Array) => {
+                let per = self.element.as_deref().map_or(0, TypeSpec::value_count);
+                if per == 0 || self.elements == 0 {
+                    return 1;
+                }
+                if self.elements >= VALUE_CEILING / per {
+                    return VALUE_CEILING;
+                }
+                1 + self.elements * per
+            }
+            Some(Type::Structure) => {
+                let mut total = 1usize;
+                for c in &self.components {
+                    total = total.saturating_add(c.spec.value_count());
+                    if total >= VALUE_CEILING {
+                        return VALUE_CEILING;
+                    }
+                }
+                total
+            }
+            _ => 1,
+        }
+    }
+}
+
 /// Decodes one `TypeSpecification` element from `dec`.
 pub fn decode_type_spec(dec: &mut Decoder<'_>) -> Result<TypeSpec> {
-    decode_type_spec_at(dec, 0)
+    let ts = decode_type_spec_at(dec, 0)?;
+    // The per-field caps bound each dimension on its own; nested arrays still
+    // multiply, so the whole tree is costed once here.
+    let n = ts.value_count();
+    if n > MAX_DEFAULT_VALUES {
+        return Err(Error::protocol(format!(
+            "type specification materialises {n} values, over the {MAX_DEFAULT_VALUES} limit"
+        )));
+    }
+    Ok(ts)
 }
 
 fn decode_type_spec_at(dec: &mut Decoder<'_>, depth: usize) -> Result<TypeSpec> {
@@ -198,7 +252,13 @@ fn decode_type_spec_at(dec: &mut Decoder<'_>, depth: usize) -> Result<TypeSpec> 
             // An optional packed flag, which this implementation ignores.
             inner.optional(context_primitive(0))?;
             let nc = inner.expect(context_primitive(1))?;
-            let elements = asn1::decode_uint(nc)? as usize;
+            let declared = asn1::decode_uint(nc)?;
+            if declared > MAX_ARRAY_ELEMENTS as u64 {
+                return Err(Error::protocol(format!(
+                    "array of {declared} elements, over the {MAX_ARRAY_ELEMENTS} limit"
+                )));
+            }
+            let elements = declared as usize;
             let ec = inner.expect(context_constructed(2))?;
             let element = decode_type_spec_at(&mut Decoder::new(ec), depth + 1)?;
             TypeSpec::array(elements, element)
@@ -224,7 +284,15 @@ fn decode_type_spec_at(dec: &mut Decoder<'_>, depth: usize) -> Result<TypeSpec> 
         }
         TAG_DATA_BOOLEAN => TypeSpec::scalar(Type::Boolean),
         TAG_DATA_BIT_STRING => {
-            TypeSpec::sized(Type::BitString, asn1::decode_int(content)? as i32)
+            // A negative size is MMS's way of declaring a fixed-length bit
+            // string, so the magnitude is what has to be bounded.
+            let bits = asn1::decode_int(content)?;
+            if !(-MAX_BIT_STRING_BITS..=MAX_BIT_STRING_BITS).contains(&bits) {
+                return Err(Error::protocol(format!(
+                    "bit string of {bits} bits, over the {MAX_BIT_STRING_BITS} limit"
+                )));
+            }
+            TypeSpec::sized(Type::BitString, bits as i32)
         }
         TAG_DATA_INTEGER => TypeSpec::sized(Type::Integer, asn1::decode_uint(content)? as i32),
         TAG_DATA_UNSIGNED => TypeSpec::sized(Type::Unsigned, asn1::decode_uint(content)? as i32),
@@ -267,6 +335,89 @@ mod tests {
     fn round_trip(ts: &TypeSpec) -> TypeSpec {
         let encoded = ts.ber().expect("encodable").encode();
         decode_type_spec(&mut Decoder::new(&encoded)).expect("decode")
+    }
+
+    /// Encodes `array [1] { numberOfElements [1] n, elementType [2] elem }`
+    /// with `n` written straight out, so a size no constructor would accept
+    /// can still be put on the wire the way a peer would.
+    fn hostile_array(n: u64, elem: Element) -> Element {
+        cons(
+            context_constructed(TAG_DATA_ARRAY),
+            [
+                uint_elem(context_primitive(1), n),
+                cons(context_constructed(2), [elem]),
+            ],
+        )
+    }
+
+    /// Encodes `bit-string [4] IMPLICIT INTEGER` with an arbitrary width.
+    fn hostile_bit_string(bits: i64) -> Element {
+        crate::asn1::int_elem(context_primitive(TAG_DATA_BIT_STRING), bits)
+    }
+
+    /// Type specifications whose declared sizes are far larger than any real
+    /// model, encoded as a peer could send them. Each is a handful of octets,
+    /// so the cost of accepting one is unbounded relative to the cost of
+    /// sending it.
+    #[test]
+    fn decoding_rejects_hostile_declared_sizes() {
+        let boolean = || prim(context_primitive(TAG_DATA_BOOLEAN), Vec::new());
+        let cases: Vec<(&str, Element)> = vec![
+            // A 64-bit all-ones length, which is what a negative count
+            // arrives as once it is read as unsigned.
+            ("array/all-ones", hostile_array(u64::MAX, boolean())),
+            // 16 GiB of values from a dozen octets.
+            ("array/huge", hostile_array(1 << 31, boolean())),
+            // Each dimension is individually plausible; the product is not.
+            (
+                "array/nested",
+                hostile_array(
+                    MAX_ARRAY_ELEMENTS as u64,
+                    hostile_array(MAX_ARRAY_ELEMENTS as u64, boolean()),
+                ),
+            ),
+            // bit_string allocates size/8 octets: a fatal allocation
+            // failure, which aborts rather than unwinding.
+            ("bitstring/huge", hostile_bit_string(1 << 40)),
+            ("bitstring/min", hostile_bit_string(-(1i64 << 62))),
+        ];
+        for (name, element) in cases {
+            let encoded = element.encode();
+            let got = decode_type_spec(&mut Decoder::new(&encoded));
+            assert!(
+                got.is_err(),
+                "{name}: accepted a {}-octet spec: {:?}",
+                encoded.len(),
+                got.ok()
+            );
+        }
+    }
+
+    /// A specification within the limits still decodes and materialises.
+    #[test]
+    fn decoding_accepts_realistic_declared_sizes() {
+        let ts = TypeSpec::structure(vec![
+            Component {
+                name: "arr".into(),
+                spec: TypeSpec::array(256, TypeSpec::scalar(Type::Boolean)),
+            },
+            Component {
+                name: "q".into(),
+                spec: TypeSpec::sized(Type::BitString, 13),
+            },
+            Component {
+                name: "neg".into(),
+                spec: TypeSpec::sized(Type::BitString, -64),
+            },
+        ]);
+        let back = round_trip(&ts);
+        let v = back.default_value();
+        assert_eq!(v.len(), 3);
+        assert_eq!(v.index(0).unwrap().len(), 256, "array elements");
+        assert_eq!(v.index(1).unwrap().bit_len(), 13, "bit string width");
+        // A negative size is a fixed-length declaration: the default value is
+        // the full width, not an error.
+        assert_eq!(v.index(2).unwrap().bit_len(), 64, "fixed-width bit string");
     }
 
     #[test]
@@ -397,3 +548,4 @@ mod tests {
         assert!(decode_type_spec(&mut Decoder::new(&buf)).is_err());
     }
 }
+
