@@ -2,9 +2,13 @@
 //! reservation, applying the effect and confirming enhanced-security commands.
 
 use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use crate::asn1::{cons, context_constructed, prim, Element, TAG_SEQUENCE};
-use crate::mms::{data_element, Type, Value};
+use crate::asn1::{
+    cons, context_constructed, context_primitive, prim, Element, TAG_SEQUENCE, TAG_VISIBLE_STRING,
+};
+use crate::mms::{data_element, ServerConn, Type, Value};
 use crate::model::{AddCause, CtlModel, Fc, Model, ObjectReference, OrCat};
 
 use super::ConnId;
@@ -58,6 +62,36 @@ pub struct ControlCtx {
     pub conn: ConnId,
     /// The client's transport address, when the transport has one.
     pub peer: Option<SocketAddr>,
+
+    /// The CommandTermination owed for an enhanced-security operate; see
+    /// [`defer_termination`](ControlCtx::defer_termination).
+    pub(crate) term: Option<Arc<Termination>>,
+}
+
+impl ControlCtx {
+    /// Takes over the CommandTermination of an operate on an
+    /// enhanced-security object.
+    ///
+    /// The server then does not terminate the operate when the handler
+    /// accepts it. Instead the returned function is called once execution has
+    /// ended, with [`AddCause::NONE`] for success (CommandTermination+) or the
+    /// cause of failure (CommandTermination-, carrying a LastApplError). It
+    /// may be called from any thread; calls after the first are ignored. If
+    /// it has not been called within the object's `operTimeout`, the server
+    /// terminates the operate negatively with time-limit-over.
+    ///
+    /// For a select, a cancel or a normal-security object there is no
+    /// termination to defer, and the returned function does nothing.
+    pub fn defer_termination(&self) -> Box<dyn Fn(AddCause) + Send + Sync> {
+        match &self.term {
+            None => Box::new(|_| {}),
+            Some(term) => {
+                term.state.lock().unwrap().deferred = true;
+                let term = Arc::clone(term);
+                Box::new(move |cause| term.finish(cause))
+            }
+        }
+    }
 }
 
 /// Reports whether an item addresses a control attribute, returning the
@@ -108,6 +142,7 @@ pub fn decode_oper(
         select: false,
         conn,
         peer,
+        term: None,
     };
     if v.type_of() != Type::Structure {
         return ctx;
@@ -140,101 +175,113 @@ pub fn decode_oper(
     ctx
 }
 
-/// Returns the control model configured on an object.
-pub fn ctl_model_of(model: &Model, reference: &ObjectReference) -> CtlModel {
+/// Returns the control model an object declares, if it declares one. An
+/// object without `ctlModel` is treated as direct with normal security.
+pub fn declared_ctl_model(model: &Model, reference: &ObjectReference) -> Option<CtlModel> {
     model
         .attribute(&reference.child("ctlModel"), Fc::Cf)
         .and_then(|da| da.value.as_ref())
         .map(|v| CtlModel::from_code(v.as_i64() as u8))
-        .unwrap_or(CtlModel::DirectNormal)
+}
+
+/// Returns a millisecond CF attribute of a control object (`sboTimeout`,
+/// `operTimeout`) as a duration, zero when the object does not declare it.
+pub fn cf_millis(model: &Model, reference: &ObjectReference, name: &str) -> Duration {
+    model
+        .attribute(&reference.child(name), Fc::Cf)
+        .and_then(|da| da.value.as_ref())
+        .map(|v| Duration::from_millis(v.as_u64()))
+        .unwrap_or_default()
 }
 
 /// Reflects an accepted operate into the process image: the controllable
-/// object's `stVal` becomes the control value.
-pub fn apply_control(model: &mut Model, reference: &ObjectReference, ctl_val: &Value) {
+/// object's `stVal` becomes the control value, and the new status reports
+/// like any process change.
+pub(crate) fn apply_control(
+    model: &mut Model,
+    reference: &ObjectReference,
+    ctl_val: &Value,
+    changes: &mut super::tx::ChangeSet,
+) {
     let st_ref = reference.child("stVal");
     if let Some(da) = model.attribute_mut(&st_ref, Fc::St) {
-        if da.children.is_empty() {
-            da.value = Some(ctl_val.clone());
+        if da.children.is_empty() && *ctl_val != Value::None {
+            let old = da.value.replace(ctl_val.clone());
+            let trg = da.trg_ops;
+            super::tx::record(changes, st_ref, Fc::St, trg, old.as_ref(), ctl_val);
         }
     }
 }
 
-/// Materialises a `LastApplError` object into every logical device's `LLN0`
-/// that does not already define one.
+/// Builds an ObjectName in its domain-specific form.
+fn domain_specific_name(domain: &str, item: &str) -> Element {
+    cons(
+        context_constructed(1),
+        [
+            prim(TAG_VISIBLE_STRING, domain.as_bytes().to_vec()),
+            prim(TAG_VISIBLE_STRING, item.as_bytes().to_vec()),
+        ],
+    )
+}
+
+/// Builds an ObjectName in its VMD-specific form.
+fn vmd_specific_name(name: &str) -> Element {
+    prim(context_primitive(0), name.as_bytes().to_vec())
+}
+
+/// One `listOfVariable` entry: `SEQUENCE { variableSpecification name [0] }`.
+fn variable_entry(name: Element) -> Element {
+    cons(TAG_SEQUENCE, [cons(context_constructed(0), [name])])
+}
+
+/// The `LastApplError` structure (IEC 61850-8-1):
+/// `{ CntrlObj, Error, Origin { orCat, orIdent }, ctlNum, AddCause }`.
 ///
-/// It is where IEC 61850-7-2 puts the device's own diagnosis of a refused
-/// control, and where a client reads it from. A model that omits it (an SCL
-/// file need not declare it) would otherwise leave every refusal reported as a
-/// bare access error, with the additional cause lost.
-pub fn materialise_last_appl_error(model: &mut Model) {
-    for ld in &mut model.devices {
-        let Some(lln0) = ld.node_mut("LLN0") else {
-            continue;
-        };
-        if lln0.object("LastApplError").is_some() {
-            continue;
-        }
-        let attr = |name: &str, v: Value| crate::model::DataAttribute {
-            name: name.to_string(),
-            fc: Fc::St,
-            kind: Some(v.type_of()),
-            value: Some(v),
-            ..Default::default()
-        };
-        lln0.objects.push(crate::model::DataObject {
-            name: "LastApplError".to_string(),
-            attributes: vec![
-                attr("Error", Value::int32(0)),
-                crate::model::DataAttribute {
-                    name: "Origin".to_string(),
-                    fc: Fc::St,
-                    kind: Some(Type::Structure),
-                    children: vec![
-                        attr("orCat", Value::int8(0)),
-                        attr("orIdent", Value::octet_string(Vec::new())),
-                    ],
-                    ..Default::default()
-                },
-                attr("CtlNum", Value::uint8(0)),
-                attr("AddCause", Value::int32(0)),
-            ],
-            ..Default::default()
-        });
-    }
-}
-
-/// Records the additional cause of a refused control in `LLN0.LastApplError`,
-/// which is where a client looks for the device's own diagnosis.
-pub fn set_last_appl_error(
-    model: &mut Model,
+/// The reason is in `AddCause`. `Error` stays "no error": it concerns the
+/// test of an operate, not its refusal.
+pub fn last_appl_error_value(
     domain: &str,
+    ctl_item: &str,
     ctx: &ControlCtx,
     cause: AddCause,
-) {
-    let Some(lae) = model
-        .device_mut(domain)
-        .and_then(|ld| ld.node_mut("LLN0"))
-        .and_then(|ln| ln.object_mut("LastApplError"))
-    else {
-        return; // the model does not carry one, which is legal
-    };
-    if let Some(a) = lae.attribute_mut("AddCause") {
-        a.value = Some(Value::int32(i32::from(cause.0)));
-    }
-    if let Some(a) = lae.attribute_mut("Error") {
-        a.value = Some(Value::int32(1));
-    }
-    if let Some(a) = lae.attribute_mut("CtlNum") {
-        a.value = Some(Value::uint8(ctx.ctl_num));
-    }
-    if let Some(a) = lae.attribute_mut("Origin") {
-        // Origin is a structure of orCat and orIdent when the model has one.
-        if a.children.len() == 2 {
-            a.children[0].value = Some(Value::int8(ctx.origin.code() as i8));
-            a.children[1].value = Some(Value::octet_string(ctx.or_ident.as_bytes().to_vec()));
-        }
-    }
+) -> Value {
+    Value::structure(vec![
+        Value::visible_string(format!("{domain}/{ctl_item}")),
+        Value::int8(0),
+        Value::structure(vec![
+            Value::int8(ctx.origin.code() as i8),
+            Value::octet_string(ctx.or_ident.as_bytes().to_vec()),
+        ]),
+        Value::uint8(ctx.ctl_num),
+        Value::int8(cause.0 as i8),
+    ])
+}
+
+/// Builds the InformationReport of the VMD-specific variable `LastApplError`
+/// that tells a client why a control was refused. It is sent ahead of the
+/// negative response to the control it explains (IEC 61850-8-1).
+pub fn last_appl_error_report(
+    domain: &str,
+    ctl_item: &str,
+    ctx: &ControlCtx,
+    cause: AddCause,
+) -> Element {
+    let value = last_appl_error_value(domain, ctl_item, ctx, cause);
+    cons(
+        context_constructed(0), // informationReport [0]
+        [
+            // listOfVariable [0]
+            cons(
+                context_constructed(0),
+                [variable_entry(vmd_specific_name("LastApplError"))],
+            ),
+            // listOfAccessResult [0]
+            cons(
+                context_constructed(0),
+                data_element(&value).into_iter().collect::<Vec<_>>(),
+            ),
+        ],
+    )
 }
 
 /// Builds the InformationReport carrying a positive CommandTermination for an
@@ -243,20 +290,13 @@ pub fn set_last_appl_error(
 /// It echoes the operate value back under the same variable name, which is how
 /// a client matches the termination to the command it sent.
 pub fn command_termination_report(domain: &str, item: &str, oper: &Value) -> Element {
-    let name = cons(
-        context_constructed(1),
-        [
-            prim(crate::asn1::TAG_VISIBLE_STRING, domain.as_bytes().to_vec()),
-            prim(crate::asn1::TAG_VISIBLE_STRING, item.as_bytes().to_vec()),
-        ],
-    );
     cons(
         context_constructed(0), // informationReport [0]
         [
-            // The variable access specification: listOfVariable [0]
+            // listOfVariable [0]
             cons(
                 context_constructed(0),
-                [cons(TAG_SEQUENCE, [cons(context_constructed(0), [name])])],
+                [variable_entry(domain_specific_name(domain, item))],
             ),
             // listOfAccessResult [0]
             cons(
@@ -267,8 +307,138 @@ pub fn command_termination_report(domain: &str, item: &str, oper: &Value) -> Ele
     )
 }
 
+/// Builds the InformationReport carrying a negative CommandTermination: the
+/// `LastApplError` naming the cause, then the operate value (IEC 61850-8-1).
+pub fn command_termination_negative_report(
+    domain: &str,
+    item: &str,
+    oper: &Value,
+    last_appl_error: &Value,
+) -> Element {
+    cons(
+        context_constructed(0), // informationReport [0]
+        [
+            cons(
+                context_constructed(0),
+                [
+                    variable_entry(vmd_specific_name("LastApplError")),
+                    variable_entry(domain_specific_name(domain, item)),
+                ],
+            ),
+            cons(
+                context_constructed(0),
+                data_element(last_appl_error)
+                    .into_iter()
+                    .chain(data_element(oper))
+                    .collect::<Vec<_>>(),
+            ),
+        ],
+    )
+}
+
+/// The CommandTermination owed for one enhanced-security operate.
+///
+/// It is sent exactly once: by the server as soon as the operate is accepted,
+/// by a handler that deferred it, or with time-limit-over when `operTimeout`
+/// passes first.
+pub(crate) struct Termination {
+    send: Box<dyn Fn(AddCause) + Send + Sync>,
+    state: Mutex<TerminationState>,
+}
+
+#[derive(Default)]
+struct TerminationState {
+    done: bool,
+    deferred: bool,
+    timer: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl std::fmt::Debug for Termination {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let st = self.state.lock().unwrap();
+        f.debug_struct("Termination")
+            .field("done", &st.done)
+            .field("deferred", &st.deferred)
+            .finish()
+    }
+}
+
+impl Termination {
+    /// Returns a termination that sends through `conn` for the control
+    /// variable `ctl_item` of `domain`.
+    pub(crate) fn new(
+        conn: Arc<ServerConn>,
+        domain: &str,
+        ctl_item: &str,
+        ctx: &ControlCtx,
+        oper: &Value,
+    ) -> Arc<Termination> {
+        let (domain, ctl_item, oper) = (domain.to_string(), ctl_item.to_string(), oper.clone());
+        let ctx = ctx.clone();
+        Arc::new(Termination {
+            send: Box::new(move |cause| {
+                let report = if cause == AddCause::NONE {
+                    command_termination_report(&domain, &ctl_item, &oper)
+                } else {
+                    let lae = last_appl_error_value(&domain, &ctl_item, &ctx, cause);
+                    command_termination_negative_report(&domain, &ctl_item, &oper, &lae)
+                };
+                if conn.send_unconfirmed(report).is_err() {
+                    tracing::debug!(item = %ctl_item, "server: command termination send failed");
+                }
+            }),
+            state: Mutex::new(TerminationState::default()),
+        })
+    }
+
+    /// Sends the termination, unless it has been sent or discarded already.
+    pub(crate) fn finish(&self, cause: AddCause) {
+        {
+            let mut st = self.state.lock().unwrap();
+            if st.done {
+                return;
+            }
+            st.done = true;
+            if let Some(timer) = st.timer.take() {
+                timer.abort();
+            }
+        }
+        (self.send)(cause);
+    }
+
+    /// Drops the termination of an operate that was refused: a refused
+    /// operate is not terminated.
+    pub(crate) fn discard(&self) {
+        self.state.lock().unwrap().done = true;
+    }
+
+    pub(crate) fn is_deferred(&self) -> bool {
+        self.state.lock().unwrap().deferred
+    }
+
+    /// Terminates negatively with time-limit-over if the deferred termination
+    /// has not come within `limit` (no limit when it is zero).
+    pub(crate) fn supervise(self: &Arc<Self>, limit: Duration) {
+        if limit.is_zero() {
+            return;
+        }
+        let me = Arc::clone(self);
+        let timer = tokio::spawn(async move {
+            tokio::time::sleep(limit).await;
+            me.finish(AddCause::TIME_LIMIT_OVER);
+        });
+        let mut st = self.state.lock().unwrap();
+        if st.done {
+            timer.abort();
+        } else {
+            st.timer = Some(timer);
+        }
+    }
+}
+
 /// Builds the MMS item ID of an object's `Oper` attribute.
-pub fn oper_item(reference: &ObjectReference) -> String {
+#[cfg(test)]
+fn oper_item(reference: &ObjectReference) -> String {
     let path = reference.path();
     format!("{}$CO${}$Oper", path[0], path[1..].join("$"))
 }

@@ -67,7 +67,13 @@ impl Asdu {
             context_primitive(2),
             self.smp_cnt.to_be_bytes().to_vec(),
         ));
-        el.push(uint_elem(context_primitive(3), u64::from(self.conf_rev)));
+        // confRev [3] is OCTET STRING (SIZE(4)) in IEC 61850-9-2, not an
+        // INTEGER: a minimal encoding is a different length, and subscribers
+        // that check the size drop the whole ASDU.
+        el.push(prim(
+            context_primitive(3),
+            self.conf_rev.to_be_bytes().to_vec(),
+        ));
         if let Some(t) = self.refr_tm {
             let v = Value::utc_time(t, TimeQuality::accuracy(10));
             el.push(prim(context_primitive(4), v.bytes().to_vec()));
@@ -218,6 +224,28 @@ mod tests {
             smp_synch: SMP_SYNCH_GLOBAL,
             smp_rate: 80,
             sample: vec![0xaa; 64],
+        }
+    }
+
+    /// Pins the fixed-size OCTET STRING fields of the 9-2 ASDU: smpCnt is 2
+    /// octets and confRev 4, whatever their values. A subscriber that checks
+    /// the sizes rejects an ASDU with a minimal encoding.
+    #[test]
+    fn the_asdu_fixed_size_fields_keep_their_width() {
+        for rev in [0u32, 1, 0x80, 0x0102_0304, u32::MAX] {
+            let mut a = asdu(7);
+            a.conf_rev = rev;
+            let encoded = a.element().encode();
+            let content = Decoder::new(&encoded).expect(TAG_SEQUENCE).unwrap();
+            let mut widths = std::collections::HashMap::new();
+            let mut fd = Decoder::new(content);
+            while fd.more() {
+                let (tag, v) = fd.read_tlv().unwrap();
+                widths.insert(tag.number, v.len());
+            }
+            assert_eq!(widths[&2], 2, "confRev={rev:#x}: smpCnt width");
+            assert_eq!(widths[&3], 4, "confRev={rev:#x}: confRev width");
+            assert_eq!(parse_asdu(content).unwrap().conf_rev, rev);
         }
     }
 

@@ -199,8 +199,10 @@ let subscription = goose::Subscriber::new(eth).subscribe(
 Publishers run their own retransmission schedule in the background: each
 `publish` increments `stNum`, resets `sqNum` and supersedes the previous
 schedule, so a stale frame never follows a new state onto the wire. `m.anomalies`
-(`st_num_regressed`, `sq_num_gap`, `stale`) is how a lost frame or a restarted
-publisher becomes visible; a clean stream reports none.
+(`st_num_regressed`, `sq_num_gap`, `stale`, `entries_mismatch`) is how a lost
+frame or a restarted publisher becomes visible; a clean stream reports none.
+`subscribe_supervised` also reports a publisher that falls silent, as soon as
+its `timeAllowedToLive` passes.
 
 Sampled Values has a generic path (`sv::Subscriber::subscribe`, raw `Asdu`) and
 a 9-2LE fast path (`subscribe_le`, `LePublisher`). In the LE subscriber the
@@ -226,6 +228,16 @@ sample buffer is reused between calls, so copy anything you keep.
 - **`intg_pd` is always written to the server**, because zero means "no
   integrity period" and so cannot also mean "leave it alone". `opt_flds` and
   `trg_ops` are written only when non-zero.
+- **Only the triggers in `TrgOps` produce reports.** A block configured with
+  the integrity period alone reports no data changes; set
+  `TrgOps::DATA_CHANGE` (and `QUALITY_CHANGE`, `GI`) before enabling it.
+- **Status and measurands are not writable.** A server accepts client writes
+  to SP, SV and SE by default and to CF, DC or BL only when configured with
+  `Options::with_writable_fcs`; ST and MX are refused whatever it lists. Push
+  process values with `Server::update`.
+- **An enhanced-security `operate` waits for the CommandTermination.** A
+  handler that defers it with `ctx.defer_termination()` must call the returned
+  function, or the operate ends with time-limit-over after `operTimeout`.
 - **A control-block reference keeps its constraint** (`ied1LD0/LLN0.RP.urcb01`)
   and goes straight to `get_rcb`. A data object does not; there the constraint
   is a separate argument.

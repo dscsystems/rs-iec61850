@@ -270,6 +270,8 @@ pub struct ReportControl {
     pub trg_ops: Option<TrgOpsElem>,
     pub opt_fields: Option<OptFieldsElem>,
     pub rpt_enabled: Option<RptEnabled>,
+    /// The `indexed` attribute; absent means true.
+    pub indexed: bool,
 }
 
 /// Report and log trigger option flags.

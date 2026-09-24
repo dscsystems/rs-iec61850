@@ -1,6 +1,6 @@
 //! Dispatches MMS confirmed requests against the model.
 
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Instant;
 
 use crate::asn1::{
@@ -11,9 +11,11 @@ use crate::mms::{self, data_element, DataAccessError, Value};
 use crate::model::{self, AddCause, CtlModel, Fcda, ObjectReference};
 
 use super::control::{self, Phase};
+use super::select::SELECT_TIMEOUT;
 use super::rcb;
 use super::reporting;
 use super::server::Inner;
+use super::tx::{self, ChangeSet};
 use super::{access, ConnId};
 
 /// MMS confirmed service CHOICE tag numbers.
@@ -31,16 +33,36 @@ const SVC_FILE_CLOSE: u32 = 74;
 const SVC_FILE_DELETE: u32 = 76;
 const SVC_FILE_DIRECTORY: u32 = 77;
 
-/// How many names one `getNameList` page carries.
+/// The octets a paged response spends around its entries: the confirmed
+/// response's tag, length and invokeID, the service and list tags and lengths,
+/// and moreFollows.
+const PAGE_ENVELOPE: usize = 32;
+
+/// Takes as many of `elements` as fit in a response of `max_pdu` octets (zero
+/// for no limit), reporting whether any were left over.
 ///
-/// A client follows the continuation until the list is complete, so this only
-/// bounds the size of a single response.
-const PAGE_MAX: usize = 100;
+/// A page always carries at least one element, or a client could never make
+/// progress.
+fn fill_page(elements: impl IntoIterator<Item = Element>, max_pdu: usize) -> (Vec<Element>, bool) {
+    let budget = max_pdu.saturating_sub(PAGE_ENVELOPE);
+    let (mut page, mut used) = (Vec::new(), 0);
+    for el in elements {
+        if max_pdu > 0 && !page.is_empty() && used + el.size() > budget {
+            return (page, true);
+        }
+        used += el.size();
+        page.push(el);
+    }
+    (page, false)
+}
 
 /// Serves one association's requests against the shared server state.
 pub struct Handler {
     pub inner: Arc<Inner>,
     pub conn: ConnId,
+    /// What the write request in progress changed in the process image,
+    /// reported once its writes are all applied.
+    pub(crate) changes: Mutex<ChangeSet>,
 }
 
 impl std::fmt::Debug for Handler {
@@ -53,7 +75,7 @@ impl mms::Handler for Handler {
     async fn handle(
         &self,
         req: mms::Request,
-        _conn: &mms::ServerConn,
+        conn: &mms::ServerConn,
     ) -> mms::Result<Element> {
         tracing::debug!(
             service = req.service,
@@ -62,7 +84,7 @@ impl mms::Handler for Handler {
         );
         match req.service {
             SVC_IDENTIFY => Ok(self.identity()),
-            SVC_GET_NAME_LIST => self.get_name_list(&req.content),
+            SVC_GET_NAME_LIST => self.get_name_list(&req.content, conn.max_pdu),
             SVC_READ => self.read(&req.content),
             SVC_WRITE => self.write(&req.content),
             SVC_GET_VARIABLE_ACCESS => self.get_variable_access(&req.content),
@@ -70,7 +92,7 @@ impl mms::Handler for Handler {
             SVC_DEFINE_NAMED_VAR_LIST => self.define_nvl(&req.content),
             SVC_DELETE_NAMED_VAR_LIST => self.delete_nvl(&req.content),
             SVC_FILE_OPEN | SVC_FILE_READ | SVC_FILE_CLOSE | SVC_FILE_DELETE
-            | SVC_FILE_DIRECTORY => self.file_service(req.service, &req.content),
+            | SVC_FILE_DIRECTORY => self.file_service(req.service, &req.content, conn.max_pdu),
             _ => Err(mms::Error::Service(mms::ServiceError {
                 class: mms::ErrorClass(1),
                 code: 1, // unrecognized-service
@@ -94,7 +116,10 @@ impl Handler {
         )
     }
 
-    fn get_name_list(&self, content: &[u8]) -> mms::Result<Element> {
+    /// Answers GetNameList one page at a time: as many names as fit in the
+    /// association's maximum PDU, with moreFollows telling the client to
+    /// continue after the last one.
+    fn get_name_list(&self, content: &[u8], max_pdu: usize) -> mms::Result<Element> {
         let mut dec = Decoder::new(content);
         // objectClass [0] { basicObjectClass [0] INTEGER }
         let class_content = dec.expect(context_constructed(0))?;
@@ -126,15 +151,13 @@ impl Handler {
                 names.drain(..=i);
             }
         }
-        let more = names.len() > PAGE_MAX;
-        names.truncate(PAGE_MAX);
-
-        let list = cons(
-            context_constructed(0),
+        let (page, more) = fill_page(
             names
                 .into_iter()
                 .map(|n| prim(TAG_VISIBLE_STRING, n.into_bytes())),
+            max_pdu,
         );
+        let list = cons(context_constructed(0), page);
         Ok(cons(
             context_constructed(SVC_GET_NAME_LIST),
             [list, bool_elem(context_primitive(1), more)],
@@ -189,10 +212,29 @@ impl Handler {
         // comes back on success.
         if let Some((base, Phase::Sbo)) = control::split_control(item) {
             let reference = control::control_ref(domain, &base);
+            let (declared, sbo_timeout) = {
+                let model = self.inner.model.read().unwrap();
+                (
+                    control::declared_ctl_model(&model, &reference),
+                    control::cf_millis(&model, &reference, "sboTimeout"),
+                )
+            };
+            // Only an SBO-with-normal-security object is selected by reading
+            // SBO; an empty name tells the client the select failed.
+            if declared.is_some_and(|cm| cm != CtlModel::SboNormal) {
+                return data_element(&Value::visible_string(""))
+                    .unwrap_or_else(|| access_failure(DataAccessError::ObjectNonExistent));
+            }
+            let timeout = if sbo_timeout.is_zero() {
+                SELECT_TIMEOUT
+            } else {
+                sbo_timeout
+            };
             let taken = self.inner.selections.lock().unwrap().reserve(
                 &reference,
                 self.conn,
                 None,
+                timeout,
                 Instant::now(),
             );
             let name = if taken { reference.to_string() } else { String::new() };
@@ -245,6 +287,16 @@ impl Handler {
                 Err(code) => results.push(write_failure(code)),
             }
         }
+
+        // Written data and operated controls report like any other change,
+        // once the request is applied. The reports are held until the write's
+        // response is out.
+        let changes = std::mem::take(&mut *self.changes.lock().unwrap());
+        if !changes.is_empty() {
+            let mut model = self.inner.model.write().unwrap();
+            let conns = self.inner.conns.lock().unwrap();
+            self.inner.reports.on_update(&mut model, &conns, &changes);
+        }
         Ok(cons(context_constructed(SVC_WRITE), results))
     }
 
@@ -273,21 +325,62 @@ impl Handler {
             return Err(DataAccessError::ObjectAccessUnsupported);
         };
 
+        // Report and setting group control block attributes have their own
+        // rules; everything else is governed by the functional-constraint
+        // write policy.
+        let sgcb = super::settinggroup::is_sgcb_write(item)
+            .filter(|_| self.inner.setting_groups.contains_key(domain));
+        let control_block = rcb::rcb_key(domain, item).is_some() || sgcb.is_some();
+        if !control_block {
+            self.write_permitted(domain, da.fc)?;
+        }
+        if !value_fits(da, v) {
+            return Err(DataAccessError::TypeInconsistent);
+        }
+        // A control block's own rules run before anything is stored: a refused
+        // write must leave the block as it was.
+        if let Some(attr) = sgcb {
+            self.inner.setting_groups[domain].check_write(attr, v)?;
+        }
+        let rcb_attr = rcb::rcb_key(domain, item).map(|(_, attr)| attr);
+
         // The access hook sees the attribute and the proposed value, and its
         // refusal is what the client is told.
         let hook = self.inner.write_handler.read().unwrap().clone();
         if let Some(h) = hook {
             h(da, v)?;
         }
-        da.value = Some(v.clone());
+        let (fc, trg) = (da.fc, da.trg_ops);
+        // A report control block's rules need the model as a whole, so the
+        // attribute is looked up again once they have run.
+        if let Some(attr) = &rcb_attr {
+            self.inner
+                .reports
+                .check_rcb_write(&model, domain, item, attr, v, self.conn)?;
+        }
+        let da = model
+            .device_mut(domain)
+            .and_then(|ld| item.split('$').next().and_then(|n| ld.node_mut(n)))
+            .and_then(|ln| access::resolve_write(ln, item))
+            .ok_or(DataAccessError::ObjectAccessUnsupported)?;
+        let old = da.value.replace(v.clone());
+        if !control_block {
+            let (reference, _) = model::from_mms(domain, item);
+            tx::record(
+                &mut self.changes.lock().unwrap(),
+                reference,
+                fc,
+                trg,
+                old.as_ref(),
+                v,
+            );
+        }
 
-        // Report control block side effects: enabling, general interrogation,
-        // resync and purge.
-        if let Some((_, attr)) = rcb::rcb_key(domain, item) {
+        // Report control block side effects: reservation, enabling, general
+        // interrogation, resync, purge and a dataset change.
+        if let Some(attr) = rcb_attr {
             let conns = self.inner.conns.lock().unwrap();
-            let owner = Arc::downgrade(&self.inner);
             self.inner.reports.on_rcb_write(
-                &owner,
                 &mut model,
                 &conns,
                 domain,
@@ -306,7 +399,34 @@ impl Handler {
         Ok(())
     }
 
+    /// Applies the functional-constraint write policy (IEC 61850-7-2): only
+    /// the constraints the server made writable are, and an SE setting only
+    /// while a setting group is being edited.
+    fn write_permitted(
+        &self,
+        domain: &str,
+        fc: model::Fc,
+    ) -> std::result::Result<(), DataAccessError> {
+        if !self.inner.writable.contains(&fc) {
+            return Err(DataAccessError::ObjectAccessDenied);
+        }
+        if fc == model::Fc::Se {
+            let editing = self
+                .inner
+                .setting_groups
+                .get(domain)
+                .is_some_and(|m| m.editing() >= 1);
+            if !editing {
+                return Err(DataAccessError::TemporarilyUnavailable);
+            }
+        }
+        Ok(())
+    }
+
     /// Handles a write to a control attribute.
+    ///
+    /// A refused command is answered negatively and, ahead of that answer,
+    /// with a LastApplError report naming the cause (IEC 61850-8-1).
     fn control_write(
         &self,
         domain: &str,
@@ -316,16 +436,53 @@ impl Handler {
         let Some((base, phase)) = control::split_control(item) else {
             return Err(DataAccessError::ObjectAccessUnsupported);
         };
+        let phase_name = match phase {
+            Phase::Oper => "Oper",
+            Phase::Sbow => "SBOw",
+            Phase::Cancel => "Cancel",
+            // SBO is the select of normal security, and it is a read.
+            Phase::Sbo => return Err(DataAccessError::ObjectAccessDenied),
+        };
+        // The control structure is written whole; its members are not
+        // separately writable.
+        if !item.ends_with(&format!("${phase_name}")) || v.type_of() != mms::Type::Structure {
+            return Err(DataAccessError::TypeInconsistent);
+        }
         let reference = control::control_ref(domain, &base);
-        let peer = self
-            .inner
-            .conns
-            .lock()
-            .unwrap()
-            .get(&self.conn)
-            .and_then(|sc| sc.peer);
-        let mut ctx = control::decode_oper(reference.clone(), v, self.conn, peer);
+        let ctl_item = format!("{base}${phase_name}");
+        let sc = self.inner.conns.lock().unwrap().get(&self.conn).cloned();
+        let mut ctx =
+            control::decode_oper(reference.clone(), v, self.conn, sc.as_ref().and_then(|c| c.peer));
+        ctx.select = phase == Phase::Sbow;
+        let refuse = |ctx: &control::ControlCtx, cause: AddCause| {
+            if let Some(sc) = &sc {
+                let report = control::last_appl_error_report(domain, &ctl_item, ctx, cause);
+                if sc.send_unconfirmed_first(report).is_err() {
+                    tracing::debug!(item = %ctl_item, "server: LastApplError send failed");
+                }
+            }
+            Err(DataAccessError::ObjectAccessDenied)
+        };
         let now = Instant::now();
+
+        let (declared, sbo_timeout, oper_timeout) = {
+            let model = self.inner.model.read().unwrap();
+            (
+                control::declared_ctl_model(&model, &reference),
+                control::cf_millis(&model, &reference, "sboTimeout"),
+                control::cf_millis(&model, &reference, "operTimeout"),
+            )
+        };
+        let ctl_model = declared.unwrap_or(CtlModel::DirectNormal);
+        match declared {
+            // A status-only object offers no control service.
+            Some(CtlModel::StatusOnly) => return refuse(&ctx, AddCause::NOT_SUPPORTED),
+            // Select-with-value belongs to SBO with enhanced security only.
+            Some(cm) if phase == Phase::Sbow && cm != CtlModel::SboEnhanced => {
+                return refuse(&ctx, AddCause::NOT_SUPPORTED)
+            }
+            _ => {}
+        }
 
         if phase == Phase::Cancel {
             let cause = self.inner.selections.lock().unwrap().check_cancel(
@@ -335,19 +492,11 @@ impl Handler {
                 now,
             );
             if cause != AddCause::NONE {
-                self.reject_control(domain, &ctx, cause);
-                return Err(DataAccessError::ObjectAccessDenied);
+                return refuse(&ctx, cause);
             }
             self.inner.selections.lock().unwrap().clear(&reference);
             return Ok(());
         }
-
-        ctx.select = phase == Phase::Sbow;
-
-        let ctl_model = {
-            let model = self.inner.model.read().unwrap();
-            control::ctl_model_of(&model, &reference)
-        };
 
         // An SBO operate must belong to a live selection: made by this
         // connection, and carrying that select's control number.
@@ -359,8 +508,21 @@ impl Handler {
                 now,
             );
             if cause != AddCause::NONE {
-                self.reject_control(domain, &ctx, cause);
-                return Err(DataAccessError::ObjectAccessDenied);
+                return refuse(&ctx, cause);
+            }
+        }
+
+        // An enhanced-security operate is concluded by a CommandTermination,
+        // which the handler may take over (defer_termination).
+        if phase == Phase::Oper && declared.is_some_and(|cm| cm.is_enhanced()) {
+            if let Some(sc) = &sc {
+                ctx.term = Some(control::Termination::new(
+                    Arc::clone(sc),
+                    domain,
+                    &ctl_item,
+                    &ctx,
+                    v,
+                ));
             }
         }
 
@@ -370,23 +532,30 @@ impl Handler {
             None => AddCause::NONE,
         };
         if cause != AddCause::NONE {
-            self.reject_control(domain, &ctx, cause);
-            return Err(DataAccessError::ObjectAccessDenied);
+            if let Some(term) = &ctx.term {
+                term.discard();
+            }
+            return refuse(&ctx, cause);
         }
 
         if ctx.select {
             // SBOw reserves the object under the control number the operate
             // will have to repeat. A reservation another client holds is not
             // ours to take.
+            let timeout = if sbo_timeout.is_zero() {
+                SELECT_TIMEOUT
+            } else {
+                sbo_timeout
+            };
             let taken = self.inner.selections.lock().unwrap().reserve(
                 &reference,
                 self.conn,
                 Some(ctx.ctl_num),
+                timeout,
                 now,
             );
             if !taken {
-                self.reject_control(domain, &ctx, AddCause::OBJECT_ALREADY_SELECTED);
-                return Err(DataAccessError::ObjectAccessDenied);
+                return refuse(&ctx, AddCause::OBJECT_ALREADY_SELECTED);
             }
             return Ok(());
         }
@@ -394,30 +563,24 @@ impl Handler {
         // The operate is accepted: reflect it into the process image.
         {
             let mut model = self.inner.model.write().unwrap();
-            control::apply_control(&mut model, &reference, &ctx.value);
+            control::apply_control(
+                &mut model,
+                &reference,
+                &ctx.value,
+                &mut self.changes.lock().unwrap(),
+            );
         }
         self.inner.selections.lock().unwrap().clear(&reference);
 
-        // An enhanced control model confirms with a CommandTermination.
-        if ctl_model.is_enhanced() {
-            let conn = self.inner.conns.lock().unwrap().get(&self.conn).cloned();
-            if let Some(sc) = conn {
-                let report = control::command_termination_report(
-                    domain,
-                    &control::oper_item(&reference),
-                    v,
-                );
-                if sc.send_unconfirmed(report).is_err() {
-                    tracing::debug!(%reference, "server: command termination send failed");
-                }
+        if let Some(term) = &ctx.term {
+            if term.is_deferred() {
+                term.supervise(oper_timeout);
+            } else {
+                // Sent now, it is held until the operate's response is out.
+                term.finish(AddCause::NONE);
             }
         }
         Ok(())
-    }
-
-    fn reject_control(&self, domain: &str, ctx: &control::ControlCtx, cause: AddCause) {
-        let mut model = self.inner.model.write().unwrap();
-        control::set_last_appl_error(&mut model, domain, ctx, cause);
     }
 
     fn get_variable_access(&self, content: &[u8]) -> mms::Result<Element> {
@@ -494,7 +657,13 @@ impl Handler {
         let Some((ln_name, ds_name)) = list.split_once('$') else {
             return Err(DataAccessError::ObjectValueInvalid.into());
         };
-        let list_content = dec.expect(context_constructed(1))?; // listOfVariable [1]
+        // listOfVariable is [0] in ISO 9506-2. Earlier versions of this crate
+        // sent [1], the tag of the attributes response, so that is accepted
+        // too rather than refusing them.
+        let list_content = match dec.optional(context_constructed(0))? {
+            Some(c) => c,
+            None => dec.expect(context_constructed(1))?,
+        };
 
         let mut entries: Vec<Fcda> = Vec::new();
         let mut ld = Decoder::new(list_content);
@@ -553,7 +722,7 @@ impl Handler {
         ))
     }
 
-    fn file_service(&self, service: u32, content: &[u8]) -> mms::Result<Element> {
+    fn file_service(&self, service: u32, content: &[u8], max_pdu: usize) -> mms::Result<Element> {
         let Some(files) = &self.inner.files else {
             return Err(DataAccessError::ObjectAccessUnsupported.into());
         };
@@ -596,8 +765,15 @@ impl Handler {
             }
             SVC_FILE_READ => {
                 let id = asn1::decode_int(content).unwrap_or(0) as i32;
+                // A chunk fills what the association's PDU leaves after the
+                // response's own framing.
+                let limit = if max_pdu == 0 {
+                    super::file::FILE_CHUNK_SIZE
+                } else {
+                    max_pdu.saturating_sub(PAGE_ENVELOPE).max(1)
+                };
                 let (chunk, more) = files
-                    .read(id)
+                    .read(id, limit)
                     .ok_or(DataAccessError::ObjectNonExistent)?;
                 Ok(cons(
                     context_constructed(SVC_FILE_READ),
@@ -648,11 +824,7 @@ impl Handler {
                         entries.drain(..=i);
                     }
                 }
-                let more = entries.len() > PAGE_MAX;
-                entries.truncate(PAGE_MAX);
-
-                let seq = cons(
-                    TAG_SEQUENCE,
+                let (page, more) = fill_page(
                     entries.into_iter().map(|e| {
                         let mut attrs = cons(
                             context_constructed(1),
@@ -675,11 +847,12 @@ impl Handler {
                             ],
                         )
                     }),
+                    max_pdu,
                 );
                 Ok(cons(
                     context_constructed(SVC_FILE_DIRECTORY),
                     [
-                        cons(context_constructed(0), [seq]),
+                        cons(context_constructed(0), [cons(TAG_SEQUENCE, page)]),
                         bool_elem(context_primitive(1), more),
                     ],
                 ))
@@ -787,6 +960,49 @@ fn write_failure(code: DataAccessError) -> Element {
     uint_elem(context_primitive(0), u64::from(code.code()))
 }
 
+/// Reports whether `v` may replace `da`'s value: the same MMS type, the same
+/// width for a bit string, and within range for a sized integer.
+///
+/// Storing anything else would corrupt every later read and report of the
+/// attribute, so it is refused as type-inconsistent.
+pub(crate) fn value_fits(da: &model::DataAttribute, v: &Value) -> bool {
+    let want = match &da.value {
+        Some(cur) => cur.type_of(),
+        None => match da.kind {
+            Some(k) => k,
+            None => return true,
+        },
+    };
+    if want == mms::Type::None {
+        return true;
+    }
+    if v.type_of() != want {
+        return false;
+    }
+    match want {
+        mms::Type::BitString => da.value.as_ref().is_none_or(|cur| v.bit_len() == cur.bit_len()),
+        mms::Type::Integer => {
+            int_range(&da.btype).is_none_or(|(lo, hi)| (lo..=hi).contains(&v.as_i64()))
+        }
+        mms::Type::Unsigned => int_range(&da.btype)
+            .is_none_or(|(_, hi)| i128::from(v.as_u64()) <= i128::from(hi)),
+        _ => true,
+    }
+}
+
+/// The value range of a sized SCL integer `bType`.
+fn int_range(btype: &str) -> Option<(i64, i64)> {
+    Some(match btype {
+        "INT8" => (i64::from(i8::MIN), i64::from(i8::MAX)),
+        "INT16" => (i64::from(i16::MIN), i64::from(i16::MAX)),
+        "INT32" => (i64::from(i32::MIN), i64::from(i32::MAX)),
+        "INT8U" => (0, i64::from(u8::MAX)),
+        "INT16U" => (0, i64::from(u16::MAX)),
+        "INT32U" => (0, i64::from(u32::MAX)),
+        _ => return None,
+    })
+}
+
 /// Keeps the control model import used, since it is only referenced through a
 /// method call above.
 const _: fn(CtlModel) -> bool = CtlModel::has_select;
@@ -797,6 +1013,37 @@ const _: fn(&ObjectReference) -> &str = ObjectReference::as_str;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn leaf(btype: &str, v: Value) -> model::DataAttribute {
+        model::DataAttribute {
+            name: "setVal".into(),
+            fc: model::Fc::Sp,
+            kind: Some(v.type_of()),
+            btype: btype.into(),
+            value: Some(v),
+            ..Default::default()
+        }
+    }
+
+    /// A sized integer is refused outside its range, and a value of another
+    /// type or width never fits.
+    #[test]
+    fn a_value_fits_only_its_type_width_and_range() {
+        let u8_attr = leaf("INT8U", Value::uint8(0));
+        assert!(!value_fits(&u8_attr, &Value::uint32(300)), "300 into INT8U");
+        assert!(value_fits(&u8_attr, &Value::uint32(200)), "200 into INT8U");
+
+        let i16_attr = leaf("INT16", Value::int16(0));
+        assert!(!value_fits(&i16_attr, &Value::int32(-40_000)));
+        assert!(value_fits(&i16_attr, &Value::int32(-32_768)));
+
+        let f = leaf("FLOAT32", Value::float32(0.0));
+        assert!(!value_fits(&f, &Value::visible_string("1.0")), "another type");
+
+        let q = leaf("Quality", Value::bit_string(13));
+        assert!(!value_fits(&q, &Value::bit_string(8)), "another width");
+        assert!(value_fits(&q, &Value::bit_string(13)));
+    }
 
     #[test]
     fn object_names_decode_in_both_scopes() {

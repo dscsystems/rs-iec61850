@@ -6,6 +6,7 @@ use tokio::sync::Semaphore;
 use crate::mms::{self, BoxTransport, ObjectClass, State, Value};
 use crate::model::{Fc, ObjectReference};
 
+use super::controlreports::ControlReports;
 use super::{Error, Result};
 
 /// Configures a [`Client`].
@@ -98,6 +99,8 @@ pub struct Client {
     /// enforces its own limit by rejecting the excess, so honouring it here
     /// turns a protocol error into a short wait.
     outstanding: Semaphore,
+    /// The association's LastApplError and CommandTermination reports.
+    pub(crate) ctl: Arc<ControlReports>,
 }
 
 impl Client {
@@ -123,10 +126,24 @@ impl Client {
 
     fn from_conn(conn: mms::Conn) -> Client {
         let permits = conn.max_serv_outstanding().max(1) as usize;
+        let ctl = Arc::new(ControlReports::default());
+        let tracker = Arc::clone(&ctl);
+        conn.on_information_report(move |ir| tracker.handle(ir));
         Client {
             conn: Arc::new(conn),
             outstanding: Semaphore::new(permits),
+            ctl,
         }
+    }
+
+    /// Returns the most recent LastApplError the server reported on this
+    /// association.
+    ///
+    /// Operate, select and cancel already put its `AddCause` in their
+    /// [`ControlError`](super::ControlError); this is for control structures
+    /// written directly.
+    pub fn last_appl_error(&self) -> Option<super::LastApplError> {
+        self.ctl.latest()
     }
 
     /// Returns the underlying MMS connection, for services the ACSI layer does

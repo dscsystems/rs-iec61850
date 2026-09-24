@@ -1,5 +1,5 @@
 use std::sync::Mutex;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use crate::mms::{TimeQuality, Type, TypeSpec, Value};
 use crate::model::{AddCause, CtlModel, Fc, ObjectReference, OrCat};
@@ -12,6 +12,8 @@ pub enum Stage {
     Select,
     Operate,
     Cancel,
+    /// The CommandTermination that concludes an enhanced-security operate.
+    Termination,
 }
 
 impl std::fmt::Display for Stage {
@@ -20,6 +22,7 @@ impl std::fmt::Display for Stage {
             Stage::Select => "select",
             Stage::Operate => "operate",
             Stage::Cancel => "cancel",
+            Stage::Termination => "termination",
         })
     }
 }
@@ -83,7 +86,14 @@ pub struct ControlOptions {
     /// Overrides the control model instead of using the one read from
     /// `ctlModel`.
     pub model: Option<CtlModel>,
+    /// How long an enhanced-security operate waits for its
+    /// CommandTermination.
+    pub termination_timeout: Duration,
 }
+
+/// The default bound on the wait for the CommandTermination of an
+/// enhanced-security operate.
+pub const TERMINATION_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl Default for ControlOptions {
     fn default() -> ControlOptions {
@@ -94,6 +104,7 @@ impl Default for ControlOptions {
             interlock_check: false,
             synchro_check: false,
             model: None,
+            termination_timeout: TERMINATION_TIMEOUT,
         }
     }
 }
@@ -129,6 +140,14 @@ impl ControlOptions {
     #[must_use]
     pub fn with_synchro_check(mut self, on: bool) -> ControlOptions {
         self.synchro_check = on;
+        self
+    }
+
+    /// Bounds the wait for the CommandTermination of an enhanced-security
+    /// operate.
+    #[must_use]
+    pub fn with_termination_timeout(mut self, d: Duration) -> ControlOptions {
+        self.termination_timeout = d;
         self
     }
 
@@ -274,7 +293,8 @@ impl ControlObject<'_> {
         }
         // SBOw: write the operate structure. This opens the sequence, and the
         // operate that follows repeats its control number.
-        let oper = self.build_oper(value, opts, self.begin_sequence());
+        let num = self.begin_sequence();
+        let oper = self.build_oper(value, opts, num);
         let item = format!("{}$SBOw", self.object);
         let results = match self.client.mms().write(&self.domain, &[&item], &[oper]).await {
             Ok(r) => r,
@@ -285,7 +305,7 @@ impl ControlObject<'_> {
         };
         if let Some(Err(code)) = results.into_iter().next() {
             self.end_sequence();
-            let cause = self.last_appl_error().await;
+            let cause = self.last_appl_error("SBOw", num);
             return Err(ControlError::with_source(Stage::Select, cause, code).into());
         }
         Ok(())
@@ -294,8 +314,20 @@ impl ControlObject<'_> {
     async fn do_operate(&self, value: Value, opts: &ControlOptions) -> Result<()> {
         // Reuses the select's control number when a sequence is open; the
         // sequence ends here either way, since a retry is a new sequence.
-        let oper = self.build_oper(value, opts, self.begin_sequence());
+        let num = self.begin_sequence();
+        let oper = self.build_oper(value, opts, num);
         let item = format!("{}$Oper", self.object);
+
+        // An enhanced-security operate is concluded by a CommandTermination
+        // (IEC 61850-7-2); the interest is registered before the operate so
+        // the termination cannot arrive unobserved.
+        let model = opts.model.unwrap_or(self.model);
+        let term = model.is_enhanced().then(|| {
+            self.client
+                .ctl
+                .await_termination(&format!("{}/{item}", self.domain), num)
+        });
+
         let result = self.client.mms().write(&self.domain, &[&item], &[oper]).await;
         self.end_sequence();
 
@@ -303,14 +335,24 @@ impl ControlObject<'_> {
             ControlError::with_source(Stage::Operate, AddCause::UNKNOWN, e)
         })?;
         if let Some(Err(code)) = results.into_iter().next() {
-            let cause = self.last_appl_error().await;
+            let cause = self.last_appl_error("Oper", num);
             return Err(ControlError::with_source(Stage::Operate, cause, code).into());
         }
-        // Enhanced models confirm asynchronously with a CommandTermination;
-        // the positive write already says the operate was accepted, and
-        // awaiting the termination is left to the caller through the
-        // information-report stream.
-        Ok(())
+        let Some((rx, _guard)) = term else {
+            return Ok(());
+        };
+        match tokio::time::timeout(opts.termination_timeout, rx).await {
+            Ok(Ok(cause)) if cause == AddCause::NONE => Ok(()),
+            Ok(Ok(cause)) => Err(ControlError::new(Stage::Termination, cause).into()),
+            // The association ended with the termination still owed.
+            Ok(Err(_)) => Err(ControlError::new(Stage::Termination, AddCause::UNKNOWN).into()),
+            Err(elapsed) => Err(ControlError::with_source(
+                Stage::Termination,
+                AddCause::UNKNOWN,
+                elapsed,
+            )
+            .into()),
+        }
     }
 
     /// Aborts a selection or operation.
@@ -318,7 +360,8 @@ impl ControlObject<'_> {
     /// It carries the control number of the sequence being cancelled, which is
     /// how the server identifies it.
     pub async fn cancel(&self, opts: &ControlOptions) -> Result<()> {
-        let oper = self.build_oper(Value::boolean(false), opts, self.begin_sequence());
+        let num = self.begin_sequence();
+        let oper = self.build_oper(Value::boolean(false), opts, num);
         let item = format!("{}$Cancel", self.object);
         let result = self.client.mms().write(&self.domain, &[&item], &[oper]).await;
         self.end_sequence();
@@ -326,7 +369,8 @@ impl ControlObject<'_> {
         let results = result
             .map_err(|e| ControlError::with_source(Stage::Cancel, AddCause::UNKNOWN, e))?;
         if let Some(Err(code)) = results.into_iter().next() {
-            return Err(ControlError::with_source(Stage::Cancel, AddCause::UNKNOWN, code).into());
+            let cause = self.last_appl_error("Cancel", num);
+            return Err(ControlError::with_source(Stage::Cancel, cause, code).into());
         }
         Ok(())
     }
@@ -432,18 +476,13 @@ impl ControlObject<'_> {
         ])
     }
 
-    /// Reads `LastApplError` to recover the additional cause of a rejected
-    /// control, best effort.
-    async fn last_appl_error(&self) -> AddCause {
-        let vals = self
-            .client
-            .mms()
-            .read(&self.domain, &["LLN0$ST$LastApplError$AddCause"])
-            .await;
-        match vals.ok().and_then(|v| v.into_iter().next()) {
-            Some(v) if v.as_access_error().is_none() => AddCause(v.as_i64() as u8),
-            _ => AddCause::UNKNOWN,
-        }
+    /// Returns the additional cause the server gave for refusing `phase`
+    /// (`SBOw`, `Oper`, `Cancel`) with control number `num`: the LastApplError
+    /// it reports ahead of a negative response (IEC 61850-8-1).
+    fn last_appl_error(&self, phase: &str, num: u8) -> AddCause {
+        self.client
+            .ctl
+            .cause_for(&format!("{}/{}${phase}", self.domain, self.object), num)
     }
 }
 

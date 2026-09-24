@@ -95,31 +95,142 @@ impl Default for InitiateRequest {
     }
 }
 
-/// The 85-bit CBB bit string, enabling the services a client uses.
-///
-/// The set is the one substation clients advertise in practice: status,
-/// getNameList, identify, read, write, getVariableAccessAttributes, the
-/// named-variable-list services, the file services and informationReport.
-fn default_service_support() -> ServiceSupport {
-    let mut bits = BitString::new(85);
-    for bit in [
-        0, 1, 2, 4, 5, 6, 11, 12, 13, 14, 15, 16, 18, 19, 72, 73, 74, 76, 77, 79,
-    ] {
-        bits.set_bit(bit, true);
+impl InitiateRequest {
+    /// The answer of a server that names no parameters: the services every
+    /// IEC 61850 MMS server provides, and the mandatory parameter CBB.
+    ///
+    /// A server offering more (client-defined datasets, files, journals)
+    /// answers with its own parameters instead.
+    pub fn server_default() -> InitiateRequest {
+        InitiateRequest {
+            local_detail: 65000,
+            max_serv_outstanding: 10,
+            nesting_level: 10,
+            services: ServiceSupport::with(&[
+                service::GET_NAME_LIST,
+                service::IDENTIFY,
+                service::READ,
+                service::WRITE,
+                service::GET_VARIABLE_ACCESS_ATTRIBUTES,
+                service::GET_NAMED_VARIABLE_LIST_ATTRIBUTES,
+                service::INFORMATION_REPORT,
+                service::CONCLUDE,
+            ]),
+            max_serv_outstanding_calling: 0,
+            max_serv_outstanding_called: 0,
+            parameter_cbb_raw: None,
+        }
     }
-    ServiceSupport { bits, raw: None }
 }
 
-/// The parameter-support bit string (proposed): indexed bits str1(0), str2(1),
-/// vnam(2), valt(3), vadr(4), vsca(7), tpy(8), vlis(9)...
-fn parameter_cbb() -> BitString {
-    let mut bs = BitString::new(11);
-    bs.set_bit(2, true); // vnam
-    bs.set_bit(3, true); // valt
-    bs.set_bit(4, true); // vadr
-    bs.set_bit(5, true);
-    bs.set_bit(6, true);
+/// `ServiceSupportOptions` bit positions (ISO 9506-2), for building the
+/// `servicesSupported` bit string of an Initiate.
+pub mod service {
+    pub const STATUS: usize = 0;
+    pub const GET_NAME_LIST: usize = 1;
+    pub const IDENTIFY: usize = 2;
+    pub const READ: usize = 4;
+    pub const WRITE: usize = 5;
+    pub const GET_VARIABLE_ACCESS_ATTRIBUTES: usize = 6;
+    pub const DEFINE_NAMED_VARIABLE_LIST: usize = 11;
+    pub const GET_NAMED_VARIABLE_LIST_ATTRIBUTES: usize = 12;
+    pub const DELETE_NAMED_VARIABLE_LIST: usize = 13;
+    pub const READ_JOURNAL: usize = 65;
+    pub const FILE_OPEN: usize = 72;
+    pub const FILE_READ: usize = 73;
+    pub const FILE_CLOSE: usize = 74;
+    pub const FILE_DELETE: usize = 76;
+    pub const FILE_DIRECTORY: usize = 77;
+    pub const INFORMATION_REPORT: usize = 79;
+    pub const CONCLUDE: usize = 83;
+    pub const CANCEL: usize = 84;
+}
+
+/// The width of the `servicesSupported` bit string.
+const SERVICE_SUPPORT_BITS: usize = 85;
+
+impl ServiceSupport {
+    /// Returns a bitmap with the given [`service`] bits set.
+    pub fn with(services: &[usize]) -> ServiceSupport {
+        let mut bits = BitString::new(SERVICE_SUPPORT_BITS);
+        for &bit in services {
+            bits.set_bit(bit, true);
+        }
+        ServiceSupport { bits, raw: None }
+    }
+
+    /// Reports whether the bitmap advertises a [`service`] bit.
+    pub fn has(&self, service: usize) -> bool {
+        if self.bits.length == 0 {
+            if let Some(raw) = &self.raw {
+                return asn1::decode_bit_string(raw).is_ok_and(|bs| bs.bit(service));
+            }
+        }
+        self.bits.bit(service)
+    }
+}
+
+/// What this client issues or receives.
+///
+/// It is an honest statement, not a wish list: a server gating on it sees the
+/// services the client can actually take part in.
+fn default_service_support() -> ServiceSupport {
+    ServiceSupport::with(&[
+        service::GET_NAME_LIST,
+        service::IDENTIFY,
+        service::READ,
+        service::WRITE,
+        service::GET_VARIABLE_ACCESS_ATTRIBUTES,
+        service::DEFINE_NAMED_VARIABLE_LIST,
+        service::GET_NAMED_VARIABLE_LIST_ATTRIBUTES,
+        service::DELETE_NAMED_VARIABLE_LIST,
+        service::READ_JOURNAL,
+        service::FILE_OPEN,
+        service::FILE_READ,
+        service::FILE_CLOSE,
+        service::FILE_DELETE,
+        service::FILE_DIRECTORY,
+        service::INFORMATION_REPORT,
+        service::CONCLUDE,
+    ])
+}
+
+// `ParameterSupportOptions` bit positions (ISO 9506-2).
+const CBB_STR1: usize = 0; // arrays
+const CBB_STR2: usize = 1; // structures
+const CBB_VNAM: usize = 2; // named variables
+const CBB_VALT: usize = 3; // alternate access
+const CBB_VLIS: usize = 7; // named variable lists
+const PARAMETER_CBB_BITS: usize = 11;
+
+/// The parameter-support bit string this end proposes: str1, str2, vnam, valt
+/// and vlis, the set IEC 61850-8-1 makes mandatory.
+///
+/// Arrays and structures carry the data model and named variable lists carry
+/// datasets; without them a peer that honours the negotiated CBB refuses
+/// exactly the accesses IEC 61850 is built on.
+pub(crate) fn parameter_cbb() -> BitString {
+    let mut bs = BitString::new(PARAMETER_CBB_BITS);
+    for bit in [CBB_STR1, CBB_STR2, CBB_VNAM, CBB_VALT, CBB_VLIS] {
+        bs.set_bit(bit, true);
+    }
     bs
+}
+
+/// Returns the bit-string content octets of `ours` AND the proposed CBB.
+///
+/// The negotiated parameter CBB is what both ends support. A malformed
+/// proposal yields `ours` unchanged.
+pub(crate) fn intersect_parameter_cbb(ours: &BitString, proposed_raw: &[u8]) -> Vec<u8> {
+    let mut out = ours.clone();
+    if let Ok(proposed) = asn1::decode_bit_string(proposed_raw) {
+        for i in 0..out.length {
+            out.set_bit(i, ours.bit(i) && proposed.bit(i));
+        }
+    }
+    let mut buf = Vec::new();
+    asn1::append_bit_string(&mut buf, &out);
+    buf
 }
 
 /// Builds an MMS InitiateRequestPDU.
@@ -292,6 +403,18 @@ pub(crate) fn reject_reason_name(category: u32, code: u8) -> String {
             return n.to_string();
         }
     }
+    if category == 5 {
+        // pdu-error
+        let name = match code {
+            0 => Some("unknown-pdu-type"),
+            1 => Some("invalid-pdu"),
+            2 => Some("illegal-acse-mapping"),
+            _ => None,
+        };
+        if let Some(n) = name {
+            return n.to_string();
+        }
+    }
     format!("reject category {category} code {code}")
 }
 
@@ -328,6 +451,94 @@ pub(crate) fn drill_error_class(body: &[u8], depth: usize) -> Option<(u8, u8)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The client's proposed parameter CBB is the IEC 61850-8-1 mandatory set:
+    /// str1, str2, vnam, valt and vlis, and nothing else.
+    #[test]
+    fn the_proposed_parameter_cbb_is_the_mandatory_set() {
+        let cbb = parameter_cbb();
+        for (bit, want) in [
+            (0, true),  // str1
+            (1, true),  // str2
+            (2, true),  // vnam
+            (3, true),  // valt
+            (4, false), // vadr
+            (5, false), // vsca
+            (6, false), // tpy
+            (7, true),  // vlis
+            (8, false), // real
+            (10, false), // cei
+        ] {
+            assert_eq!(cbb.bit(bit), want, "CBB bit {bit}");
+        }
+        // On the wire: 5 unused bits, then str1 str2 vnam valt . . . vlis.
+        let mut wire = Vec::new();
+        asn1::append_bit_string(&mut wire, &cbb);
+        assert_eq!(wire, [0x05, 0xf1, 0x00]);
+    }
+
+    /// The client's servicesSupported lists what it takes part in, and none of
+    /// the type-definition or VMD-control services it has no part in.
+    #[test]
+    fn the_client_advertises_only_services_it_takes_part_in() {
+        let s = default_service_support();
+        for bit in [
+            service::GET_NAME_LIST,
+            service::IDENTIFY,
+            service::READ,
+            service::WRITE,
+            service::GET_VARIABLE_ACCESS_ATTRIBUTES,
+            service::DEFINE_NAMED_VARIABLE_LIST,
+            service::GET_NAMED_VARIABLE_LIST_ATTRIBUTES,
+            service::DELETE_NAMED_VARIABLE_LIST,
+            service::READ_JOURNAL,
+            service::FILE_OPEN,
+            service::FILE_READ,
+            service::FILE_CLOSE,
+            service::FILE_DIRECTORY,
+            service::INFORMATION_REPORT,
+            service::CONCLUDE,
+        ] {
+            assert!(s.has(bit), "service bit {bit} missing");
+        }
+        // defineNamedType, getNamedTypeAttributes, deleteNamedType, output,
+        // takeControl.
+        for bit in [14, 15, 16, 18, 19] {
+            assert!(!s.has(bit), "service bit {bit} claimed but not implemented");
+        }
+    }
+
+    /// The negotiated CBB is what both ends support.
+    #[test]
+    fn the_parameter_cbb_intersects_with_the_proposal() {
+        let mut theirs = BitString::new(11);
+        theirs.set_bit(0, true); // str1
+        theirs.set_bit(2, true); // vnam
+        theirs.set_bit(4, true); // vadr: not ours
+        let mut raw = Vec::new();
+        asn1::append_bit_string(&mut raw, &theirs);
+        let got = asn1::decode_bit_string(&intersect_parameter_cbb(&parameter_cbb(), &raw))
+            .expect("decodes");
+        for (bit, want) in [(0, true), (1, false), (2, true), (3, false), (4, false), (7, false)] {
+            assert_eq!(got.bit(bit), want, "negotiated CBB bit {bit}");
+        }
+        // A malformed proposal leaves ours unchanged.
+        let got = asn1::decode_bit_string(&intersect_parameter_cbb(&parameter_cbb(), &[]))
+            .expect("decodes");
+        assert_eq!(got, parameter_cbb());
+    }
+
+    #[test]
+    fn a_raw_bitmap_answers_has() {
+        let mut raw = Vec::new();
+        asn1::append_bit_string(&mut raw, &ServiceSupport::with(&[service::READ]).bits);
+        let s = ServiceSupport {
+            bits: BitString::default(),
+            raw: Some(raw),
+        };
+        assert!(s.has(service::READ));
+        assert!(!s.has(service::WRITE));
+    }
 
     #[test]
     fn initiate_parameters_round_trip() {
@@ -429,6 +640,7 @@ mod tests {
     fn reject_reasons_are_named_where_the_standard_names_them() {
         assert_eq!(reject_reason_name(1, 1), "unrecognized-service");
         assert_eq!(reject_reason_name(1, 6), "max-serv-outstanding-exceeded");
+        assert_eq!(reject_reason_name(5, 1), "invalid-pdu");
         assert_eq!(reject_reason_name(9, 3), "reject category 9 code 3");
     }
 

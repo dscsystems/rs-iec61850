@@ -142,12 +142,35 @@ pub struct ServiceError {
 
 impl std::fmt::Display for ServiceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let kind = if self.rejected { "reject" } else { "error" };
-        write!(f, "mms: service {kind}: {}({})", self.class, self.code)?;
+        if self.rejected {
+            // A reject's class is its RejectPDU category, a different enum from
+            // the service error classes.
+            write!(f, "mms: service reject: {}({})", reject_category(self.class.0), self.code)?;
+        } else {
+            write!(f, "mms: service error: {}({})", self.class, self.code)?;
+        }
         if !self.detail.is_empty() {
             write!(f, ": {}", self.detail)?;
         }
         Ok(())
+    }
+}
+
+/// Names a RejectPDU `rejectReason` category (ISO 9506-2).
+fn reject_category(category: u8) -> &'static str {
+    match category {
+        1 => "confirmed-requestPDU",
+        2 => "confirmed-responsePDU",
+        3 => "confirmed-errorPDU",
+        4 => "unconfirmedPDU",
+        5 => "pdu-error",
+        6 => "cancel-requestPDU",
+        7 => "cancel-responsePDU",
+        8 => "cancel-errorPDU",
+        9 => "conclude-requestPDU",
+        10 => "conclude-responsePDU",
+        11 => "conclude-errorPDU",
+        _ => "unknown",
     }
 }
 
@@ -235,11 +258,11 @@ mod tests {
 
         let e = ServiceError {
             rejected: true,
-            ..ServiceError::new(ErrorClass::SERVICE, 1).with_detail("unknown service")
+            ..ServiceError::new(ErrorClass(1), 1).with_detail("unknown service")
         };
         assert_eq!(
             e.to_string(),
-            "mms: service reject: service(1): unknown service"
+            "mms: service reject: confirmed-requestPDU(1): unknown service"
         );
     }
 }

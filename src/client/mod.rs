@@ -16,6 +16,7 @@
 //! ```
 
 mod control;
+mod controlreports;
 mod dataset;
 mod directory;
 mod file;
@@ -29,6 +30,7 @@ mod client;
 
 pub use client::{Client, Options};
 pub use control::{ControlError, ControlObject, ControlOptions, Stage};
+pub use controlreports::LastApplError;
 pub use dataset::{DataSet, DataSetEntry};
 pub use directory::{AcsiClass, DirectoryEntry};
 pub use file::FileReader;

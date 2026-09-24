@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::ethernet::{Interface, ETHER_TYPE_GOOSE};
@@ -56,12 +56,88 @@ pub struct Anomalies {
     pub sq_num_gap: bool,
     /// The inter-arrival time exceeded the previous `timeAllowedToLive`.
     pub stale: bool,
+    /// `numDatSetEntries` disagrees with the number of values in `allData`;
+    /// the message's data cannot be trusted.
+    pub entries_mismatch: bool,
 }
 
 impl Anomalies {
     /// Reports whether anything at all was flagged.
     pub fn any(self) -> bool {
-        self.st_num_regressed || self.sq_num_gap || self.stale
+        self.st_num_regressed || self.sq_num_gap || self.stale || self.entries_mismatch
+    }
+}
+
+/// The time-allowed-to-live deadlines of one supervised subscription.
+#[derive(Default)]
+struct Deadlines {
+    /// By control block: when its data goes stale, and whether that has been
+    /// reported for the current silence.
+    blocks: HashMap<String, (Instant, bool)>,
+    stopped: bool,
+}
+
+/// Time-allowed-to-live supervision (IEC 61850-8-1): a subscriber has to treat
+/// a control block's data as invalid once `timeAllowedToLive` passes without a
+/// message, which is how a failed publisher or a broken path is noticed.
+struct Supervision {
+    deadlines: Mutex<Deadlines>,
+    wake: Condvar,
+}
+
+impl Supervision {
+    /// Restarts a control block's deadline on a message.
+    fn arrived(&self, go_cb_ref: &str, tatl: Duration) {
+        if tatl.is_zero() {
+            return;
+        }
+        let mut d = self.deadlines.lock().unwrap();
+        d.blocks
+            .insert(go_cb_ref.to_string(), (Instant::now() + tatl, false));
+        self.wake.notify_one();
+    }
+
+    fn stop(&self) {
+        self.deadlines.lock().unwrap().stopped = true;
+        self.wake.notify_one();
+    }
+
+    /// Calls `expired` once for each silence, until stopped.
+    fn run(&self, expired: impl Fn(&str)) {
+        let mut d = self.deadlines.lock().unwrap();
+        loop {
+            if d.stopped {
+                return;
+            }
+            let now = Instant::now();
+            let due: Vec<String> = d
+                .blocks
+                .iter_mut()
+                .filter(|(_, (at, fired))| !*fired && *at <= now)
+                .map(|(r, (_, fired))| {
+                    *fired = true;
+                    r.clone()
+                })
+                .collect();
+            if !due.is_empty() {
+                drop(d);
+                for r in &due {
+                    expired(r);
+                }
+                d = self.deadlines.lock().unwrap();
+                continue;
+            }
+            let next = d
+                .blocks
+                .values()
+                .filter(|(_, fired)| !fired)
+                .map(|(at, _)| *at)
+                .min();
+            d = match next {
+                Some(at) => self.wake.wait_timeout(d, at - now).unwrap().0,
+                None => self.wake.wait(d).unwrap(),
+            };
+        }
     }
 }
 
@@ -140,17 +216,29 @@ impl SequenceTracker {
 ///
 /// Dropping it stops delivery just as calling [`stop`](Subscription::stop)
 /// does, so a subscription cannot outlive the scope that owns it by accident.
-#[derive(Debug)]
 pub struct Subscription {
     stopped: Arc<AtomicBool>,
     task: Option<std::thread::JoinHandle<()>>,
+    supervision: Option<Arc<Supervision>>,
+}
+
+impl std::fmt::Debug for Subscription {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Subscription")
+            .field("stopped", &self.stopped)
+            .field("supervised", &self.supervision.is_some())
+            .finish()
+    }
 }
 
 impl Subscription {
     /// Stops delivery. The reader thread exits on the next frame or when the
-    /// interface closes.
+    /// interface closes; supervision stops at once.
     pub fn stop(&self) {
         self.stopped.store(true, Ordering::SeqCst);
+        if let Some(s) = &self.supervision {
+            s.stop();
+        }
     }
 
     /// Stops delivery and waits for the reader thread to finish.
@@ -199,9 +287,42 @@ impl Subscriber {
         filter: Filter,
         callback: impl Fn(&Message) + Send + 'static,
     ) -> Subscription {
+        self.start(filter, callback, None)
+    }
+
+    /// [`subscribe`](Subscriber::subscribe) with time-allowed-to-live
+    /// supervision (IEC 61850-8-1).
+    ///
+    /// A subscriber has to treat a control block's data as invalid once
+    /// `timeAllowedToLive` passes without a message, which is how a failed
+    /// publisher or a broken path is noticed. `expired` is called with the
+    /// `goCbRef` when that happens, from a supervision thread, once per
+    /// silence: the next message from that control block ends it.
+    pub fn subscribe_supervised(
+        &self,
+        filter: Filter,
+        callback: impl Fn(&Message) + Send + 'static,
+        expired: impl Fn(&str) + Send + 'static,
+    ) -> Subscription {
+        let supervision = Arc::new(Supervision {
+            deadlines: Mutex::new(Deadlines::default()),
+            wake: Condvar::new(),
+        });
+        let watcher = Arc::clone(&supervision);
+        std::thread::spawn(move || watcher.run(expired));
+        self.start(filter, callback, Some(supervision))
+    }
+
+    fn start(
+        &self,
+        filter: Filter,
+        callback: impl Fn(&Message) + Send + 'static,
+        supervision: Option<Arc<Supervision>>,
+    ) -> Subscription {
         let stopped = Arc::new(AtomicBool::new(false));
         let iface = Arc::clone(&self.iface);
         let flag = Arc::clone(&stopped);
+        let watch = supervision.clone();
 
         let task = std::thread::spawn(move || {
             let mut tracker = SequenceTracker::new();
@@ -222,6 +343,13 @@ impl Subscriber {
                     continue;
                 }
                 m.anomalies = tracker.observe(&m, Instant::now());
+                m.anomalies.entries_mismatch = m.num_dat_set_entries as usize != m.values.len();
+                if let Some(s) = &watch {
+                    s.arrived(
+                        &m.go_cb_ref,
+                        Duration::from_millis(u64::from(m.time_allowed_to_live)),
+                    );
+                }
                 callback(&m);
             }
         });
@@ -229,6 +357,7 @@ impl Subscriber {
         Subscription {
             stopped,
             task: Some(task),
+            supervision,
         }
     }
 }
@@ -400,6 +529,76 @@ mod tests {
         assert_eq!(got, [(1, true), (2, false)], "got {got:?}");
         sub.stop();
         pub_.close();
+    }
+
+    /// A publisher that falls silent is noticed once its timeAllowedToLive
+    /// passes (IEC 61850-8-1): once, and not while it is retransmitting.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_silent_publisher_expires_once_after_its_time_allowed_to_live() {
+        use std::sync::atomic::AtomicUsize;
+        let (a, b) = ethernet::pipe();
+        let expired = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&expired);
+        let sub = Subscriber::new(Arc::new(b)).subscribe_supervised(
+            Filter::app_id(0x1000),
+            |_| {},
+            move |r| {
+                if r == "IED1LD0/LLN0$GO$gcb01" {
+                    count.fetch_add(1, Ordering::SeqCst);
+                }
+            },
+        );
+        let pub_ = Publisher::new(
+            Arc::new(a),
+            PublisherConfig {
+                app_id: 0x1000,
+                go_cb_ref: "IED1LD0/LLN0$GO$gcb01".into(),
+                dat_set: "ds".into(),
+                go_id: "g".into(),
+                retrans: vec![Duration::from_millis(20)], // TAL 40 ms
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        pub_.publish(vec![Value::boolean(true)]).unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            expired.load(Ordering::SeqCst),
+            0,
+            "expired while the publisher was retransmitting"
+        );
+        pub_.close();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(expired.load(Ordering::SeqCst), 1, "once per silence");
+        sub.stop();
+    }
+
+    /// numDatSetEntries that disagrees with allData is flagged.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_declared_entry_count_that_disagrees_is_flagged() {
+        let (a, b) = ethernet::pipe();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let tx = Mutex::new(tx);
+        let sub = Subscriber::new(Arc::new(b)).subscribe(Filter::any(), move |m| {
+            let _ = tx.lock().unwrap().send(m.anomalies.entries_mismatch);
+        });
+        let m = Message {
+            go_cb_ref: "gcb01".into(),
+            num_dat_set_entries: 3,
+            values: vec![Value::boolean(true), Value::boolean(false)],
+            ..Default::default()
+        };
+        a.write_frame(&crate::ethernet::Frame {
+            ether_type: ETHER_TYPE_GOOSE,
+            payload: m.marshal(),
+            ..Default::default()
+        })
+        .unwrap();
+        let flagged = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the message arrives");
+        assert!(flagged, "3 entries declared, 2 sent: not flagged");
+        sub.stop();
     }
 
     #[tokio::test(flavor = "multi_thread")]

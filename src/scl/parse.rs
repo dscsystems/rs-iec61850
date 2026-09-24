@@ -290,6 +290,7 @@ fn report_control_from(n: &Node) -> ReportControl {
         buffered: n.attr_bool("buffered", false),
         buf_time: n.attr_num("bufTime"),
         intg_pd: n.attr_num("intgPd"),
+        indexed: n.attr_bool("indexed", true),
         trg_ops: n.child("TrgOps").map(trg_ops_from),
         opt_fields: n.child("OptFields").map(|o| OptFieldsElem {
             seq_num: o.attr_bool("seqNum", false),

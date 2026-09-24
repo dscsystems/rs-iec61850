@@ -111,6 +111,10 @@ pub struct ReportControl {
     pub intg_pd: u32,
     /// The maximum number of enabled instances (indexed RCBs).
     pub rpt_enabled: usize,
+    /// SCL `indexed="false"`: the block has exactly one instance, named
+    /// `name` with no `01`..`99` suffix. The default, false, is the schema's
+    /// indexed form.
+    pub not_indexed: bool,
     /// How many reports a buffered control block retains while no subscriber
     /// is enabled. Zero leaves it to the server's own default, and it has no
     /// meaning for an unbuffered control block.

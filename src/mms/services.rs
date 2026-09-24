@@ -99,6 +99,27 @@ pub(crate) fn object_name(domain: &str, item: &str) -> Element {
     )
 }
 
+/// Builds a DefineNamedVariableList request:
+///
+/// ```text
+/// DefineNamedVariableList-Request ::= SEQUENCE {
+///   variableListName ObjectName,
+///   listOfVariable [0] IMPLICIT SEQUENCE OF ... }   (ISO 9506-2)
+/// ```
+///
+/// The list is `[0]`, not the `[1]` of the GetNamedVariableListAttributes
+/// response. A server that decodes strictly rejects `[1]` as an invalid PDU.
+fn define_named_variable_list_request(domain: &str, list_name: &str, members: &[VarRef]) -> Element {
+    let list = cons(
+        context_constructed(0),
+        members.iter().map(|m| variable_entry(&m.domain, &m.item)),
+    );
+    cons(
+        context_constructed(SVC_DEFINE_NAMED_VAR_LIST),
+        [object_name(domain, list_name), list],
+    )
+}
+
 /// Builds one `ListOfVariable` entry naming a domain variable.
 fn variable_entry(domain: &str, item: &str) -> Element {
     cons(
@@ -465,21 +486,7 @@ impl Conn {
         list_name: &str,
         members: &[VarRef],
     ) -> Result<()> {
-        let list = cons(
-            context_constructed(1), // listOfVariable [1]
-            members.iter().map(|m| {
-                cons(
-                    TAG_SEQUENCE,
-                    [cons(context_constructed(0), [object_name(&m.domain, &m.item)])],
-                )
-            }),
-        );
-        // DefineNamedVariableList-Request ::= SEQUENCE {
-        //   variableListName ObjectName, listOfVariable [1] SEQUENCE OF ... }
-        let req = cons(
-            context_constructed(SVC_DEFINE_NAMED_VAR_LIST),
-            [object_name(domain, list_name), list],
-        );
+        let req = define_named_variable_list_request(domain, list_name, members);
         let resp = self.call_inner(req).await?;
         let mut dec = Decoder::new(&resp);
         if dec
@@ -883,6 +890,34 @@ fn parse_journal_variables(content: &[u8], e: &mut JournalEntry) {
 mod tests {
     use super::*;
 
+    /// ISO 9506-2 tags DefineNamedVariableList's listOfVariable [0]. The [1]
+    /// of the attributes response is rejected by a strict server as an invalid
+    /// PDU, which silently breaks dataset creation on real devices.
+    #[test]
+    fn a_define_named_variable_list_request_tags_its_list_zero() {
+        let req = define_named_variable_list_request(
+            "LD",
+            "LLN0$DS",
+            &[VarRef::new("LD", "GGIO1$ST$Ind1$stVal")],
+        )
+        .encode();
+        let body = Decoder::new(&req)
+            .expect(context_constructed(SVC_DEFINE_NAMED_VAR_LIST))
+            .unwrap();
+        let mut d = Decoder::new(body);
+        let (name_tag, _) = d.read_tlv().unwrap();
+        assert_eq!(name_tag, context_constructed(1), "variableListName, domain-specific");
+        let list = d
+            .expect(context_constructed(0))
+            .expect("listOfVariable is [0]");
+        let entry = Decoder::new(list).expect(TAG_SEQUENCE).unwrap();
+        let spec = Decoder::new(entry).expect(context_constructed(0)).unwrap();
+        assert_eq!(
+            parse_object_name(spec).unwrap(),
+            VarRef::new("LD", "GGIO1$ST$Ind1$stVal")
+        );
+    }
+
     #[test]
     fn object_names_round_trip_in_both_scopes() {
         let domain_specific = object_name("ied1LD0", "GGIO1$MX$AnIn1").encode();
@@ -1054,3 +1089,4 @@ mod tests {
         assert!(e.last_modified.is_some());
     }
 }
+

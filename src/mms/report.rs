@@ -1,4 +1,4 @@
-use crate::asn1::{context_constructed, Decoder};
+use crate::asn1::{context_constructed, Decoder, TAG_SEQUENCE};
 
 use super::services::{parse_object_name, VarRef};
 use super::{decode_access_result, Value};
@@ -74,15 +74,26 @@ pub(crate) fn parse_information_report(body: &[u8]) -> Option<InformationReport>
 
 /// Decodes the `listOfVariable` form's VariableSpecifications.
 ///
-/// Each entry is a CHOICE whose `name [0]` alternative carries an ObjectName;
-/// other alternatives (address, variableDescription, scatteredAccess) leave an
-/// empty entry so the positions still line up with `listOfAccessResult`.
+/// `listOfVariable` is a `SEQUENCE OF SEQUENCE { variableSpecification,
+/// alternateAccess [5] OPTIONAL }` (ISO 9506-2), so the name sits inside each
+/// entry's SEQUENCE; an entry sent without it is accepted too.
+///
+/// Each specification is a CHOICE whose `name [0]` alternative carries an
+/// ObjectName; other alternatives (address, variableDescription,
+/// scatteredAccess) leave an empty entry so the positions still line up with
+/// `listOfAccessResult`.
 fn parse_var_spec_list(content: &[u8], rep: &mut InformationReport) {
     let mut dec = Decoder::new(content);
     while dec.more() {
-        let Ok((tag, vs)) = dec.read_tlv() else {
+        let Ok((mut tag, mut vs)) = dec.read_tlv() else {
             return;
         };
+        if tag == TAG_SEQUENCE {
+            let Ok(inner) = Decoder::new(vs).read_tlv() else {
+                return;
+            };
+            (tag, vs) = inner;
+        }
         let mut r = VarRef::default();
         if tag == context_constructed(0) {
             // name [0] ObjectName
@@ -98,7 +109,7 @@ fn parse_var_spec_list(content: &[u8], rep: &mut InformationReport) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::asn1::{cons, context_primitive, prim, TAG_SEQUENCE, TAG_VISIBLE_STRING};
+    use crate::asn1::{cons, context_primitive, prim, TAG_VISIBLE_STRING};
     use crate::mms::{data_element, Value};
 
     fn object_name(domain: &str, item: &str) -> crate::asn1::Element {
@@ -167,6 +178,48 @@ mod tests {
         assert_eq!(rep.var_refs[0].domain, "ied1LD0");
         assert_eq!(rep.values.len(), 2);
         assert!(rep.values[0].as_bool() && !rep.values[1].as_bool());
+    }
+
+    /// ISO 9506-2 wraps each `listOfVariable` entry in a SEQUENCE, the form a
+    /// CommandTermination or LastApplError arrives in. Missing it leaves the
+    /// name empty, and the client cannot tell what the report is about.
+    #[test]
+    fn a_sequence_wrapped_list_of_variable_entry_keeps_its_name() {
+        let mut buf = Vec::new();
+        cons(
+            context_constructed(0),
+            [
+                cons(
+                    TAG_SEQUENCE,
+                    [cons(
+                        context_constructed(0),
+                        [object_name("ied1LD0", "GGIO1$CO$SPCSO1$Oper")],
+                    )],
+                ),
+                // A VMD-specific name, as LastApplError is sent.
+                cons(
+                    TAG_SEQUENCE,
+                    [cons(
+                        context_constructed(0),
+                        [prim(context_primitive(0), b"LastApplError".to_vec())],
+                    )],
+                ),
+            ],
+        )
+        .append(&mut buf);
+        cons(
+            context_constructed(0),
+            [
+                data_element(&Value::boolean(true)).unwrap(),
+                data_element(&Value::boolean(false)).unwrap(),
+            ],
+        )
+        .append(&mut buf);
+
+        let rep = parse_information_report(&buf).expect("report parses");
+        assert_eq!(rep.var_names, ["GGIO1$CO$SPCSO1$Oper", "LastApplError"]);
+        assert_eq!(rep.var_refs[0].domain, "ied1LD0");
+        assert_eq!(rep.var_refs[1].domain, "", "VMD-specific");
     }
 
     /// Positions must still line up when a specification uses an alternative

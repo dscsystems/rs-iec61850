@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
-use crate::mms::Value;
+use crate::mms::{DataAccessError, Value};
 use crate::model::{
     DataAttribute, DataObject, Fc, LogicalDevice, Model, ObjectReference,
 };
@@ -200,7 +200,28 @@ pub fn is_sgcb_write(item: &str) -> Option<&str> {
 }
 
 impl SettingGroupManager {
-    /// Handles an `ActSG`, `EditSG` or `CnfEdit` write.
+    /// Validates an SGCB write before it is stored (IEC 61850-7-2 setting
+    /// group services).
+    ///
+    /// Only `ActSG`, `EditSG` and `CnfEdit` are writable. A group number
+    /// outside `1..=NumOfSG` is invalid (0 is also allowed for `EditSG`, which
+    /// ends editing), and confirming an edit needs one open.
+    pub fn check_write(&self, attr: &str, v: &Value) -> Result<(), DataAccessError> {
+        let st = self.state.lock().unwrap();
+        let n = i64::from(self.num_of_sg);
+        match attr {
+            "ActSG" if !(1..=n).contains(&v.as_i64()) => Err(DataAccessError::ObjectValueInvalid),
+            "EditSG" if !(0..=n).contains(&v.as_i64()) => Err(DataAccessError::ObjectValueInvalid),
+            "CnfEdit" if v.as_bool() && !(1..=self.num_of_sg).contains(&st.edit_sg) => {
+                Err(DataAccessError::TemporarilyUnavailable)
+            }
+            "ActSG" | "EditSG" | "CnfEdit" => Ok(()),
+            _ => Err(DataAccessError::ObjectAccessDenied),
+        }
+    }
+
+    /// Handles an `ActSG`, `EditSG` or `CnfEdit` write that
+    /// [`check_write`](SettingGroupManager::check_write) admitted.
     ///
     /// Called with the model write lock held, since switching groups rewrites
     /// every setting value in the device.
@@ -362,6 +383,48 @@ mod tests {
             .and_then(|da| da.value.as_ref())
             .map(Value::as_i32)
             .unwrap_or(-1)
+    }
+
+    /// SGCB writes are validated before they are stored: group numbers stay
+    /// within `1..=NumOfSG`, only the three service attributes are writable,
+    /// and an edit is confirmed only while one is open.
+    #[test]
+    fn sgcb_writes_are_validated_before_they_are_stored() {
+        let mut m = device_with_settings();
+        let mgrs = materialise_sgcbs(&mut m, 3);
+        let mgr = &mgrs["DEMOPROT"];
+
+        assert_eq!(
+            mgr.check_write("ActSG", &Value::uint8(9)),
+            Err(DataAccessError::ObjectValueInvalid)
+        );
+        assert_eq!(
+            mgr.check_write("ActSG", &Value::uint8(0)),
+            Err(DataAccessError::ObjectValueInvalid)
+        );
+        // 257 would once have truncated to group 1.
+        assert_eq!(
+            mgr.check_write("ActSG", &Value::uint32(257)),
+            Err(DataAccessError::ObjectValueInvalid)
+        );
+        assert_eq!(mgr.check_write("ActSG", &Value::uint8(2)), Ok(()));
+
+        assert_eq!(mgr.check_write("EditSG", &Value::uint8(0)), Ok(()), "0 ends editing");
+        assert_eq!(
+            mgr.check_write("EditSG", &Value::uint8(4)),
+            Err(DataAccessError::ObjectValueInvalid)
+        );
+        assert_eq!(
+            mgr.check_write("NumOfSG", &Value::uint8(5)),
+            Err(DataAccessError::ObjectAccessDenied)
+        );
+        assert_eq!(
+            mgr.check_write("CnfEdit", &Value::boolean(true)),
+            Err(DataAccessError::TemporarilyUnavailable),
+            "nothing is being edited"
+        );
+        mgr.on_sgcb_write(&mut m, "EditSG", &Value::uint8(2));
+        assert_eq!(mgr.check_write("CnfEdit", &Value::boolean(true)), Ok(()));
     }
 
     #[test]

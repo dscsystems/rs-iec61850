@@ -5,10 +5,10 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::SystemTime;
 
-use crate::asn1::Element;
 use crate::mms::Value;
 use crate::model::{
-    DataAttribute, DataObject, Fc, LogicalNode, Model, OptFlds, ReportControl, TrgOps,
+    DataAttribute, DataObject, Fc, Model, OptFlds, ReasonCode, ReportControl,
+    TrgOps,
 };
 
 use super::ConnId;
@@ -17,47 +17,128 @@ use super::ConnId;
 /// that sets no default.
 pub const DEFAULT_BUFFERED_REPORTS: usize = 256;
 
-/// One buffered report retained for delivery and resync.
+/// One report's content, captured when its events happen.
+///
+/// Everything that depends on the moment of transmission (the sequence
+/// number, segmentation, BufOvfl) is added when it is sent, so a buffered
+/// report is numbered in the order the client receives it.
 #[derive(Debug, Clone)]
-pub struct BufEntry {
-    /// The 8-octet EntryID.
+pub struct ReportEntry {
+    /// The 8-octet EntryID, for a BRCB.
     pub id: Vec<u8>,
-    /// The pre-built informationReport element.
-    pub element: Element,
+    /// TimeOfEntry.
+    pub time: SystemTime,
+    /// The included dataset member indices, ascending.
+    pub members: Vec<usize>,
+    /// One per member, as it was at the event.
+    pub values: Vec<Value>,
+    pub reasons: Vec<ReasonCode>,
+}
+
+impl ReportEntry {
+    pub fn new() -> ReportEntry {
+        ReportEntry {
+            id: Vec::new(),
+            time: SystemTime::now(),
+            members: Vec::new(),
+            values: Vec::new(),
+            reasons: Vec::new(),
+        }
+    }
+
+    /// Adds `other`'s members, keeping dataset order.
+    pub fn merge(&mut self, other: ReportEntry) {
+        for ((idx, v), r) in other.members.into_iter().zip(other.values).zip(other.reasons) {
+            let at = self.members.partition_point(|&m| m < idx);
+            self.members.insert(at, idx);
+            self.values.insert(at, v);
+            self.reasons.insert(at, r);
+        }
+    }
+
+    /// Reports whether any member is in both entries.
+    pub fn overlaps(&self, other: &ReportEntry) -> bool {
+        other.members.iter().any(|m| self.members.contains(m))
+    }
+}
+
+impl Default for ReportEntry {
+    fn default() -> ReportEntry {
+        ReportEntry::new()
+    }
 }
 
 /// The mutable runtime state of one report control block.
 #[derive(Debug, Default)]
 pub struct RcbRuntime {
     pub enabled: bool,
+    /// The subscriber while enabled.
     pub conn: Option<ConnId>,
-    pub seq_num: u32,
+    /// The client holding the block (IEC 61850-7-2): reserved explicitly
+    /// through Resv, or implicitly by the first client to write it. Nobody
+    /// else may change it until the owner lets go or leaves.
+    pub owner: Option<ConnId>,
+    /// The sequence number the next report carries.
+    pub sq_num: u32,
     /// Cancels the integrity-period task, when one is running.
     pub integrity: Option<tokio::task::AbortHandle>,
+    /// Bumped whenever the integrity task is replaced or stopped, so a task
+    /// that already woke cannot report for a subscription it no longer
+    /// belongs to.
+    pub integrity_gen: u64,
+
+    /// The events of an open buffer-time window (BufTm).
+    pub pending: Option<ReportEntry>,
+    pub pending_timer: Option<tokio::task::AbortHandle>,
+    /// Bumped whenever a window closes, for the same reason as
+    /// `integrity_gen`.
+    pub pending_gen: u64,
 
     // Buffered-report state, for a BRCB only.
-    /// Pending buffered reports, oldest first.
-    pub buffer: Vec<BufEntry>,
+    /// Retained reports, oldest first.
+    pub buffer: Vec<ReportEntry>,
+    /// The index in `buffer` of the next report to transmit.
+    pub next: usize,
     /// A monotonic EntryID source.
     pub entry_counter: u64,
     /// A client-requested resync point, from an EntryID write.
     pub resync_id: Option<Vec<u8>>,
-    /// Set when the buffer discarded unsent entries.
+    /// Set when entries were discarded before transmission.
     pub buf_overflow: bool,
+}
+
+impl RcbRuntime {
+    /// The position of the entry with EntryID `id`, if the buffer holds it.
+    pub fn buffer_index(&self, id: &[u8]) -> Option<usize> {
+        self.buffer.iter().position(|e| e.id == id)
+    }
+
+    pub fn purge(&mut self) {
+        self.buffer.clear();
+        self.next = 0;
+        self.buf_overflow = false;
+        self.resync_id = None;
+    }
+
+    pub fn stop_integrity(&mut self) {
+        if let Some(h) = self.integrity.take() {
+            h.abort();
+        }
+        self.integrity_gen += 1;
+    }
 }
 
 /// A report control block: its identity in the model plus its runtime state.
 #[derive(Debug)]
 pub struct RcbState {
     pub domain: String,
-    /// `LN$RP$name` or `LN$BR$name`.
+    /// `LN$RP$name01` or `LN$BR$name01`.
     pub item: String,
     pub ln_name: String,
     /// The name of the materialised data object holding the block's
     /// attributes.
     pub object_name: String,
     pub buffered: bool,
-    pub data_set: String,
     /// How many reports the buffer retains, for a BRCB.
     pub max_buffer: usize,
     pub state: Mutex<RcbRuntime>,
@@ -99,11 +180,7 @@ pub fn materialise_rcbs(m: &mut Model, buf_default: usize) -> HashMap<String, Rc
             let controls = ln.report_controls.clone();
             for rc in &controls {
                 let fc = if rc.buffered { Fc::Br } else { Fc::Rp };
-                // Report controls are indexed by default (IEC 61850-6):
-                // RptEnabled max="N" yields instances Name01..NameNN.
-                let n = rc.rpt_enabled.max(1);
-                for i in 1..=n {
-                    let inst_name = format!("{}{:02}", rc.name, i);
+                for inst_name in rcb_instance_names(rc) {
                     let object = build_rcb_object(&ld_name, &ln_name, rc, fc, &inst_name);
                     ln.objects.push(object);
                     let item = format!("{ln_name}${fc}${inst_name}");
@@ -115,7 +192,6 @@ pub fn materialise_rcbs(m: &mut Model, buf_default: usize) -> HashMap<String, Rc
                             ln_name: ln_name.clone(),
                             object_name: inst_name,
                             buffered: rc.buffered,
-                            data_set: rc.data_set.clone(),
                             max_buffer: buffer_depth(rc, buf_default),
                             state: Mutex::new(RcbRuntime::default()),
                         },
@@ -125,6 +201,19 @@ pub fn materialise_rcbs(m: &mut Model, buf_default: usize) -> HashMap<String, Rc
         }
     }
     registry
+}
+
+/// Names the instances of a control block (IEC 61850-6).
+///
+/// An indexed block, the default, has `RptEnabled max` instances named
+/// `Name01..NameNN`; an unindexed block is the single instance `Name`.
+pub fn rcb_instance_names(rc: &ReportControl) -> Vec<String> {
+    if rc.not_indexed {
+        return vec![rc.name.clone()];
+    }
+    (1..=rc.rpt_enabled.max(1))
+        .map(|i| format!("{}{:02}", rc.name, i))
+        .collect()
 }
 
 /// Materialises the standard URCB or BRCB attributes as a data object named
@@ -157,7 +246,9 @@ fn build_rcb_object(
         value: Some(v),
         ..Default::default()
     };
-    let rpt_id = rcb_rpt_id(rc, ld_name, ln_name);
+    // An empty RptID is kept empty: it means "use the control block's
+    // reference", which is resolved when a report is sent (rpt_id_of).
+    let rpt_id = rc.rpt_id.clone();
 
     let attributes = if rc.buffered {
         // Buffered reports carry an EntryID and a TimeofEntry, so those option
@@ -176,7 +267,7 @@ fn build_rcb_object(
             attr("GI", Value::boolean(false)),
             attr("PurgeBuf", Value::boolean(false)),
             attr("EntryID", Value::octet_string(vec![0u8; 8])),
-            attr("TimeofEntry", Value::binary_time(SystemTime::UNIX_EPOCH)),
+            attr("TimeofEntry", Value::binary_time(binary_time_epoch())),
             attr("ResvTms", Value::int16(0)),
         ]
     } else {
@@ -202,12 +293,21 @@ fn build_rcb_object(
     }
 }
 
-fn rcb_rpt_id(rc: &ReportControl, ld_name: &str, ln_name: &str) -> String {
-    if !rc.rpt_id.is_empty() {
-        return rc.rpt_id.clone();
+/// 1984-01-01, the zero of `BinaryTime`, which a TimeofEntry holds until the
+/// first entry.
+fn binary_time_epoch() -> SystemTime {
+    crate::time_util::from_unix(crate::time_util::BINARY_TIME_EPOCH_DAYS * 86_400, 0)
+}
+
+/// Returns the RptID a report carries: the RptID attribute, or when that is
+/// empty the control block instance's own reference (IEC 61850-7-2), which
+/// tells instances of one block apart.
+pub fn rpt_id_of(attr: &str, domain: &str, item: &str) -> String {
+    if attr.is_empty() {
+        format!("{domain}/{item}")
+    } else {
+        attr.to_string()
     }
-    let tag = if rc.buffered { "BR" } else { "RP" };
-    format!("{ld_name}/{ln_name}${tag}${}", rc.name)
 }
 
 /// Reports whether an item ID addresses a report control block, returning the
@@ -230,18 +330,10 @@ pub fn make_entry_id(n: u64) -> Vec<u8> {
     n.to_be_bytes().to_vec()
 }
 
-/// Looks up a materialised control-block attribute's current value.
-pub fn rcb_attr_value(ln: &LogicalNode, object_name: &str, attr: &str) -> Value {
-    ln.object(object_name)
-        .and_then(|o| o.attribute(attr))
-        .and_then(|a| a.value.clone())
-        .unwrap_or(Value::boolean(false))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::LogicalDevice;
+    use crate::model::{LogicalDevice, LogicalNode};
     use crate::scl;
 
     fn model_with_rcbs() -> (Model, HashMap<String, RcbState>) {
@@ -359,28 +451,33 @@ mod tests {
         assert!(opt.has(OptFlds::BUF_OVFL));
     }
 
+    /// An empty RptID stays empty in the block; a report carries the block
+    /// instance's own reference instead, which tells instances of one block
+    /// apart. A configured one wins.
     #[test]
-    fn a_block_without_a_report_id_gets_the_standard_one() {
+    fn an_empty_report_id_means_the_instances_reference() {
+        assert_eq!(
+            rpt_id_of("", "ied1LD0", "LLN0$RP$urcb01"),
+            "ied1LD0/LLN0$RP$urcb01"
+        );
+        assert_eq!(rpt_id_of("custom", "ied1LD0", "LLN0$RP$urcb01"), "custom");
+    }
+
+    /// IEC 61850-6: an unindexed block is a single instance under its own
+    /// name, whatever RptEnabled says.
+    #[test]
+    fn an_unindexed_block_is_one_instance_under_its_own_name() {
         let rc = ReportControl {
             name: "urcb".into(),
+            rpt_enabled: 3,
             ..Default::default()
         };
-        assert_eq!(rcb_rpt_id(&rc, "ied1LD0", "LLN0"), "ied1LD0/LLN0$RP$urcb");
-
+        assert_eq!(rcb_instance_names(&rc), ["urcb01", "urcb02", "urcb03"]);
         let rc = ReportControl {
-            name: "brcb".into(),
-            buffered: true,
-            ..Default::default()
+            not_indexed: true,
+            ..rc
         };
-        assert_eq!(rcb_rpt_id(&rc, "ied1LD0", "LLN0"), "ied1LD0/LLN0$BR$brcb");
-
-        // A configured one wins.
-        let rc = ReportControl {
-            name: "urcb".into(),
-            rpt_id: "custom".into(),
-            ..Default::default()
-        };
-        assert_eq!(rcb_rpt_id(&rc, "ied1LD0", "LLN0"), "custom");
+        assert_eq!(rcb_instance_names(&rc), ["urcb"]);
     }
 
     #[test]

@@ -20,7 +20,9 @@ cargo run --bin ied-client -- --addr 127.0.0.1:10102 test
 ```
 
 `ied-client test` exercises every feature the server exposes and prints a
-PASS/FAIL/SKIP report. Against the bundled server it reports 27 passing checks.
+PASS/FAIL/SKIP report. Against the bundled server it reports 26 passing checks,
+and skips the three features that server does not enable (writable
+configuration, setting groups and logs).
 
 Read a value programmatically:
 

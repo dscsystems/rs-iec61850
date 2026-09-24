@@ -1,8 +1,35 @@
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::time::SystemTime;
 
 use crate::mms::{TimeQuality, Value};
-use crate::model::{Fc, Model, ObjectReference, Quality};
+use crate::model::{Fc, Model, ObjectReference, Quality, TrgOps};
+
+/// The leaves an update wrote and the trigger reasons each write raised.
+///
+/// A leaf is keyed by reference and functional constraint: the same reference
+/// can exist under several constraints, and a change under CF is no change to
+/// a dataset member under ST.
+pub(crate) type ChangeSet = BTreeMap<(ObjectReference, Fc), TrgOps>;
+
+/// Notes a write of `new` over `old` to a leaf with trigger options `trg`.
+///
+/// It raises the attribute's dchg or qchg when the value changed and its dupd
+/// whenever it was written (IEC 61850-7-2); an attribute without trigger
+/// options, a timestamp for one, raises nothing.
+pub(crate) fn record(
+    changes: &mut ChangeSet,
+    reference: ObjectReference,
+    fc: Fc,
+    trg: TrgOps,
+    old: Option<&Value>,
+    new: &Value,
+) {
+    let mut r = trg.0 & TrgOps::DATA_UPDATE.0;
+    if old != Some(new) {
+        r |= trg.0 & (TrgOps::DATA_CHANGE.0 | TrgOps::QUALITY_CHANGE.0);
+    }
+    changes.entry((reference, fc)).or_insert(TrgOps(0)).0 |= r;
+}
 
 /// An in-progress atomic model update.
 ///
@@ -12,14 +39,14 @@ use crate::model::{Fc, Model, ObjectReference, Quality};
 #[derive(Debug)]
 pub struct Tx<'a> {
     pub(crate) model: &'a mut Model,
-    pub(crate) changed: BTreeSet<ObjectReference>,
+    pub(crate) changed: ChangeSet,
 }
 
 impl<'a> Tx<'a> {
     pub(crate) fn new(model: &'a mut Model) -> Tx<'a> {
         Tx {
             model,
-            changed: BTreeSet::new(),
+            changed: ChangeSet::new(),
         }
     }
 
@@ -54,8 +81,10 @@ impl<'a> Tx<'a> {
             tracing::warn!(%reference, %fc, "server: update to a structured attribute");
             return false;
         }
-        da.value = Some(v);
-        self.changed.insert(reference);
+        let old = da.value.replace(v);
+        let trg = da.trg_ops;
+        let new = da.value.as_ref().expect("just set");
+        record(&mut self.changed, reference, fc, trg, old.as_ref(), new);
         true
     }
 
@@ -124,9 +153,9 @@ impl<'a> Tx<'a> {
         )
     }
 
-    /// Returns the references this transaction has changed so far.
-    pub fn changed(&self) -> &BTreeSet<ObjectReference> {
-        &self.changed
+    /// Returns the references this transaction has written so far.
+    pub fn changed(&self) -> std::collections::BTreeSet<ObjectReference> {
+        self.changed.keys().map(|(r, _)| r.clone()).collect()
     }
 }
 

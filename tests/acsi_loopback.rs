@@ -141,21 +141,26 @@ async fn a_batch_read_returns_the_values_in_order() {
     assert_eq!(many[1].as_ref().unwrap().as_f32(), 2.0);
 }
 
+/// A server that opts in to writable configuration and descriptions.
+async fn connected_config_writable() -> (Client, Server) {
+    connected_with(server::Options::new().with_writable_fcs(&[Fc::Cf, Fc::Dc])).await
+}
+
 #[tokio::test]
 async fn a_client_write_reaches_the_servers_model() {
-    let (c, s) = connected().await;
+    let (c, s) = connected_config_writable().await;
     c.write(
-        format!("{LD}/GGIO1.AnIn1.mag.f"),
-        Fc::Mx,
-        Value::float32(400.5),
+        format!("{LD}/GGIO1.NamPlt.d"),
+        Fc::Dc,
+        Value::visible_string("feeder 3"),
     )
     .await
     .unwrap();
     assert_eq!(
-        s.read(format!("{LD}/GGIO1.AnIn1.mag.f"), Fc::Mx)
+        s.read(format!("{LD}/GGIO1.NamPlt.d"), Fc::Dc)
             .unwrap()
-            .as_f32(),
-        400.5
+            .text(),
+        "feeder 3"
     );
 }
 
@@ -163,7 +168,7 @@ async fn a_client_write_reaches_the_servers_model() {
 /// to reach the client as the access error it chose.
 #[tokio::test]
 async fn the_write_hook_can_refuse_a_write() {
-    let (c, s) = connected().await;
+    let (c, s) = connected_config_writable().await;
     s.on_write(|da, _v| {
         if da.name == "ctlModel" {
             return Err(server::ERR_ACCESS_DENIED);
@@ -183,9 +188,9 @@ async fn the_write_hook_can_refuse_a_write() {
 
     // Everything else still goes through.
     c.write(
-        format!("{LD}/GGIO1.AnIn1.mag.f"),
-        Fc::Mx,
-        Value::float32(1.0),
+        format!("{LD}/GGIO1.NamPlt.d"),
+        Fc::Dc,
+        Value::visible_string("x"),
     )
     .await
     .expect("an unprotected write is allowed");
@@ -416,9 +421,10 @@ async fn a_data_change_report_carries_only_the_members_that_changed() {
 async fn a_change_outside_the_dataset_fires_no_data_change_report() {
     let (c, s) = connected().await;
     let mut rcb = c.get_rcb(format!("{LD}/LLN0.RP.EventsRCB01")).await.unwrap();
-    // The reference block configures a 1s integrity period; switch it off so
-    // only data-change reports can arrive.
+    // The reference block configures a 1s integrity period and no data-change
+    // trigger; ask for data-change reports only.
     rcb.intg_pd = Duration::ZERO;
+    rcb.trg_ops = TrgOps::DATA_CHANGE;
 
     let seen = Arc::new(AtomicUsize::new(0));
     let counter = Arc::clone(&seen);
@@ -516,11 +522,14 @@ async fn concurrent_subscriptions_receive_only_their_own_reports() {
     // A report carries no identification but its RptID, so the two blocks have
     // to be ones the reference model gives distinct ids: EventsRCB watches
     // Events, Measurements watches Measurements.
-    let rcb_a = c.get_rcb(format!("{LD}/LLN0.RP.EventsRCB01")).await.unwrap();
-    let rcb_b = c
+    let mut rcb_a = c.get_rcb(format!("{LD}/LLN0.RP.EventsRCB01")).await.unwrap();
+    let mut rcb_b = c
         .get_rcb(format!("{LD}/LLN0.BR.Measurements01"))
         .await
         .unwrap();
+    // Only the triggers a block asks for produce reports.
+    rcb_a.trg_ops = TrgOps::DATA_CHANGE;
+    rcb_b.trg_ops = TrgOps::DATA_CHANGE;
     assert_ne!(rcb_a.rpt_id, rcb_b.rpt_id, "the blocks are distinguishable");
 
     let count_a = Arc::new(AtomicUsize::new(0));
@@ -794,15 +803,15 @@ async fn the_server_reports_its_connections() {
 
 #[tokio::test]
 async fn a_write_to_an_unknown_object_is_refused_without_disturbing_the_others() {
-    let (c, _s) = connected().await;
+    let (c, _s) = connected_config_writable().await;
 
     // A batch where one item does not exist: the others must still apply.
     let results = c
         .mms()
         .write(
             LD,
-            &["GGIO1$MX$AnIn1$mag$f", "GGIO1$MX$Nope$mag$f"],
-            &[Value::float32(7.5), Value::float32(1.0)],
+            &["GGIO1$DC$NamPlt$d", "GGIO1$DC$Nope$d"],
+            &[Value::visible_string("bay 7"), Value::visible_string("x")],
         )
         .await
         .unwrap();
@@ -810,12 +819,54 @@ async fn a_write_to_an_unknown_object_is_refused_without_disturbing_the_others()
     assert!(results[0].is_ok());
     assert_eq!(results[1], Err(DataAccessError::ObjectAccessUnsupported));
     assert_eq!(
-        c.read(format!("{LD}/GGIO1.AnIn1.mag.f"), Fc::Mx)
+        c.read(format!("{LD}/GGIO1.NamPlt.d"), Fc::Dc)
             .await
             .unwrap()
-            .as_f32(),
-        7.5
+            .text(),
+        "bay 7"
     );
+}
+
+/// Status is never writable, even when a server lists ST; configuration is
+/// when it opts in.
+#[tokio::test]
+async fn the_write_policy_never_allows_status() {
+    let (c, s) = connected_with(server::Options::new().with_writable_fcs(&[Fc::St, Fc::Cf])).await;
+
+    let err = c
+        .write(format!("{LD}/GGIO1.SPCSO1.stVal"), Fc::St, Value::boolean(true))
+        .await
+        .expect_err("status is read-only");
+    assert!(err.to_string().contains("object-access-denied"), "got: {err}");
+
+    // Nor are measurands, which are not in the writable set at all.
+    let (c2, _s2) = connected().await;
+    let err = c2
+        .write(format!("{LD}/GGIO1.AnIn1.mag.f"), Fc::Mx, Value::float32(1.0))
+        .await
+        .expect_err("measurands are read-only");
+    assert!(err.to_string().contains("object-access-denied"), "got: {err}");
+
+    let ctl_model = format!("{LD}/GGIO1.SPCSO1.ctlModel");
+    c.write(ctl_model.clone(), Fc::Cf, Value::int32(4))
+        .await
+        .expect("CF is writable when the server opts in");
+    assert_eq!(s.read(ctl_model, Fc::Cf).unwrap().as_i64(), 4);
+}
+
+/// A value of another type is refused and leaves the attribute as it was.
+#[tokio::test]
+async fn a_write_of_another_type_is_refused() {
+    let (c, s) = connected_config_writable().await;
+    let ctl_model = format!("{LD}/GGIO1.SPCSO1.ctlModel");
+    let before = s.read(ctl_model.clone(), Fc::Cf).unwrap();
+
+    let err = c
+        .write(ctl_model.clone(), Fc::Cf, Value::visible_string("sbo"))
+        .await
+        .expect_err("a string is not an enum");
+    assert!(err.to_string().contains("type-inconsistent"), "got: {err}");
+    assert_eq!(s.read(ctl_model, Fc::Cf).unwrap(), before);
 }
 
 #[tokio::test]
@@ -902,4 +953,240 @@ async fn the_file_services_list_and_stream_a_filestore() {
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The Initiate answer states the server's own services, whatever the client
+/// claimed, and negotiates the parameter CBB down to what both ends support
+/// (ISO 9506-2). A client proposing a minimal bitmap must still learn that the
+/// server reads and writes, and must not be told the server does things it
+/// does not.
+#[tokio::test]
+async fn the_initiate_answer_states_the_servers_own_capabilities() {
+    use iec61850::asn1::{append_bit_string, decode_bit_string, BitString};
+    use iec61850::mms::{service, InitiateRequest, ServiceSupport};
+
+    let srv = Server::new(reference_model(), server::Options::new());
+    let (client_side, server_side) = tokio::io::duplex(256 * 1024);
+    let serving = srv.clone();
+    tokio::spawn(async move {
+        serving
+            .serve_stream(Box::new(server_side) as BoxTransport, None)
+            .await;
+    });
+
+    // A client claiming only getNameList, and only str1 + vnam support.
+    let mut cbb = BitString::new(11);
+    cbb.set_bit(0, true); // str1
+    cbb.set_bit(2, true); // vnam
+    cbb.set_bit(4, true); // vadr: the server does not offer it
+    let mut raw = Vec::new();
+    append_bit_string(&mut raw, &cbb);
+    let mut opts = iec61850::client::Options::new();
+    opts.initiate = Some(InitiateRequest {
+        services: ServiceSupport::with(&[service::GET_NAME_LIST]),
+        parameter_cbb_raw: Some(raw),
+        ..Default::default()
+    });
+    let c = Client::from_stream(Box::new(client_side) as BoxTransport, opts)
+        .await
+        .expect("the client associates");
+    let got = c.mms().negotiated().clone();
+
+    for (bit, name, want) in [
+        (service::READ, "read", true),
+        (service::WRITE, "write", true),
+        (service::GET_VARIABLE_ACCESS_ATTRIBUTES, "getVariableAccessAttributes", true),
+        (service::DEFINE_NAMED_VARIABLE_LIST, "defineNamedVariableList", true),
+        (service::INFORMATION_REPORT, "informationReport", true),
+        (service::STATUS, "status", false),
+        (service::CANCEL, "cancel", false),
+        (service::READ_JOURNAL, "readJournal", false),
+        (service::FILE_OPEN, "fileOpen", false), // no file store configured
+    ] {
+        assert_eq!(got.services.has(bit), want, "server advertises {name}");
+    }
+
+    let neg = decode_bit_string(got.parameter_cbb_raw.as_deref().expect("a CBB"))
+        .expect("the negotiated CBB decodes");
+    for (bit, want) in [(0, true), (1, false), (2, true), (3, false), (4, false), (7, false)] {
+        assert_eq!(neg.bit(bit), want, "negotiated CBB bit {bit}");
+    }
+}
+
+/// Serves the reference model with extra CF attributes on `GGIO1.SPCSO1`,
+/// then connects.
+async fn connected_with_cf(extra: &[(&str, Value)]) -> (Client, Server) {
+    let mut m = reference_model();
+    let object = m
+        .device_mut(LD)
+        .and_then(|ld| ld.node_mut("GGIO1"))
+        .and_then(|ln| ln.object_mut("SPCSO1"))
+        .expect("SPCSO1");
+    for (name, v) in extra {
+        match object.attribute_mut(name) {
+            Some(a) => a.value = Some(v.clone()),
+            None => object.attributes.push(iec61850::model::DataAttribute {
+                name: (*name).to_string(),
+                fc: Fc::Cf,
+                kind: Some(v.type_of()),
+                value: Some(v.clone()),
+                ..Default::default()
+            }),
+        }
+    }
+    let srv = Server::new(m, server::Options::new());
+    let (client_side, server_side) = tokio::io::duplex(256 * 1024);
+    let serving = srv.clone();
+    tokio::spawn(async move {
+        serving
+            .serve_stream(Box::new(server_side) as BoxTransport, None)
+            .await;
+    });
+    let client = Client::from_stream(
+        Box::new(client_side) as BoxTransport,
+        iec61850::client::Options::new(),
+    )
+    .await
+    .expect("the client associates");
+    (client, srv)
+}
+
+fn ctl_model(m: CtlModel) -> Value {
+    Value::int32(i32::from(m.code()))
+}
+
+/// A status-only object refuses control and says why in LastApplError, which
+/// names the control variable and the refused control number.
+#[tokio::test]
+async fn a_status_only_object_refuses_control() {
+    let (c, s) = connected_with_cf(&[("ctlModel", ctl_model(CtlModel::StatusOnly))]).await;
+    let object = format!("{LD}/GGIO1.SPCSO1");
+    let co = c.control_for(object.clone()).await.unwrap();
+    let err = co
+        .operate(
+            Value::boolean(true),
+            &iec61850::client::ControlOptions::new().with_model(CtlModel::DirectNormal),
+        )
+        .await
+        .expect_err("status-only offers no control");
+    assert!(err.to_string().contains("not-supported"), "got: {err}");
+
+    let lae = c.last_appl_error().expect("a LastApplError was reported");
+    assert_eq!(lae.cntrl_obj, format!("{LD}/GGIO1$CO$SPCSO1$Oper"));
+    assert_eq!(lae.ctl_num, co.ctl_num());
+    assert_eq!(lae.add_cause, AddCause::NOT_SUPPORTED);
+    assert!(!s.read(format!("{object}.stVal"), Fc::St).unwrap().as_bool());
+}
+
+/// SBOw belongs to SBO with enhanced security only.
+#[tokio::test]
+async fn sbow_is_refused_for_a_direct_model() {
+    let (c, _s) = connected_with_cf(&[("ctlModel", ctl_model(CtlModel::DirectNormal))]).await;
+    let co = c.control_for(format!("{LD}/GGIO1.SPCSO1")).await.unwrap();
+    let err = co
+        .select_with_value(
+            Value::boolean(true),
+            &iec61850::client::ControlOptions::new().with_model(CtlModel::SboEnhanced),
+        )
+        .await
+        .expect_err("a direct object has no SBOw");
+    assert!(err.to_string().contains("not-supported"), "got: {err}");
+}
+
+/// A member of the control structure is not an operate.
+#[tokio::test]
+async fn a_write_to_a_control_member_is_refused() {
+    let (c, s) = connected().await;
+    let results = c
+        .mms()
+        .write(LD, &["GGIO1$CO$SPCSO1$Oper$ctlVal"], &[Value::boolean(true)])
+        .await
+        .unwrap();
+    assert_eq!(results[0], Err(DataAccessError::TypeInconsistent));
+    assert!(!s
+        .read(format!("{LD}/GGIO1.SPCSO1.stVal"), Fc::St)
+        .unwrap()
+        .as_bool());
+}
+
+/// A handler that defers the termination can end the operate negatively, and
+/// the client's operate reports the cause.
+#[tokio::test]
+async fn a_deferred_termination_can_end_an_operate_negatively() {
+    let (c, s) = connected_with_cf(&[("ctlModel", ctl_model(CtlModel::DirectEnhanced))]).await;
+    let object = format!("{LD}/GGIO1.SPCSO1");
+    s.on_control(object.clone(), |ctx| {
+        let done = ctx.defer_termination();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            done(AddCause::BLOCKED_BY_PROCESS);
+        });
+        AddCause::NONE
+    });
+    let co = c.control_for(object).await.unwrap();
+    let err = co
+        .operate(Value::boolean(true), &Default::default())
+        .await
+        .expect_err("the termination is negative");
+    assert!(err.to_string().contains("termination"), "got: {err}");
+    assert!(err.to_string().contains("blocked-by-process"), "got: {err}");
+}
+
+/// An operate whose deferred termination never comes ends with
+/// time-limit-over once operTimeout passes.
+#[tokio::test]
+async fn an_unterminated_operate_times_out_after_oper_timeout() {
+    let (c, s) = connected_with_cf(&[
+        ("ctlModel", ctl_model(CtlModel::DirectEnhanced)),
+        ("operTimeout", Value::uint32(50)),
+    ])
+    .await;
+    let object = format!("{LD}/GGIO1.SPCSO1");
+    s.on_control(object.clone(), |ctx| {
+        // Taken over, and never called.
+        std::mem::forget(ctx.defer_termination());
+        AddCause::NONE
+    });
+    let co = c.control_for(object).await.unwrap();
+    let err = co
+        .operate(Value::boolean(true), &Default::default())
+        .await
+        .expect_err("operTimeout ends it");
+    assert!(err.to_string().contains("time-limit-over"), "got: {err}");
+}
+
+/// An enhanced operate the server terminates itself completes positively.
+#[tokio::test]
+async fn an_enhanced_operate_waits_for_its_positive_termination() {
+    let (c, s) = connected_with_cf(&[("ctlModel", ctl_model(CtlModel::DirectEnhanced))]).await;
+    let object = format!("{LD}/GGIO1.SPCSO1");
+    let co = c.control_for(object.clone()).await.unwrap();
+    co.operate(Value::boolean(true), &Default::default())
+        .await
+        .expect("CommandTermination+");
+    assert!(s.read(format!("{object}.stVal"), Fc::St).unwrap().as_bool());
+}
+
+/// A selection lasts the object's sboTimeout, not a fixed server default.
+#[tokio::test]
+async fn a_selection_expires_after_the_objects_sbo_timeout() {
+    let (c, _s) = connected_with_cf(&[
+        ("ctlModel", ctl_model(CtlModel::SboEnhanced)),
+        ("sboTimeout", Value::uint32(50)),
+    ])
+    .await;
+    let co = c.control_for(format!("{LD}/GGIO1.SPCSO1")).await.unwrap();
+    let opts = iec61850::client::ControlOptions::new();
+    co.select_with_value(Value::boolean(true), &opts)
+        .await
+        .expect("selected");
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    let err = co
+        .operate(
+            Value::boolean(true),
+            &opts.clone().with_model(CtlModel::DirectEnhanced),
+        )
+        .await
+        .expect_err("the selection has expired");
+    assert!(err.to_string().contains("not-selected"), "got: {err}");
 }

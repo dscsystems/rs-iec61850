@@ -362,7 +362,9 @@ impl<'a> Builder<'a> {
                         &bda.btype,
                         &bda.kind,
                         &bda.count,
-                        model::TrgOps::default(),
+                        // A DA's trigger options cover all its components: a
+                        // change to mag.f is a change of mag (IEC 61850-7-2).
+                        trg,
                         &bda.vals,
                         depth + 1,
                     )
@@ -706,6 +708,12 @@ fn build_report_control(r: &ReportControl) -> model::ReportControl {
             rc.rpt_enabled = re.max as usize;
         }
     }
+    // IEC 61850-6: an unindexed block is a single instance under its own
+    // name, whatever RptEnabled says.
+    if !r.indexed {
+        rc.not_indexed = true;
+        rc.rpt_enabled = 1;
+    }
     if let Some(of) = &r.opt_fields {
         let mut flags = model::OptFlds::default();
         let mut set = |on: bool, f: model::OptFlds| {
@@ -919,6 +927,9 @@ mod tests {
               <OptFields seqNum="true" reasonCode="true"/>
             </ReportControl>
             <ReportControl name="urcb" datSet="Events" buffered="false"/>
+            <ReportControl name="single" datSet="Events" buffered="false" indexed="false">
+              <RptEnabled max="4"/>
+            </ReportControl>
             <GSEControl name="gcb01" appID="events" datSet="Events" confRev="3"/>
           </LN0>
           <LN prefix="" lnClass="GGIO" inst="1" lnType="GGIO_1">
@@ -1092,6 +1103,29 @@ mod tests {
         // An FCDA with no daName names the whole data object.
         assert_eq!(ds.entries[1].reference.as_str(), "ied1LD0/GGIO1.AnIn1");
         assert_eq!(ds.entries[1].fc, Fc::Mx);
+    }
+
+    /// `indexed="false"` makes a report control block a single instance under
+    /// its own name (IEC 61850-6); the default stays indexed.
+    #[test]
+    fn an_unindexed_report_control_is_one_instance() {
+        let m = model_of();
+        let ln0 = m.device("ied1LD0").unwrap().node("LLN0").unwrap();
+        let single = ln0.report_control("single").unwrap();
+        assert!(single.not_indexed);
+        assert_eq!(single.rpt_enabled, 1, "whatever RptEnabled says");
+        assert!(!ln0.report_control("urcb").unwrap().not_indexed);
+    }
+
+    /// A DA's trigger options cover its components: the leaf an update writes,
+    /// mag.f, triggers as mag does (IEC 61850-7-2).
+    #[test]
+    fn trigger_options_reach_the_components() {
+        let m = model_of();
+        let f = m
+            .attribute(&"ied1LD0/GGIO1.AnIn1.mag.f".into(), Fc::Mx)
+            .expect("mag.f");
+        assert!(f.trg_ops.has(model::TrgOps::DATA_CHANGE));
     }
 
     #[test]

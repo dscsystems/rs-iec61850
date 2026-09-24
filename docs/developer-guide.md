@@ -145,9 +145,17 @@ flags present in the report itself.
 
 Writes to `…$CO$…$Oper`, `$SBOw` and `$Cancel`, and reads of `…$SBO`, are
 intercepted in the handler and routed to `server/control.rs` and
-`server/select.rs`. SBO models require a reservation, held per connection with
-a 30 s timeout; enhanced models send a positive CommandTermination as an
-unconfirmed InformationReport after the operate.
+`server/select.rs`. SBO models require a reservation, held per connection for
+the object's `sboTimeout` (30 s when it declares none); enhanced models are
+concluded by a CommandTermination, positive or negative, which a control
+handler may defer.
+
+The order of PDUs around a control is part of the protocol (IEC 61850-8-1): a
+LastApplError precedes the negative response it explains, and a
+CommandTermination, like the reports a write provokes, follows the response.
+`ServerConn` holds unconfirmed PDUs while a confirmed request is handled and
+releases them on the right side of its response; `send_unconfirmed_first` is
+the form for what must go ahead of it.
 
 One control sequence carries one control number throughout. A server that
 compares the operate's `ctlNum` against the select's rejects a mismatch as

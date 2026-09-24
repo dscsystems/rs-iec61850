@@ -225,14 +225,19 @@ sub.disable().await?;
 written always, because zero is a meaningful integrity period (none at all) and
 so cannot also mean "leave it alone".
 
+Only the triggers in `TrgOps` produce reports, so ask for the ones you want: a
+block configured with the integrity period alone reports no data changes.
+
 A buffered block resumes gap-free after a disconnect: set
 `rcb.resync_entry_id = Some(last_seen)` (from `Report::entry_id`) before
 enabling. If the server has discarded that point, it flushes the whole buffer
 and sets `buf_ovfl` so you know entries were lost.
 
-Each subscription filters on its own `RptID`. A report carries no other
-identification, so blocks configured with the same `RptID` — which the standard
-permits, and which the reference `simpleIO` model does — cannot be told apart.
+Each subscription filters on its own `RptID` (`Rcb::report_id`: the block's
+reference when its `RptID` is empty, as the server substitutes it). A report
+carries no other identification, so blocks configured with the same `RptID`,
+which the standard permits and the reference `simpleIO` model does, cannot be
+told apart.
 
 **The callback runs on the connection's reader task and must not block.**
 
@@ -261,6 +266,13 @@ if let Err(iec61850::client::Error::Control(e)) = result {
     println!("{} failed: {}", e.stage, e.add_cause);   // "operate", "blocked-by-interlocking"
 }
 ```
+
+On an enhanced-security model `operate` returns once the CommandTermination
+arrives, failing with stage `termination` and its cause if the termination is
+negative; `ControlOptions::with_termination_timeout` bounds the wait (30 s by
+default). A refusal's `add_cause` is the LastApplError the server reported
+ahead of the negative response; `Client::last_appl_error` returns the most
+recent one, for control structures written directly.
 
 The lower-level steps are exposed too: `select`, `select_with_value`, `cancel`,
 `ctl_val_spec` (what type of `ctlVal` the device will accept), and
@@ -341,9 +353,13 @@ server.listen_and_serve("0.0.0.0:102").await?;
 ```
 
 Report control blocks are materialised into the model at construction, so they
-read and write through the ordinary variable path. A `LastApplError` object is
-materialised into each `LLN0` that lacks one, so a refused control's diagnosis
-can always reach a client.
+read and write through the ordinary variable path.
+
+The server answers the MMS Initiate with the services it actually implements
+and negotiates the parameter CBB down to what both ends support. Every response
+is bounded by the association's negotiated PDU size: name lists, directory
+listings and file reads are paged to fit, reports are segmented, and a response
+that still cannot fit is refused with a resource error.
 
 ### Pushing values
 
@@ -366,6 +382,20 @@ a lock the update already holds.
 
 ### Write access control
 
+Clients may write SP, SV and SE by default, and SE only while a setting group
+is being edited. CF, DC and BL are writable in IEC 61850-7-2 but change
+configuration, descriptions and blocking, so a server opts in to them. ST, MX,
+OR, EX and SG are never writable, whatever is listed.
+
+```rust
+let server = Server::new(model, Options::new().with_writable_fcs(&[Fc::Sp, Fc::Sv, Fc::Se, Fc::Cf]));
+```
+
+A value is stored only when it has the attribute's type, bit-string width and,
+for a sized integer, range; anything else is refused as type-inconsistent.
+Report and setting-group control blocks follow their own rules, checked before
+anything is stored. The hook then sees every write the policy admitted:
+
 ```rust
 server.on_write(|da, _value| {
     if da.name == "ctlModel" {
@@ -374,6 +404,9 @@ server.on_write(|da, _value| {
     Ok(())                       // allow; the value is then applied
 });
 ```
+
+A client write and an operate report like a process change: a member of an
+enabled block's dataset is reported for the triggers its attribute raised.
 
 ### Control handlers
 
@@ -393,8 +426,34 @@ server.on_control("IED1LD0/GGIO1.SPCSO1", |ctx| {
 `ctx.origin` and `ctx.or_ident` are what the client *claims*; `ctx.peer` and
 `ctx.conn` are what the server observed, which is what an audit trail needs.
 
-Reporting, SBO select reservations and CommandTermination for the enhanced
-control models are handled internally.
+A refused command is answered negatively and, ahead of that answer, with a
+LastApplError report naming the cause (IEC 61850-8-1). A status-only object
+refuses control, SBOw is accepted only for SBO with enhanced security, and the
+members of a control structure are not writable on their own. A selection lasts
+the object's `sboTimeout`.
+
+An enhanced-security operate is concluded by a CommandTermination, sent after
+the operate's response. The server sends it as soon as the handler accepts,
+unless the handler takes it over to report the outcome of a longer execution:
+
+```rust
+server.on_control("IED1LD0/XCBR1.Pos", |ctx| {
+    let done = ctx.defer_termination();
+    tokio::spawn(async move {
+        let reached = drive_breaker().await;
+        done(if reached { AddCause::NONE } else { AddCause::BLOCKED_BY_PROCESS });
+    });
+    AddCause::NONE               // accepted; terminated when `done` is called
+});
+```
+
+If `done` is not called within the object's `operTimeout`, the server
+terminates the operate negatively with time-limit-over.
+
+Report control blocks follow IEC 61850-7-2 clause 17: the first client to write
+a block reserves it, settings are locked while it is enabled, only the triggers
+in `TrgOps` produce reports (with their own reason codes), `BufTm` collects
+events into one report, and a buffered block delivers each entry once.
 
 ### Connection events
 
@@ -523,10 +582,23 @@ background task retransmits with increasing `sqNum` until the next publish. A
 newer publish supersedes the previous retransmissions, so a stale frame never
 follows a new state onto the wire.
 
-Anomalies (`st_num_regressed`, `sq_num_gap`, `stale`) come from per-control-block
-sequence tracking and are what turn a lost frame or a restarted publisher into
-something visible. `SequenceTracker` is public if you want the rules without the
-socket.
+Anomalies (`st_num_regressed`, `sq_num_gap`, `stale`, `entries_mismatch`) come
+from per-control-block sequence tracking and are what turn a lost frame or a
+restarted publisher into something visible. `SequenceTracker` is public if you
+want the rules without the socket.
+
+`stale` is only noticed when the next message arrives. A subscriber has to
+treat a control block's data as invalid as soon as `timeAllowedToLive` passes
+(IEC 61850-8-1), which `subscribe_supervised` reports as it happens, once per
+silence:
+
+```rust
+let subscription = goose::Subscriber::new(eth).subscribe_supervised(
+    goose::Filter::app_id(0x1000),
+    |m| { /* ... */ },
+    |go_cb_ref| eprintln!("{go_cb_ref}: publisher silent, data invalid"),
+);
+```
 
 Use `ethernet::pipe()` for an in-memory segment in tests.
 

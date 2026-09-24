@@ -23,7 +23,6 @@ pub use server::{
     WriteHandler, ERR_ACCESS_DENIED, ERR_OBJECT_NON_EXISTENT, ERR_OBJECT_VALUE_INVALID,
 };
 pub use server::ConnMap;
-pub(crate) use server::Inner;
 pub use settinggroup::SettingGroupManager;
 pub use tx::Tx;
 

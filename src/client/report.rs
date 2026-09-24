@@ -39,6 +39,19 @@ pub struct Rcb {
     item: String,
 }
 
+impl Rcb {
+    /// Returns the RptID the block's reports carry: its RptID attribute, or
+    /// when that is empty the block's own reference in MMS form, which a
+    /// server substitutes (IEC 61850-7-2).
+    pub fn report_id(&self) -> String {
+        if self.rpt_id.is_empty() {
+            format!("{}/{}", self.domain, self.item)
+        } else {
+            self.rpt_id.clone()
+        }
+    }
+}
+
 /// Converts `LD/LN.RP.name` to the domain `LD` and item `LN$RP$name`.
 fn rcb_ref_to_mms(reference: &ObjectReference) -> (String, String) {
     (reference.ld().to_string(), reference.path().join("$"))
@@ -236,7 +249,7 @@ impl Client {
         // Register the handler before enabling, or the first report races the
         // registration. The registration is additive, so other subscriptions
         // on this connection keep theirs; each filters on its own RptID.
-        let want_rpt_id = rcb.rpt_id.clone();
+        let want_rpt_id = rcb.report_id();
         let members = Arc::new(members);
         let handler = self.mms().on_information_report(move |ir| {
             if let Some(rep) = decode_report(ir, &members) {

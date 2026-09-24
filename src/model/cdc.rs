@@ -9,7 +9,7 @@ use std::collections::BTreeSet;
 
 use crate::mms::{Type, Value};
 
-use super::{CtlModel, DataAttribute, DataObject, Fc};
+use super::{CtlModel, DataAttribute, DataObject, Fc, TrgOps};
 
 /// A common data class name (IEC 61850-7-3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -301,7 +301,9 @@ pub fn new_data_object(name: &str, cdc: Cdc, opts: &CdcOptions) -> DataObject {
         ..Default::default()
     };
     for a in &s.attrs {
-        if let Some(da) = build_attribute(a, opts) {
+        if let Some(mut da) = build_attribute(a, opts) {
+            da.trg_ops = cdc_trg_ops(&da.name, da.fc);
+            inherit_trg_ops(&mut da);
             object.attributes.push(da);
         }
     }
@@ -368,6 +370,40 @@ fn build_attribute_with_fc(a: &CdcAttribute, fc: Fc, opts: &CdcOptions) -> Optio
     }
     da.value = zero_value(a.kind, a.size);
     Some(da)
+}
+
+/// Gives every component of a structured attribute the attribute's own
+/// trigger options, which cover all of it: a change to `mag.f` is a change
+/// of `mag` (IEC 61850-7-2).
+pub(crate) fn inherit_trg_ops(da: &mut DataAttribute) {
+    let t = da.trg_ops;
+    for c in &mut da.children {
+        c.trg_ops = t;
+        inherit_trg_ops(c);
+    }
+}
+
+/// The trigger options of a common data class attribute, following the tables
+/// of IEC 61850-7-3.
+///
+/// `q` is qchg; the timestamp and the deadbanded-away instantaneous values
+/// trigger nothing; the analogue and counter values also trigger on update;
+/// every other status, measurand, setting and configuration attribute is
+/// dchg. Control structures and extensions trigger nothing.
+fn cdc_trg_ops(name: &str, fc: Fc) -> TrgOps {
+    use Fc::*;
+    if !matches!(fc, St | Mx | Sp | Sg | Se | Sv | Cf | Dc | Bl) {
+        return TrgOps(0);
+    }
+    match name {
+        "q" => TrgOps::QUALITY_CHANGE,
+        "t" | "instMag" | "instCVal" | "frTm" | "subVal" | "subMag" | "subCVal" | "subQ"
+        | "subID" | "subEna" => TrgOps(0),
+        "mag" | "cVal" | "actVal" | "frVal" => {
+            TrgOps(TrgOps::DATA_CHANGE.0 | TrgOps::DATA_UPDATE.0)
+        }
+        _ => TrgOps::DATA_CHANGE,
+    }
 }
 
 /// Reports whether a structure is an `AnalogueValue`, whose `i` and `f`
@@ -868,6 +904,36 @@ mod tests {
 
     fn names(das: &[DataAttribute]) -> Vec<&str> {
         das.iter().map(|a| a.name.as_str()).collect()
+    }
+
+    /// Built data objects carry the trigger options of IEC 61850-7-3, down to
+    /// the leaves an update writes.
+    #[test]
+    fn built_objects_carry_the_trigger_options_of_7_3() {
+        let mv = new_data_object("AnIn1", Cdc::Mv, &CdcOptions::new());
+        let dchg_dupd = TrgOps(TrgOps::DATA_CHANGE.0 | TrgOps::DATA_UPDATE.0);
+        for (name, want) in [
+            ("mag", dchg_dupd),
+            ("q", TrgOps::QUALITY_CHANGE),
+            ("t", TrgOps(0)),
+        ] {
+            let a = mv.attribute(name).expect(name);
+            assert_eq!(a.trg_ops, want, "{name}");
+            for c in &a.children {
+                assert_eq!(c.trg_ops, want, "{name}.{} inherits", c.name);
+            }
+        }
+        let spc = new_data_object(
+            "SPCSO1",
+            Cdc::Spc,
+            &CdcOptions::new().with_control_model(CtlModel::DirectNormal),
+        );
+        for a in &spc.attributes {
+            if a.fc == Fc::Co {
+                assert_eq!(a.trg_ops, TrgOps(0), "control structure {}", a.name);
+            }
+        }
+        assert_eq!(spc.attribute("stVal").unwrap().trg_ops, TrgOps::DATA_CHANGE);
     }
 
     #[test]

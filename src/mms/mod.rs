@@ -21,7 +21,7 @@ pub use conn::{AcseIdentity, Conn, HandlerId, Options, State};
 pub use errors::{DataAccessError, Error, ErrorClass, Result, ServiceError};
 pub use pdu::{
     encode_initiate_request, encode_initiate_response, parse_initiate_request,
-    parse_initiate_response, InitiateRequest, ServiceSupport,
+    parse_initiate_response, service, InitiateRequest, ServiceSupport,
 };
 pub use report::InformationReport;
 pub use server_conn::{

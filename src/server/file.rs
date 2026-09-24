@@ -103,14 +103,14 @@ impl FileStore {
         Ok((id, size, modified))
     }
 
-    /// Reads the next chunk of an open file.
+    /// Reads the next chunk of an open file, at most `max_chunk` octets.
     ///
     /// Returns the chunk and whether more follows, or `None` when the id names
     /// no open file.
-    pub fn read(&self, id: i32) -> Option<(Vec<u8>, bool)> {
+    pub fn read(&self, id: i32, max_chunk: usize) -> Option<(Vec<u8>, bool)> {
         let mut st = self.state.lock().unwrap();
         let f = st.open.get_mut(&id)?;
-        let end = (f.pos + FILE_CHUNK_SIZE).min(f.data.len());
+        let end = (f.pos + max_chunk.max(1)).min(f.data.len());
         let chunk = f.data[f.pos..end].to_vec();
         f.pos = end;
         let more = f.pos < f.data.len();
@@ -235,7 +235,7 @@ mod tests {
         let mut total = 0;
         let mut chunks = 0;
         loop {
-            let (chunk, more) = store.read(id).unwrap();
+            let (chunk, more) = store.read(id, FILE_CHUNK_SIZE).unwrap();
             total += chunk.len();
             chunks += 1;
             if !more {
@@ -248,7 +248,7 @@ mod tests {
 
         store.close(id);
         assert_eq!(store.open_count(), 0);
-        assert!(store.read(id).is_none(), "a closed id reads nothing");
+        assert!(store.read(id, FILE_CHUNK_SIZE).is_none(), "a closed id reads nothing");
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -258,7 +258,7 @@ mod tests {
         let (store, dir) = temp_store();
         let (id, size, _) = store.open("a.txt").unwrap();
         assert_eq!(size, 5);
-        let (chunk, more) = store.read(id).unwrap();
+        let (chunk, more) = store.read(id, FILE_CHUNK_SIZE).unwrap();
         assert_eq!(chunk, b"hello");
         assert!(!more);
         store.close(id);
@@ -327,14 +327,14 @@ mod tests {
         let (b, _, _) = store.open("COMTRADE/rec001.cfg").unwrap();
         assert_ne!(a, b, "each open gets its own state machine");
 
-        let (chunk_a, _) = store.read(a).unwrap();
+        let (chunk_a, _) = store.read(a, FILE_CHUNK_SIZE).unwrap();
         assert_eq!(chunk_a, b"hello");
-        let (chunk_b, more_b) = store.read(b).unwrap();
+        let (chunk_b, more_b) = store.read(b, FILE_CHUNK_SIZE).unwrap();
         assert_eq!(chunk_b.len(), FILE_CHUNK_SIZE);
         assert!(more_b, "the other file's read did not disturb this one");
 
         store.close(a);
-        assert!(store.read(b).is_some(), "closing one leaves the other open");
+        assert!(store.read(b, FILE_CHUNK_SIZE).is_some(), "closing one leaves the other open");
 
         let _ = std::fs::remove_dir_all(dir);
     }

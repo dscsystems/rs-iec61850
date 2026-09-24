@@ -187,6 +187,41 @@ async fn find_measurand(client: &Client, ld: &str) -> Option<(String, Fc)> {
     None
 }
 
+/// Finds a leaf the sweep may write back unchanged: an SP or SV leaf, which
+/// is what clients are meant to write, or else a `ctlModel` under CF.
+async fn find_writable(client: &Client, ld: &str) -> Option<(String, Fc)> {
+    let names = client
+        .mms()
+        .get_name_list(ObjectClass::NamedVariable, ld)
+        .await
+        .ok()?;
+    // A leaf is a name no other name extends.
+    let is_leaf = |i: usize| {
+        names
+            .get(i + 1)
+            .is_none_or(|next| !next.starts_with(&format!("{}$", names[i])))
+    };
+    let mut cf = None;
+    for (i, name) in names.iter().enumerate() {
+        let parts: Vec<&str> = name.split('$').collect();
+        if parts.len() < 4 || !is_leaf(i) {
+            continue;
+        }
+        match parts[1] {
+            "SP" | "SV" if parts[2] != "SGCB" => {
+                let (reference, fc) = iec61850::model::from_mms(ld, name);
+                return Some((reference.to_string(), fc));
+            }
+            "CF" if cf.is_none() && parts[parts.len() - 1] == "ctlModel" => {
+                let (reference, fc) = iec61850::model::from_mms(ld, name);
+                cf = Some((reference.to_string(), fc));
+            }
+            _ => {}
+        }
+    }
+    cf
+}
+
 async fn sweep_read_write(client: &Client, ld: &str, r: &mut Report) {
     println!("\n== read and write ==");
 
@@ -211,14 +246,28 @@ async fn sweep_read_write(client: &Client, ld: &str, r: &mut Report) {
         Err(e) => r.fail("readValues(batch)", e.to_string()),
     }
 
-    // Write the value back unchanged: it changes nothing on the device but
-    // exercises the whole write path.
-    match client.read(reference.clone(), fc).await {
-        Ok(v) => match client.write(reference.clone(), fc, v).await {
-            Ok(()) => r.pass("write(MX)", "value written back unchanged"),
-            Err(e) => r.skip("write(MX)", format!("refused: {e}")),
-        },
-        Err(e) => r.fail("write(MX)", format!("could not read it back first: {e}")),
+    // Measurands are read-only (IEC 61850-7-2), so the write path is
+    // exercised on a setting or substitution value, or on ctlModel when a
+    // device has neither. Writing the value back unchanged changes nothing on
+    // the device.
+    match find_writable(client, ld).await {
+        None => r.skip("write", "the device exposes no SP, SV or CF leaf"),
+        Some((target, wfc)) => {
+            let label = format!("write({wfc})");
+            match client.read(target.clone(), wfc).await {
+                Ok(v) => match client.write(target.clone(), wfc, v).await {
+                    Ok(()) => r.pass(&label, format!("{target} written back unchanged")),
+                    // Refusing a write is the server's policy to state, and
+                    // conformant servers refuse CF unless configured to allow
+                    // it.
+                    Err(e) if e.to_string().contains("object-access-denied") => {
+                        r.skip(&label, format!("server refuses writes to {target}"))
+                    }
+                    Err(e) => r.fail(&label, e.to_string()),
+                },
+                Err(e) => r.fail(&label, format!("could not read it back first: {e}")),
+            }
+        }
     }
 
     // A read of something that cannot exist has to come back as an access

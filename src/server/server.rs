@@ -109,6 +109,9 @@ pub struct Options {
     pub report_buffer_size: usize,
     /// Enables setting-group handling with this many groups.
     pub setting_groups: u8,
+    /// The functional constraints clients may write; `None` is SP, SV and SE.
+    /// See [`Options::with_writable_fcs`].
+    pub writable_fcs: Option<Vec<Fc>>,
     /// Enables TLS per IEC 62351-3.
     #[cfg(feature = "tls")]
     pub tls: Option<Arc<tokio_rustls::rustls::ServerConfig>>,
@@ -161,6 +164,21 @@ impl Options {
         self
     }
 
+    /// Sets the functional constraints whose data attributes clients may
+    /// write, replacing the default of SP, SV and SE. CF, DC and BL are
+    /// writable in IEC 61850-7-2 but change configuration, descriptions and
+    /// blocking, so a server opts in to them.
+    ///
+    /// ST, MX, OR, EX and SG are never writable: IEC 61850-7-2 makes status,
+    /// measurements, originators, extensions and active settings read-only,
+    /// and a listed one is ignored. Control (CO), report (RP, BR) and setting
+    /// group control block attributes have their own services and rules.
+    #[must_use]
+    pub fn with_writable_fcs(mut self, fcs: &[Fc]) -> Options {
+        self.writable_fcs = Some(fcs.to_vec());
+        self
+    }
+
     #[cfg(feature = "tls")]
     #[must_use]
     pub fn with_tls(mut self, cfg: Arc<tokio_rustls::rustls::ServerConfig>) -> Options {
@@ -181,6 +199,8 @@ pub(crate) struct Inner {
     pub identity: Identity,
     pub files: Option<FileStore>,
     pub setting_groups: std::collections::BTreeMap<String, super::SettingGroupManager>,
+    /// The functional constraints clients may write.
+    pub writable: Vec<Fc>,
     pub max_conns: usize,
     pub open: Mutex<usize>,
     pub next_conn: AtomicU64,
@@ -198,7 +218,50 @@ impl std::fmt::Debug for Inner {
     }
 }
 
+/// The writable set for `fcs`, leaving out the functional constraints
+/// IEC 61850-7-2 makes read-only whatever a server asks for.
+fn writable_fcs(fcs: &[Fc]) -> Vec<Fc> {
+    fcs.iter()
+        .copied()
+        .filter(|fc| !matches!(fc, Fc::St | Fc::Mx | Fc::Or | Fc::Ex | Fc::Sg))
+        .collect()
+}
+
 impl Inner {
+    /// The MMS Initiate this server answers with.
+    ///
+    /// Its `servicesSupported` bitmap lists exactly the services the handler
+    /// implements: clients gate features on it, so an unimplemented service
+    /// must not appear and an implemented one must not be missing.
+    fn initiate(&self) -> mms::InitiateRequest {
+        use mms::service;
+        let mut services = vec![
+            service::GET_NAME_LIST,
+            service::IDENTIFY,
+            service::READ,
+            service::WRITE,
+            service::GET_VARIABLE_ACCESS_ATTRIBUTES,
+            service::DEFINE_NAMED_VARIABLE_LIST,
+            service::GET_NAMED_VARIABLE_LIST_ATTRIBUTES,
+            service::DELETE_NAMED_VARIABLE_LIST,
+            service::INFORMATION_REPORT,
+            service::CONCLUDE,
+        ];
+        if self.files.is_some() {
+            services.extend([
+                service::FILE_OPEN,
+                service::FILE_READ,
+                service::FILE_CLOSE,
+                service::FILE_DELETE,
+                service::FILE_DIRECTORY,
+            ]);
+        }
+        mms::InitiateRequest {
+            services: mms::ServiceSupport::with(&services),
+            ..mms::InitiateRequest::server_default()
+        }
+    }
+
     /// Reserves one connection slot, reporting the resulting count and whether
     /// the limit allowed it.
     fn take_slot(&self) -> (usize, bool) {
@@ -248,12 +311,9 @@ impl Server {
         } else {
             std::collections::BTreeMap::new()
         };
-        // A control refusal reports its cause through LastApplError, so the
-        // model must carry one whether or not the SCL declared it.
-        super::control::materialise_last_appl_error(&mut model);
         let reports = ReportManager::new(&mut model, opts.report_buffer_size);
 
-        Server {
+        let server = Server {
             inner: Arc::new(Inner {
                 model: RwLock::new(model),
                 reports,
@@ -265,13 +325,23 @@ impl Server {
                 identity,
                 files: opts.file_store.map(FileStore::new),
                 setting_groups,
+                writable: writable_fcs(
+                    opts.writable_fcs
+                        .as_deref()
+                        .unwrap_or(&[Fc::Sp, Fc::Sv, Fc::Se]),
+                ),
                 max_conns: opts.max_connections,
                 open: Mutex::new(0),
                 next_conn: AtomicU64::new(1),
                 #[cfg(feature = "tls")]
                 tls: opts.tls,
             }),
-        }
+        };
+        server
+            .inner
+            .reports
+            .set_owner(Arc::downgrade(&server.inner));
+        server
     }
 
     /// Registers a handler consulted before applying a client write.
@@ -389,7 +459,11 @@ impl Server {
             return;
         }
 
-        let sc = match mms::accept_conn(stream, peer).await {
+        let accept = mms::AcceptOptions {
+            initiate: Some(inner.initiate()),
+            ..Default::default()
+        };
+        let sc = match mms::accept_conn_opts(stream, peer, &accept).await {
             Ok(sc) => Arc::new(sc),
             Err(e) => {
                 tracing::warn!(?peer, error = %e, "server: association setup failed");
@@ -415,6 +489,7 @@ impl Server {
         let handler = super::handler::Handler {
             inner: Arc::clone(inner),
             conn: id,
+            changes: Default::default(),
         };
         if let Err(e) = sc.serve(&handler).await {
             tracing::debug!(?peer, %id, error = %e, "server: association ended");
@@ -422,9 +497,13 @@ impl Server {
 
         // Everything the association held goes with it: its reservations, its
         // report subscriptions and its slot.
-        inner.conns.lock().unwrap().remove(&id);
+        {
+            let mut model = inner.model.write().unwrap();
+            let mut conns = inner.conns.lock().unwrap();
+            conns.remove(&id);
+            inner.reports.disable_conn(&mut model, &conns, id);
+        }
         let open = inner.release_slot();
-        inner.reports.disable_conn(id);
         inner.selections.lock().unwrap().release_conn(id);
         let _ = sc.close().await;
         inner.notify(ConnectionEvent {

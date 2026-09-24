@@ -8,7 +8,8 @@ use crate::model::{AddCause, ObjectReference};
 
 use super::ConnId;
 
-/// How long an SBO reservation is held without an operate.
+/// How long an SBO reservation is held without an operate when the object
+/// declares no `sboTimeout`.
 pub const SELECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// An active SBO reservation of a control object.
@@ -31,7 +32,8 @@ pub struct Selections {
 
 impl Selections {
     /// Reserves a control object for a connection, recording the control
-    /// number an operate will have to repeat.
+    /// number an operate will have to repeat. The reservation lasts `timeout`,
+    /// the object's `sboTimeout` (IEC 61850-7-2).
     ///
     /// Returns false when another client holds a live reservation, which is
     /// the whole point of select-before-operate.
@@ -40,6 +42,7 @@ impl Selections {
         reference: &ObjectReference,
         conn: ConnId,
         ctl_num: Option<u8>,
+        timeout: Duration,
         now: Instant,
     ) -> bool {
         if let Some(sel) = self.active.get(reference) {
@@ -51,7 +54,7 @@ impl Selections {
             reference.clone(),
             Selection {
                 conn,
-                expiry: now + SELECT_TIMEOUT,
+                expiry: now + timeout,
                 ctl_num,
             },
         );
@@ -148,14 +151,14 @@ mod tests {
         let now = Instant::now();
         let r = reference();
 
-        assert!(s.reserve(&r, A, Some(1), now));
-        assert!(!s.reserve(&r, B, Some(1), now), "B must not steal A's select");
+        assert!(s.reserve(&r, A, Some(1), SELECT_TIMEOUT, now));
+        assert!(!s.reserve(&r, B, Some(1), SELECT_TIMEOUT, now), "B must not steal A's select");
         // A may re-select its own reservation, which is how a retry works.
-        assert!(s.reserve(&r, A, Some(2), now));
+        assert!(s.reserve(&r, A, Some(2), SELECT_TIMEOUT, now));
 
         // Once it has expired, anyone may take it.
         let later = now + SELECT_TIMEOUT + Duration::from_secs(1);
-        assert!(s.reserve(&r, B, Some(1), later));
+        assert!(s.reserve(&r, B, Some(1), SELECT_TIMEOUT, later));
     }
 
     /// An operate from a connection that did not select the object is the
@@ -165,7 +168,7 @@ mod tests {
         let mut s = Selections::default();
         let now = Instant::now();
         let r = reference();
-        s.reserve(&r, A, Some(5), now);
+        s.reserve(&r, A, Some(5), SELECT_TIMEOUT, now);
 
         assert_eq!(s.check_operate(&r, A, 5, now), AddCause::NONE);
         assert_eq!(
@@ -181,7 +184,7 @@ mod tests {
         let mut s = Selections::default();
         let now = Instant::now();
         let r = reference();
-        s.reserve(&r, A, Some(5), now);
+        s.reserve(&r, A, Some(5), SELECT_TIMEOUT, now);
 
         assert_eq!(
             s.check_operate(&r, A, 6, now),
@@ -197,7 +200,7 @@ mod tests {
         let mut s = Selections::default();
         let now = Instant::now();
         let r = reference();
-        s.reserve(&r, A, None, now);
+        s.reserve(&r, A, None, SELECT_TIMEOUT, now);
 
         assert_eq!(s.check_operate(&r, A, 0, now), AddCause::NONE);
         assert_eq!(s.check_operate(&r, A, 42, now), AddCause::NONE);
@@ -212,7 +215,7 @@ mod tests {
         let mut s = Selections::default();
         let now = Instant::now();
         let r = reference();
-        s.reserve(&r, A, Some(1), now);
+        s.reserve(&r, A, Some(1), SELECT_TIMEOUT, now);
 
         let later = now + SELECT_TIMEOUT + Duration::from_millis(1);
         assert_eq!(
@@ -246,7 +249,7 @@ mod tests {
         let mut s = Selections::default();
         let now = Instant::now();
         let r = reference();
-        s.reserve(&r, A, Some(3), now);
+        s.reserve(&r, A, Some(3), SELECT_TIMEOUT, now);
 
         assert_eq!(
             s.check_cancel(&r, B, 3, now),
@@ -265,8 +268,8 @@ mod tests {
         let now = Instant::now();
         let r1 = ObjectReference::new("LD/GGIO1.SPCSO1");
         let r2 = ObjectReference::new("LD/GGIO1.SPCSO2");
-        s.reserve(&r1, A, Some(1), now);
-        s.reserve(&r2, B, Some(1), now);
+        s.reserve(&r1, A, Some(1), SELECT_TIMEOUT, now);
+        s.reserve(&r2, B, Some(1), SELECT_TIMEOUT, now);
         assert_eq!(s.len(), 2);
 
         s.clear(&r1);
