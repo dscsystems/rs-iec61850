@@ -517,8 +517,23 @@ impl Conn {
                 [object_name(domain, list_name)],
             )],
         );
-        self.call_inner(req).await?;
-        Ok(())
+        let resp = self.call_inner(req).await?;
+        // DeleteNamedVariableList-Response ::= SEQUENCE {
+        //   numberMatched [0] Unsigned32, numberDeleted [1] Unsigned32 }
+        let content = Decoder::new(&resp).expect(context_constructed(SVC_DELETE_NAMED_VAR_LIST))?;
+        let mut dec = Decoder::new(content);
+        let (Ok(mb), Ok(db)) = (dec.expect(context_primitive(0)), dec.expect(context_primitive(1))) else {
+            return Err(Error::protocol("malformed DeleteNamedVariableList response"));
+        };
+        let matched = asn1::decode_uint(mb).unwrap_or(0);
+        let deleted = asn1::decode_uint(db).unwrap_or(0);
+        if deleted > 0 {
+            Ok(())
+        } else if matched == 0 {
+            Err(DataAccessError::ObjectNonExistent.into())
+        } else {
+            Err(Error::NotDeleted)
+        }
     }
 
     /// Returns the member references of a named variable list (dataset).
@@ -610,12 +625,11 @@ impl Conn {
 
     /// Deletes a file from the server's filestore.
     pub async fn file_delete(&self, name: &str) -> Result<()> {
+        // FileDelete-Request ::= FileName, the strings themselves: an extra
+        // [0] around them is refused by libiec61850.
         let req = cons(
             context_constructed(SVC_FILE_DELETE),
-            [cons(
-                context_constructed(0),
-                [prim(TAG_GRAPHIC_STRING, name.as_bytes().to_vec())],
-            )],
+            [prim(TAG_GRAPHIC_STRING, name.as_bytes().to_vec())],
         );
         self.call_inner(req).await?;
         Ok(())
@@ -734,7 +748,8 @@ fn parse_generalized_time(s: &str) -> Option<SystemTime> {
 
 // Journal (log) services.
 impl Conn {
-    /// Queries a journal (log) for entries in the inclusive time range.
+    /// Queries a journal (log) for entries in the inclusive time range,
+    /// following the server's continuation until the range is complete.
     pub async fn read_journal_by_time(
         &self,
         domain: &str,
@@ -751,18 +766,14 @@ impl Conn {
                     context_constructed(1),
                     [prim(context_primitive(0), binary_time_bytes(start))],
                 ),
-                // rangeStopSpecification [2]
-                cons(
-                    context_constructed(2),
-                    [prim(context_primitive(0), binary_time_bytes(end))],
-                ),
+                range_stop(end),
             ],
         );
-        self.read_journal(req).await
+        self.read_journal_all(domain, item, req, Some(end)).await
     }
 
     /// Queries a journal for entries after the given time and entry id, for
-    /// gap-free continuation.
+    /// gap-free continuation, following the server's continuation.
     pub async fn read_journal_after(
         &self,
         domain: &str,
@@ -770,24 +781,37 @@ impl Conn {
         after: SystemTime,
         entry_id: &[u8],
     ) -> Result<Vec<JournalEntry>> {
-        let req = cons(
-            context_constructed(SVC_READ_JOURNAL),
-            [
-                journal_name(domain, item),
-                // entryToStartAfter [3]
-                cons(
-                    context_constructed(3),
-                    [
-                        prim(context_primitive(0), binary_time_bytes(after)),
-                        prim(context_primitive(1), entry_id.to_vec()),
-                    ],
-                ),
-            ],
-        );
-        self.read_journal(req).await
+        let req = after_request(domain, item, after, entry_id, None);
+        self.read_journal_all(domain, item, req, None).await
     }
 
-    async fn read_journal(&self, req: Element) -> Result<Vec<JournalEntry>> {
+    /// Issues `req` and, while the server says more follow, continues after
+    /// the last entry received.
+    async fn read_journal_all(
+        &self,
+        domain: &str,
+        item: &str,
+        mut req: Element,
+        end: Option<SystemTime>,
+    ) -> Result<Vec<JournalEntry>> {
+        let mut all = Vec::new();
+        loop {
+            let (entries, more) = self.read_journal(req).await?;
+            let last = entries.last().cloned();
+            all.extend(entries);
+            match (more, last) {
+                (true, Some(last)) => {
+                    let after = last.occurrence_time.unwrap_or(SystemTime::UNIX_EPOCH);
+                    req = after_request(domain, item, after, &last.entry_id, end);
+                }
+                _ => return Ok(all),
+            }
+        }
+    }
+
+    /// Issues one ReadJournal and returns its entries and whether the server
+    /// has more.
+    async fn read_journal(&self, req: Element) -> Result<(Vec<JournalEntry>, bool)> {
         let resp = self.call_inner(req).await?;
         let mut dec = Decoder::new(&resp);
         let content = dec.expect(context_constructed(SVC_READ_JOURNAL))?;
@@ -799,8 +823,42 @@ impl Conn {
             let entry_content = ld.expect(TAG_SEQUENCE)?;
             entries.push(parse_journal_entry(entry_content)?);
         }
-        Ok(entries)
+        // moreFollows [1]
+        let more = matches!(inner.optional(context_primitive(1))?, Some(b) if b.first().is_some_and(|v| *v != 0));
+        Ok((entries, more))
     }
+}
+
+/// A ReadJournal continuing after one entry, up to `end` when given.
+/// entryToStartAfter is [5] in ISO 9506-2; earlier versions of this crate
+/// sent [3], which no other server understands.
+fn after_request(
+    domain: &str,
+    item: &str,
+    after: SystemTime,
+    entry_id: &[u8],
+    end: Option<SystemTime>,
+) -> Element {
+    let mut req = cons(context_constructed(SVC_READ_JOURNAL), [journal_name(domain, item)]);
+    if let Some(end) = end {
+        req.push(range_stop(end));
+    }
+    req.push(cons(
+        context_constructed(5), // entryToStartAfter [5]
+        [
+            prim(context_primitive(0), binary_time_bytes(after)),
+            prim(context_primitive(1), entry_id.to_vec()),
+        ],
+    ));
+    req
+}
+
+/// rangeStopSpecification [2] { endingTime [0] }.
+fn range_stop(end: SystemTime) -> Element {
+    cons(
+        context_constructed(2),
+        [prim(context_primitive(0), binary_time_bytes(end))],
+    )
 }
 
 fn journal_name(domain: &str, item: &str) -> Element {
@@ -851,15 +909,21 @@ fn parse_entry_content(content: &[u8], e: &mut JournalEntry) {
     }
 }
 
+/// Reads the data [2] of an entry. ISO 9506-2 puts the variables in
+/// listOfVariables [1], each a SEQUENCE { variableTag [0], valueSpecification
+/// [1] Data }; the variables are also accepted directly in data, a shape some
+/// servers send.
 fn parse_journal_variables(content: &[u8], e: &mut JournalEntry) {
-    // Each journal variable is a SEQUENCE { variableTag GraphicString,
-    // valueSpecification [1] Data }.
     let mut dec = Decoder::new(content);
     while dec.more() {
         let Ok((tag, c)) = dec.read_tlv() else {
             return;
         };
-        if tag != TAG_SEQUENCE && tag != context_constructed(1) {
+        if tag == context_constructed(1) {
+            parse_journal_variables(c, e);
+            continue;
+        }
+        if tag != TAG_SEQUENCE {
             continue;
         }
         let mut jv = JournalVariable {

@@ -31,7 +31,7 @@ impl Filter {
         }
     }
 
-    fn matches(&self, m: &Message) -> bool {
+    pub(crate) fn matches(&self, m: &Message) -> bool {
         if self.app_id != 0 && m.app_id != self.app_id {
             return false;
         }
@@ -174,12 +174,15 @@ impl SequenceTracker {
 
         match self.states.get_mut(&m.go_cb_ref) {
             Some(st) => {
-                if m.st_num < st.st_num {
+                // Both counters roll over to 1, not 0, so the wrap is neither
+                // a regression nor a gap.
+                let wrapped = st.st_num == u32::MAX && m.st_num == 1;
+                if m.st_num < st.st_num && !wrapped {
                     out.st_num_regressed = true;
                 }
                 out.sq_num_gap = if m.st_num == st.st_num {
                     // Within one state, the sequence must advance by one.
-                    m.sq_num != st.sq_num.wrapping_add(1)
+                    m.sq_num != st.sq_num.wrapping_add(1).max(1)
                 } else {
                     // A new state restarts the sequence at zero.
                     m.sq_num != 0

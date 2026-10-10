@@ -22,7 +22,10 @@ pub struct Node {
     pub children: Vec<Node>,
 }
 
-/// Bounds nesting so a hostile or corrupt document cannot exhaust the stack.
+/// Bounds the nesting kept in the tree, so a hostile or corrupt document
+/// cannot exhaust the stack. Deeper elements are well-formedness checked but
+/// not kept: no SCL construct nests anywhere near this deep, and the audit
+/// reports what was skipped.
 const MAX_DEPTH: usize = 256;
 
 impl Node {
@@ -91,6 +94,8 @@ pub fn parse(xml: &str) -> Result<Node, Error> {
     // The element currently being filled, plus its open ancestors.
     let mut stack: Vec<Node> = Vec::new();
     let mut root: Option<Node> = None;
+    // How many open elements beyond MAX_DEPTH are being skipped.
+    let mut skipped = 0usize;
 
     loop {
         match reader.read_event() {
@@ -103,13 +108,17 @@ pub fn parse(xml: &str) -> Result<Node, Error> {
             Ok(Event::Eof) => break,
 
             Ok(Event::Start(e)) => {
-                if stack.len() >= MAX_DEPTH {
-                    return Err(Error::Xml(format!("nesting deeper than {MAX_DEPTH}")));
+                if skipped > 0 || stack.len() >= MAX_DEPTH {
+                    skipped += 1;
+                    continue;
                 }
                 stack.push(node_from(&e)?);
             }
 
             Ok(Event::Empty(e)) => {
+                if skipped > 0 || stack.len() >= MAX_DEPTH {
+                    continue;
+                }
                 let node = node_from(&e)?;
                 match stack.last_mut() {
                     Some(parent) => parent.children.push(node),
@@ -120,6 +129,10 @@ pub fn parse(xml: &str) -> Result<Node, Error> {
             }
 
             Ok(Event::End(_)) => {
+                if skipped > 0 {
+                    skipped -= 1;
+                    continue;
+                }
                 let Some(node) = stack.pop() else {
                     return Err(Error::Xml("unbalanced end tag".into()));
                 };
@@ -130,6 +143,9 @@ pub fn parse(xml: &str) -> Result<Node, Error> {
             }
 
             Ok(Event::Text(t)) => {
+                if skipped > 0 {
+                    continue;
+                }
                 if let Some(top) = stack.last_mut() {
                     let decoded = t
                         .unescape()
@@ -139,6 +155,9 @@ pub fn parse(xml: &str) -> Result<Node, Error> {
             }
 
             Ok(Event::CData(t)) => {
+                if skipped > 0 {
+                    continue;
+                }
                 // CDATA is literal by definition, so it is taken as-is
                 // rather than unescaped.
                 if let Some(top) = stack.last_mut() {
@@ -152,7 +171,7 @@ pub fn parse(xml: &str) -> Result<Node, Error> {
         }
     }
 
-    if !stack.is_empty() {
+    if !stack.is_empty() || skipped > 0 {
         return Err(Error::Xml("unclosed element at end of document".into()));
     }
     root.ok_or_else(|| Error::Xml("document has no root element".into()))
@@ -285,10 +304,22 @@ mod tests {
         assert!(parse("<SCL attr=></SCL>").is_err());
     }
 
+    /// Nesting beyond the bound is checked and skipped rather than kept,
+    /// so it can neither overflow the stack nor make a well-formed document
+    /// unreadable.
     #[test]
-    fn deep_nesting_is_rejected_rather_than_overflowing_the_stack() {
-        let deep = "<a>".repeat(MAX_DEPTH + 8);
-        assert!(parse(&deep).is_err());
+    fn deep_nesting_is_skipped_rather_than_overflowing_the_stack() {
+        let n = MAX_DEPTH + 5000;
+        let deep = format!("{}{}", "<a>".repeat(n), "</a>".repeat(n));
+        let root = parse(&deep).unwrap();
+        let mut depth = 1;
+        let mut node = &root;
+        while let Some(c) = node.children.first() {
+            node = c;
+            depth += 1;
+        }
+        assert_eq!(depth, MAX_DEPTH);
+        assert!(parse(&"<a>".repeat(MAX_DEPTH + 8)).is_err(), "still unclosed");
     }
 
     #[test]

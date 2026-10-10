@@ -39,6 +39,29 @@ impl Client {
             .read_journal_after(&domain, &item, after, entry_id)
             .await?)
     }
+
+    /// Returns how many entries a log (`LD/LN.LG.LogName`) holds, and whether
+    /// the server lets clients delete them (MMS ReportJournalStatus).
+    pub async fn log_status(&self, log_ref: impl Into<ObjectReference>) -> Result<crate::mms::JournalStatus> {
+        let (domain, item) = log_ref_to_mms(&log_ref.into());
+        Ok(self.mms().report_journal_status(&domain, &item).await?)
+    }
+
+    /// Deletes log entries (MMS InitializeJournal): all of them when `until` is
+    /// `None`, else those up to and including `until` and, when `entry_id` is
+    /// not empty, no further than that entry. It returns how many went.
+    pub async fn clear_log(
+        &self,
+        log_ref: impl Into<ObjectReference>,
+        until: Option<SystemTime>,
+        entry_id: &[u8],
+    ) -> Result<u32> {
+        let (domain, item) = log_ref_to_mms(&log_ref.into());
+        Ok(self
+            .mms()
+            .initialize_journal(&domain, &item, until, entry_id)
+            .await?)
+    }
 }
 
 #[cfg(test)]

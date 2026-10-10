@@ -139,6 +139,53 @@ async fn in_process_harness() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn process_bus_from_the_model(
+    eth: Arc<dyn ethernet::Interface>,
+    ld: &model::LogicalDevice,
+    lln0: &model::LogicalNode,
+    gcb: &model::GseControl,
+    src_mac: [u8; 6],
+    key_material: Vec<u8>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use iec61850::rsession;
+    let publisher = goose::Publisher::from_model(eth.clone(), ld, lln0, gcb, src_mac)?;
+
+    let keys = Arc::new(rsession::KeyStore::with_keys([rsession::Key {
+        id: 1,
+        material: key_material,
+        sec: rsession::SecAlgorithm::AES_128_GCM,
+        ..Default::default()
+    }])?);
+    let session: Arc<dyn ethernet::Interface> = Arc::new(rsession::Session::open(rsession::Config {
+        remote: "239.192.0.1:102".into(),
+        keys: Some(keys),
+        ..Default::default()
+    })?);
+    let publisher = goose::Publisher::new(session, goose::PublisherConfig {
+        go_cb_ref: "IED1LD0/LLN0$GO$gcb01".into(),
+        ..Default::default()
+    })?;
+    Ok(())
+}
+
+#[cfg(feature = "tls")]
+async fn security(
+    cert: rustls::pki_types::CertificateDer<'static>,
+    key: rustls::pki_types::PrivateKeyDer<'static>,
+    root: rustls::pki_types::CertificateDer<'static>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use iec61850::iec62351;
+    let cfg = iec62351::client_config(iec62351::Options {
+        certificates: vec![cert],
+        key: Some(key),
+        roots: vec![root],
+        server_name: "ied1".into(),
+        ..Default::default()
+    })?;
+    let client = Client::dial_with("ied1:3782", Options::new().with_tls(cfg)).await?;
+    Ok(())
+}
+
 /// The guide claims the package and the library have different names, which is
 /// the first thing a new application gets wrong.
 #[test]

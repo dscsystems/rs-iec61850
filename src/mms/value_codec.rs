@@ -142,6 +142,16 @@ fn decode_data_tlv(tag: Tag, content: &[u8], depth: usize) -> Result<Value> {
         }
         TAG_DATA_MMS_STRING => Value::MmsString(content.to_vec()),
         TAG_DATA_UTC_TIME => Value::utc_time_raw(content)?,
+        // A DataAccessError nested inside a structure or array. ISO 9506
+        // Data has no [0] alternative, but libiec61850 servers encode an
+        // element they cannot serve this way (a setting-group-editable
+        // attribute outside an edit session reads as temporarily-unavailable
+        // inside its logical node) and libiec61850 clients accept it.
+        // Refusing it failed the whole read. data_element encodes the value
+        // back as [0], so it round-trips.
+        0 if !tag.constructed => {
+            Value::access_error(DataAccessError::from_code(asn1::decode_uint(content)? as u8))
+        }
         n => {
             return Err(Error::protocol(format!("unsupported data tag [{n}]")));
         }
@@ -163,6 +173,20 @@ pub fn decode_access_result(dec: &mut Decoder<'_>) -> Result<Value> {
 
 #[cfg(test)]
 mod tests {
+    /// An access error nested in a structure decodes rather than failing the
+    /// read, and encodes back the same way.
+    #[test]
+    fn a_nested_access_error_round_trips() {
+        let v = Value::structure(vec![
+            Value::boolean(true),
+            Value::access_error(DataAccessError::TemporarilyUnavailable),
+        ]);
+        let enc = encode_data(&v);
+        let back = decode_data(&mut Decoder::new(&enc)).unwrap();
+        assert_eq!(back.index(1).unwrap().as_access_error(), Some(DataAccessError::TemporarilyUnavailable));
+        assert_eq!(encode_data(&back), enc);
+    }
+
     use super::*;
     use crate::mms::TimeQuality;
 

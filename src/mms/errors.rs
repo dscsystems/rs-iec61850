@@ -208,8 +208,27 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("mms: {0}")]
     Protocol(String),
+    /// The server refused the association: its AARE carried result rejected,
+    /// with this ACSE service-user diagnostic.
+    #[error("mms: association rejected{}", rejected_reason(*.0))]
+    Rejected(i64),
+    /// The association ended by an abort (ACSE A-ABORT over a session ABORT)
+    /// rather than a release: by the peer, or by `abort` on this end.
+    #[error("mms: association aborted{0}")]
+    Aborted(String),
+    /// An authenticator refused the association; the client was told so (an
+    /// AARE with result rejected) before the connection was closed.
     #[error("mms: association rejected: {0}")]
-    Rejected(String),
+    AssociationRejected(String),
+    /// Returned by an authenticator, rejects the association as needing
+    /// authentication (ACSE diagnostic authentication-required) rather than
+    /// as having failed it.
+    #[error("mms: authentication required")]
+    AuthenticationRequired,
+    /// A data set the server has but would not delete: one it was configured
+    /// with, or one a control block uses (IEC 61850-7-2).
+    #[error("mms: named variable list exists but was not deleted")]
+    NotDeleted,
     #[error("mms: connection closed")]
     Closed,
     #[error("mms: request timed out")]
@@ -223,6 +242,60 @@ pub enum Error {
 impl Error {
     pub(crate) fn protocol(msg: impl Into<String>) -> Error {
         Error::Protocol(msg.into())
+    }
+
+    /// Reports whether the error is an association refused for a failed or
+    /// missing authentication.
+    pub fn is_authentication_failure(&self) -> bool {
+        matches!(
+            self,
+            Error::Rejected(d) if *d == crate::osi::acse::DIAG_AUTHENTICATION_FAILURE
+                || *d == crate::osi::acse::DIAG_AUTHENTICATION_REQUIRED
+        )
+    }
+
+    /// Returns the confirmed-error or reject the peer answered with, if that
+    /// is what this is.
+    pub fn as_service_error(&self) -> Option<&ServiceError> {
+        match self {
+            Error::Service(se) => Some(se),
+            _ => None,
+        }
+    }
+
+    /// Returns the data access error of a failed item, if that is what this
+    /// is.
+    pub fn as_access_error(&self) -> Option<DataAccessError> {
+        match self {
+            Error::Access(e) => Some(*e),
+            _ => None,
+        }
+    }
+
+    /// Rebuilds an equivalent error for a second recipient. The original is
+    /// handed to the first; the others get the same kind with its message.
+    pub(crate) fn duplicate(&self) -> Error {
+        match self {
+            Error::Service(se) => Error::Service(se.clone()),
+            Error::Access(e) => Error::Access(*e),
+            Error::Rejected(d) => Error::Rejected(*d),
+            Error::Aborted(s) => Error::Aborted(s.clone()),
+            Error::Closed => Error::Closed,
+            Error::Timeout => Error::Timeout,
+            Error::NotDeleted => Error::NotDeleted,
+            Error::ReportQueueFull => Error::ReportQueueFull,
+            Error::AuthenticationRequired => Error::AuthenticationRequired,
+            Error::AssociationRejected(s) => Error::AssociationRejected(s.clone()),
+            other => Error::Protocol(other.to_string()),
+        }
+    }
+}
+
+fn rejected_reason(diagnostic: i64) -> String {
+    match diagnostic {
+        crate::osi::acse::DIAG_AUTHENTICATION_FAILURE => ": authentication failure".into(),
+        crate::osi::acse::DIAG_AUTHENTICATION_REQUIRED => ": authentication required".into(),
+        d => format!(" (diagnostic {d})"),
     }
 }
 

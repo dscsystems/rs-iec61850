@@ -43,13 +43,15 @@
 mod le;
 mod pdu;
 mod publisher;
+mod scl;
 mod subscriber;
 
 pub use le::{
     decode_le_into, decode_le_sample, encode_le_sample, write_le_sample, LeSample, LE_SAMPLE_LEN,
 };
 pub use pdu::{parse, Asdu, Pdu, SMP_SYNCH_GLOBAL, SMP_SYNCH_LOCAL, SMP_SYNCH_NONE};
-pub use publisher::{default_mac, LeConfig, LePublisher};
+pub use publisher::{default_mac, AsduOpts, LeConfig, LePublisher};
+pub use crate::model::SmpMod;
 pub use subscriber::{Filter, Subscriber, Subscription};
 
 /// Errors raised by the sampled-value layer.

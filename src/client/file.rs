@@ -54,12 +54,45 @@ impl Client {
         Ok(out)
     }
 
-    /// Deletes a file from the server's filestore.
+    /// Deletes a file from the server's filestore (IEC 61850 DeleteFile).
     pub async fn delete_file(&self, name: &str) -> Result<()> {
         self.mms().file_delete(name).await?;
         Ok(())
     }
+
+    /// Stores `data` in the server's file store as `name` (IEC 61850 SetFile,
+    /// which IEC 61850-8-1 maps to MMS obtainFile: the server reads the file
+    /// back from this client). The server refuses a name that exists.
+    pub async fn set_file(&self, name: &str, data: Vec<u8>) -> Result<()> {
+        self.mms()
+            .obtain_file(crate::mms::ObtainSource::Bytes(data), SET_FILE_LOCAL_NAME, name)
+            .await?;
+        Ok(())
+    }
+
+    /// [`set_file`](Client::set_file) with the content read from the local
+    /// file `src`.
+    pub async fn set_file_from(&self, src: impl AsRef<std::path::Path>, name: &str) -> Result<()> {
+        let src = src.as_ref();
+        let local = src
+            .file_name()
+            .map_or_else(|| SET_FILE_LOCAL_NAME.to_string(), |n| n.to_string_lossy().into_owned());
+        self.mms()
+            .obtain_file(crate::mms::ObtainSource::File(src.to_path_buf()), &local, name)
+            .await?;
+        Ok(())
+    }
+
+    /// Renames a file in the server's file store (MMS fileRename). A server
+    /// refuses it when the new name is taken.
+    pub async fn rename_file(&self, current: &str, renamed: &str) -> Result<()> {
+        self.mms().file_rename(current, renamed).await?;
+        Ok(())
+    }
 }
+
+/// The name an in-memory SetFile is served under while the server reads it.
+const SET_FILE_LOCAL_NAME: &str = "setfile.bin";
 
 impl FileReader {
     /// Returns the file size the server reported when the file was opened.

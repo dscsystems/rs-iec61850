@@ -5,15 +5,20 @@
 //! for the process side to drive value changes.
 
 pub mod access;
+mod cb;
 mod control;
 mod file;
 mod handler;
+mod journal;
 mod rcb;
 mod reporting;
 #[allow(clippy::module_inception)]
 mod server;
 mod select;
+mod services_ext;
 mod settinggroup;
+mod svcb;
+mod tracking;
 mod tx;
 
 pub use control::{ControlCtx, Phase};
@@ -23,7 +28,9 @@ pub use server::{
     WriteHandler, ERR_ACCESS_DENIED, ERR_OBJECT_NON_EXISTENT, ERR_OBJECT_VALUE_INVALID,
 };
 pub use server::ConnMap;
+pub use journal::DEFAULT_LOG_CAPACITY;
 pub use settinggroup::SettingGroupManager;
+pub use svcb::{SvControlEvent, SvControlHandler};
 pub use tx::Tx;
 
 /// Identifies one accepted client association.

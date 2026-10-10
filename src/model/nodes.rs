@@ -1,8 +1,10 @@
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::net::IpAddr;
 
 use crate::mms::{Type, Value};
 
-use super::{Fc, ObjectReference, OptFlds, TrgOps};
+use super::{fc_text, Diagnostic, Fc, ObjectReference, OptFlds, TrgOps};
 
 /// The root of an IED data model: the server's view when built from SCL or by
 /// hand, and the client's view when retrieved online.
@@ -11,6 +13,28 @@ pub struct Model {
     /// The IED name.
     pub name: String,
     pub devices: Vec<LogicalDevice>,
+    /// Non-fatal problems found while interpreting the source of this model
+    /// (SCL build, or online retrieval): unknown basic types, unknown
+    /// functional constraints, unresolvable dataset members. The model is
+    /// still usable. See [`Diagnostic`].
+    pub diagnostics: Vec<Diagnostic>,
+    /// The per-group initial values of FC SG and SE attributes, when the
+    /// source configuration defines them (SCL `Val` elements carrying an
+    /// `sGroup`).
+    pub setting_groups: Vec<SettingGroup>,
+}
+
+/// One setting group of a logical device: the value each setting-group
+/// attribute takes in it.
+#[derive(Debug, Clone, Default)]
+pub struct SettingGroup {
+    /// The setting-group number, from 1.
+    pub number: usize,
+    /// The logical device (MMS domain) the group applies to.
+    pub ld: String,
+    /// Maps an attribute reference, for example
+    /// `SIMPLEIOLD0/GGIO1.AnIn1.setVal`, to its value in this group.
+    pub values: BTreeMap<String, Value>,
 }
 
 /// One MMS domain.
@@ -38,6 +62,10 @@ pub struct LogicalNode {
     pub sv_controls: Vec<SvControl>,
     pub log_controls: Vec<LogControl>,
     pub setting_control: Option<SettingControl>,
+    /// The logs this node holds (SCL `Log` elements), which a server serves
+    /// as MMS journals named `LN$Name`. A log a [`LogControl`] writes to is
+    /// served whether or not it is declared here.
+    pub logs: Vec<String>,
 }
 
 /// A data object or sub-data-object.
@@ -58,6 +86,9 @@ pub struct DataObject {
 pub struct DataAttribute {
     pub name: String,
     pub fc: Fc,
+    /// The constraint's mnemonic verbatim from the source, used when `fc` is
+    /// [`Fc::Unknown`].
+    pub fc_name: String,
     /// The leaf basic type, or [`Type::Structure`] / [`Type::Array`].
     pub kind: Option<Type>,
     /// The SCL `bType` (for example `Quality`, `Timestamp`, `INT32`), kept for
@@ -84,6 +115,10 @@ pub struct DataAttribute {
 pub struct DataSet {
     pub name: String,
     pub entries: Vec<Fcda>,
+    /// Marks a data set a client created (DefineNamedVariableList), which a
+    /// client may also delete. Configured ones are not deletable
+    /// (IEC 61850-7-2).
+    pub deletable: bool,
 }
 
 /// One dataset member.
@@ -92,6 +127,25 @@ pub struct Fcda {
     /// `LD/LN.DO[.DA]`.
     pub reference: ObjectReference,
     pub fc: Fc,
+    /// The constraint's mnemonic verbatim from the source, used when `fc` is
+    /// [`Fc::Unknown`].
+    pub fc_name: String,
+}
+
+impl Fcda {
+    /// Returns a member under a known constraint.
+    pub fn new(reference: impl Into<ObjectReference>, fc: Fc) -> Fcda {
+        Fcda {
+            reference: reference.into(),
+            fc,
+            fc_name: String::new(),
+        }
+    }
+
+    /// Renders the functional constraint of the member.
+    pub fn fc_text(&self) -> String {
+        fc_text(self.fc, &self.fc_name)
+    }
 }
 
 /// The SCL-side configuration of a report control block.
@@ -119,6 +173,93 @@ pub struct ReportControl {
     /// is enabled. Zero leaves it to the server's own default, and it has no
     /// meaning for an unbuffered control block.
     pub max_queue_size: usize,
+    /// The clients the configuration reserves instances for (SCL
+    /// `RptEnabled/ClientLN`), in instance order: `reservations[i]` holds
+    /// instance `i+1`. Only that client may use the instance, and a BRCB
+    /// reports `ResvTms` -1 for it (IEC 61850-7-2). A `None` entry leaves its
+    /// instance free.
+    pub reservations: Vec<Option<ClientReservation>>,
+}
+
+/// Identifies the client a report control block instance is reserved for.
+///
+/// The server knows a client by its transport address before anything else,
+/// so the IP address is what the reservation is checked against; `ied_name`
+/// is informational.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientReservation {
+    pub ied_name: String,
+    pub ip: Option<IpAddr>,
+}
+
+/// The variant of a GOOSE control block: plain GOOSE or the legacy GSSE.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GsType {
+    #[default]
+    Goose,
+    Gsse,
+}
+
+impl std::fmt::Display for GsType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            GsType::Goose => "GOOSE",
+            GsType::Gsse => "GSSE",
+        })
+    }
+}
+
+/// The sample mode of a sampled-value control block: the rate is samples per
+/// measurement period, per second, or seconds per sample (IEC 61850-9-2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SmpMod {
+    #[default]
+    SmpPerPeriod,
+    SmpPerSec,
+    SecPerSmp,
+}
+
+impl SmpMod {
+    /// Returns the wire and SCL code: 0, 1 or 2.
+    pub fn code(self) -> u8 {
+        match self {
+            SmpMod::SmpPerPeriod => 0,
+            SmpMod::SmpPerSec => 1,
+            SmpMod::SecPerSmp => 2,
+        }
+    }
+
+    /// Returns the mode for a code; anything unknown is samples per period.
+    pub fn from_code(code: i64) -> SmpMod {
+        match code {
+            1 => SmpMod::SmpPerSec,
+            2 => SmpMod::SecPerSmp,
+            _ => SmpMod::SmpPerPeriod,
+        }
+    }
+}
+
+impl std::fmt::Display for SmpMod {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            SmpMod::SmpPerPeriod => "SmpPerPeriod",
+            SmpMod::SmpPerSec => "SmpPerSec",
+            SmpMod::SecPerSmp => "SecPerSmp",
+        })
+    }
+}
+
+/// The optional fields a sampled-value control block includes in its ASDU
+/// (IEC 61850-6 `SmvOpts`). A field is present only when its option is set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SvOpts {
+    pub refresh_time: bool,
+    pub sample_synchronized: bool,
+    pub sample_rate: bool,
+    pub data_set: bool,
+    pub security: bool,
+    pub timestamp: bool,
+    pub synch_source_id: bool,
 }
 
 /// The SCL-side configuration of a GOOSE control block.
@@ -128,9 +269,16 @@ pub struct GseControl {
     pub go_id: String,
     pub data_set: String,
     pub conf_rev: u32,
+    pub kind: GsType,
+    /// The transmission profile, for example `R-GOOSE`: the routable profile
+    /// of IEC 61850-90-5, which [`crate::rsession`] carries.
+    pub protocol: String,
     /// Communication parameters resolved from the SCL Communication section,
     /// zero when absent.
     pub dst_mac: [u8; 6],
+    /// The destination of a routable block (the `IP` or `IPv6` address
+    /// parameter), `None` when the address has none.
+    pub dst_ip: Option<IpAddr>,
     pub app_id: u16,
     pub vlan_id: u16,
     pub vlan_pri: u8,
@@ -138,6 +286,12 @@ pub struct GseControl {
     pub min_time: u32,
     /// The stable retransmission time in milliseconds.
     pub max_time: u32,
+    /// `GSEControl@fixedOffs`: the block asks for the fixed-offset encoding of
+    /// IEC 61850-8-1, in which every dataset member has a fixed position and
+    /// length in the frame. It is served as `GoCB.FixedOffs`. This crate
+    /// encodes GOOSE only with variable lengths, so the loader reports a block
+    /// that sets it.
+    pub fixed_offs: bool,
 }
 
 /// The SCL-side configuration of a sampled-value control block.
@@ -150,7 +304,17 @@ pub struct SvControl {
     pub smp_rate: u32,
     pub no_asdu: u32,
     pub multicast: bool,
+    pub smp_mod: SmpMod,
+    pub opts: SvOpts,
+    /// `SampledValueControl@svType` as the SCL gives it, empty when the
+    /// attribute is absent. It is carried for tools that report the
+    /// configuration; the publisher does not interpret it.
+    pub sv_type: String,
+    /// The transmission profile, for example `R-SV`.
+    pub protocol: String,
     pub dst_mac: [u8; 6],
+    /// The destination of a routable block, as for [`GseControl`].
+    pub dst_ip: Option<IpAddr>,
     pub app_id: u16,
     pub vlan_id: u16,
     pub vlan_pri: u8,
@@ -165,6 +329,16 @@ pub struct LogControl {
     pub trg_ops: TrgOps,
     pub intg_pd: u32,
     pub log_ena: bool,
+    /// The buffer period in milliseconds.
+    pub buf_time: u32,
+    /// Whether the log is written with a reason for each entry.
+    pub reason_code: bool,
+    /// The logical device instance holding the log (`LogControl@ldInst`);
+    /// empty means the block's own device (IEC 61850-6).
+    pub log_ld_inst: String,
+    /// The logical node holding the log (prefix+lnClass+lnInst); empty means
+    /// `LLN0`.
+    pub log_ln: String,
 }
 
 /// Describes the setting groups of a logical device.
@@ -172,6 +346,9 @@ pub struct LogControl {
 pub struct SettingControl {
     pub num_of_sgs: u8,
     pub act_sg: u8,
+    /// How long a setting-group reservation lasts, in milliseconds
+    /// (IEC 61850-8-1, Ed 2.1). Zero leaves it to the server.
+    pub resv_tms: u32,
 }
 
 /// What a reference resolves to within a [`Model`].
@@ -184,6 +361,11 @@ pub enum Node<'a> {
 }
 
 impl Model {
+    /// Records a non-fatal problem on the model.
+    pub fn diagnostic(&mut self, path: impl Into<String>, message: impl Into<String>) {
+        self.diagnostics.push(Diagnostic::new(path, message));
+    }
+
     /// Returns the logical device with the given (domain) name.
     pub fn device(&self, name: &str) -> Option<&LogicalDevice> {
         self.devices.iter().find(|ld| ld.name == name)
@@ -344,6 +526,24 @@ impl DataObject {
         self.attributes.iter_mut().find(|a| a.name == name)
     }
 
+    /// Returns the mnemonic to use in an item ID for the constraint the object
+    /// exposes.
+    ///
+    /// An [`Fc::Unknown`] attribute carries the verbatim mnemonic, so an object
+    /// under a constraint this crate does not know still composes the name the
+    /// peer uses.
+    pub fn fc_text(&self, fc: Fc) -> String {
+        fn walk(o: &DataObject, fc: Fc) -> Option<String> {
+            for a in &o.attributes {
+                if a.fc == fc {
+                    return Some(fc_text(a.fc, &a.fc_name));
+                }
+            }
+            o.objects.iter().find_map(|s| walk(s, fc))
+        }
+        walk(self, fc).unwrap_or_else(|| fc.as_str().to_string())
+    }
+
     /// Returns the sorted set of functional constraints present on the object,
     /// including those of nested sub-objects.
     ///
@@ -376,6 +576,21 @@ impl DataAttribute {
     /// Returns the named child of a structured attribute, mutably.
     pub fn child_mut(&mut self, name: &str) -> Option<&mut DataAttribute> {
         self.children.iter_mut().find(|c| c.name == name)
+    }
+
+    /// Returns the mnemonic of the attribute's functional constraint.
+    pub fn fc_text(&self) -> String {
+        fc_text(self.fc, &self.fc_name)
+    }
+
+    /// Returns the `i`-th element of an array attribute, `None` when the
+    /// attribute is not an array of a basic type or the index is out of
+    /// range.
+    pub fn elem(&self, i: usize) -> Option<&Value> {
+        if self.kind != Some(Type::Array) {
+            return None;
+        }
+        self.value.as_ref()?.index(i)
     }
 
     /// Reports whether the attribute is a leaf carrying a value.
@@ -529,6 +744,7 @@ mod tests {
                     ..Default::default()
                 }],
             }],
+            ..Default::default()
         }
     }
 

@@ -1,0 +1,497 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  A synthetic IEC 61850-6:2009+AMD1 (Edition 2.1, SCL 2007B4) CID exercising
+  the constructs a real Ed 2.1 file uses and an Ed 1 or Ed 2.0 file usually
+  does not:
+
+    * PhyComAddr, SvOptFlds and LogOptFlds basic types (the physical
+      communication address of the PhyCom node, and the two option bit
+      strings of Ed 2.1)
+    * an SDO with a count, giving a multi-instance data object addressed
+      through array notation
+    * FCDA@ix naming a member of that array
+    * Val@sGroup giving a distinct initial value per setting group
+    * DAI@sAddr addressing one element of an array attribute
+    * SmvOpts and smpMod on a sampled-value control block
+    * a GSM/GSSE GSEControl and a R-GOOSE Protocol element
+    * a log control block naming its own logical node
+    * the full Services capability set
+    * an unknown basic type and an unknown functional constraint, both of
+      which must load and be reported rather than fail the load
+    * DocName on LN0
+    * the Edition 2 and 2.1 common data classes (HST, BAC, ORG, TSG, CUG,
+      VSG, CSG) and the 7-2 service tracking classes (CTS, GTS) under FC SR,
+      each shaped as IEC 61850-7-3 defines it
+-->
+<SCL xmlns="http://www.iec.ch/61850/2003/SCL" version="2007" revision="B" release="4">
+  <Header id="ED21" version="1" revision="1" toolID="go-iec61850 testgen">
+    <Text>Diverse Edition 2.1 CID</Text>
+    <History>
+      <Hitem version="1" revision="1" when="2024-01-01T00:00:00Z" who="testgen" what="created" why="fixture" />
+    </History>
+  </Header>
+
+  <Communication>
+    <SubNetwork name="station" bitRate="102400">
+      <ConnectedAP iedName="ED21" apName="S1" redProt="prp">
+        <Address>
+          <P type="IP">192.168.1.11/24</P>
+          <P type="IP-SUBNET">255.255.255.0</P>
+          <P type="IP-GATEWAY">192.168.1.1</P>
+          <P type="OSI-TSEL">0001</P>
+          <P type="OSI-SSEL">0001</P>
+          <P type="OSI-PSEL">00000001</P>
+          <P type="OSI-AP-Title">1,3,9999,23</P>
+          <P type="OSI-AE-Qualifier">23</P>
+          <P type="MMS-Port">102</P>
+        </Address>
+        <GSE ldInst="LD0" cbName="gcb01" desc="GOOSE block">
+          <Address>
+            <P type="MAC-Address">01-0C-CD-03-00-01</P>
+            <P type="IP">239.192.0.1</P>
+            <P type="APPID">2000</P>
+            <P type="VLAN-ID">0123</P>
+            <P type="VLAN-PRIORITY">4</P>
+          </Address>
+          <MinTime unit="s" multiplier="m">20</MinTime>
+          <MaxTime unit="s" multiplier="m">1000</MaxTime>
+        </GSE>
+        <GSE ldInst="LD0" cbName="gscb01" desc="GSSE block">
+          <Address>
+            <P type="MAC-Address">01-0C-CD-03-00-02</P>
+            <P type="APPID">2001</P>
+          </Address>
+        </GSE>
+        <SMV ldInst="LD0" cbName="msvcb01" desc="SV block">
+          <Address>
+            <P type="MAC-Address">01-0C-CD-04-00-01</P>
+            <P type="APPID">4000</P>
+          </Address>
+        </SMV>
+        <SMV ldInst="LD0" cbName="usvcb01" desc="unicast SV block">
+          <Address>
+            <P type="MAC-Address">01-0C-CD-04-00-02</P>
+            <P type="IPv6">2001:db8::10/64</P>
+            <P type="APPID">4001</P>
+          </Address>
+        </SMV>
+        <PhysConn type="iec60870-5-104">
+          <Address>
+            <P type="C37-118-IP-Port">2404</P>
+          </Address>
+        </PhysConn>
+      </ConnectedAP>
+      <!-- A client IED: its address is what a ClientLN reservation resolves to. -->
+      <ConnectedAP iedName="HMI" apName="S1">
+        <Address>
+          <P type="IP">10.0.0.50</P>
+        </Address>
+      </ConnectedAP>
+    </SubNetwork>
+  </Communication>
+
+  <IED name="ED21" type="ED21" manufacturer="ACME" configVersion="1.0"
+       originalSclVersion="2007" originalSclRevision="B" originalSclRelease="4"
+       engRight="modify" owner="ACME">
+    <Services nameLength="64">
+      <DynAssociation max="3" />
+      <SettingGroups>
+        <SGEdit max="2" />
+        <ConfSG max="4" />
+      </SettingGroups>
+      <GetDirectory getMaxAttributes="10" />
+      <ReadWrite max="9999" maxAttributes="1000" />
+      <TimerActivatedControl max="4" />
+      <GetCBValues max="100" />
+      <DataSetDirectory />
+      <GetDataObjectDefinition />
+      <GetDataSetValue />
+      <SetDataSetValue />
+      <SupSubscription maxGo="4" maxSv="2" />
+      <ConfSigRef max="1" />
+      <RedProt>hsr</RedProt>
+      <TimeSyncProt max="3" />
+      <CommProt max="3" />
+      <ValueHandling max="9" />
+      <FileHandling max="5" />
+      <ConfLNs />
+      <ConfDataSet max="8" maxAttributes="100" modify="false" />
+      <ConfReportControl max="20" maxBuf="16" bufMode="both" bufConf="both" />
+      <ReportSettings />
+      <ConfLogControl max="4" maxBuf="10" />
+      <LogSettings />
+      <GSESettings />
+      <GOOSE max="4" fixedOffs="true" rGOOSE="true" />
+      <GSSE max="1" />
+      <SMVSettings />
+      <SMVsc max="2" delivery="unicast-multicast" />
+      <ClientServices maxAttributes="500" maxReports="8" maxGOOSE="4" maxSMV="2"
+                     rGOOSE="true" rSV="true" supportsLdName="true" />
+      <GSEDir />
+    </Services>
+    <AccessPoint name="S1" server="true" clock="true">
+      <Services nameLength="64">
+        <ConfReportControl max="20" maxBuf="16" />
+      </Services>
+      <Server timeout="30">
+        <Authentication>weak</Authentication>
+        <Association iedName="ED21" ldInst="LD0" lnClass="LLN0" lnInst="" kind="1" associationID="1" />
+        <LDevice inst="LD0" ldName="Measurement">
+          <LN0 lnClass="LLN0" inst="" lnType="LLN0_1">
+            <DOI name="Mod">
+              <DAI name="stVal"><Val>on</Val></DAI>
+              <DAI name="ctlModel"><Val>status-only</Val></DAI>
+            </DOI>
+            <DataSet name="Measurements" desc="measured currents">
+              <FCDA ldInst="LD0" prefix="" lnClass="MMXU" lnInst="1" doName="TotW" daName="mag.f" fc="MX" desc="active power"/>
+              <!-- A member named with array notation, the usual spelling. -->
+              <FCDA ldInst="LD0" prefix="" lnClass="GGIO" lnInst="1" doName="AnIn3" daName="phsA(2).mag.f" fc="MX"/>
+              <!-- FCDA@ix selecting an element of an array attribute. -->
+              <FCDA ldInst="LD0" prefix="" lnClass="GGIO" lnInst="1" doName="AnIn1" daName="phsAngRef" fc="MX" ix="2"/>
+              <!-- An unknown FC: carried verbatim, not dropped. -->
+              <FCDA ldInst="LD0" prefix="" lnClass="GGIO" lnInst="1" doName="AnIn1" daName="mag.f" fc="ZX"/>
+            </DataSet>
+            <ReportControl name="urcb01" desc="unbuffered" rptID="ED21LD0/LLN0$urcb01$drp01"
+                           datSet="Measurements" confRev="1" buffered="false" bufTime="100" intgPd="5000">
+              <TrgOps dchg="true" qchg="true" dupd="true" period="true" gi="true"/>
+              <OptFields seqNum="true" timeStamp="true" dataSet="true" reasonCode="true"
+                         dataRef="true" entryID="true" configRef="true"/>
+              <RptEnabled max="2">
+                <ClientLN iedName="ED21" apName="S1" ldInst="LD0" prefix="" lnClass="IHMI" lnInst="1"/>
+              </RptEnabled>
+            </ReportControl>
+            <ReportControl name="brcb01" desc="buffered" rptID="ED21LD0/LLN0$brcb01$drp01"
+                           datSet="Measurements" confRev="1" buffered="true" bufTime="100" intgPd="0">
+              <TrgOps dchg="true" qchg="true" gi="true"/>
+              <OptFields seqNum="true" timeStamp="true" reasonCode="true" bufOvfl="true" entryID="true"/>
+              <!-- Instance 01 is reserved for HMI; instance 02 names an IED
+                   the document gives no address, which cannot be enforced. -->
+              <RptEnabled max="4">
+                <ClientLN iedName="HMI" apRef="S1" ldInst="LD0" lnClass="IHMI" lnInst="1"/>
+                <ClientLN iedName="GHOST" apRef="S1" ldInst="LD0" lnClass="IHMI" lnInst="1"/>
+              </RptEnabled>
+            </ReportControl>
+            <GSEControl name="gcb01" desc="trip GOOSE" appID="ED21LD0/LLN0.gcb01"
+                        datSet="Measurements" confRev="1" type="GOOSE" fixedOffs="true">
+              <Protocol>R-GOOSE</Protocol>
+            </GSEControl>
+            <GSEControl name="gscb01" desc="legacy GSSE" appID="ED21LD0/LLN0.gscb01"
+                        datSet="Measurements" confRev="1" type="GSSE"/>
+            <SampledValueControl name="msvcb01" desc="multicast SV" smvID="ED21MSVCB01"
+                                datSet="Measurements" confRev="1" smpRate="50" nofASDU="1"
+                                multicast="true" smpMod="SmpPerSec" svType=" MSV ">
+              <SmvOpts refreshTime="true" sampleSynchronized="true" sampleRate="true"
+                       dataSet="false" security="false" timestamp="true" synchSourceId="true"/>
+            </SampledValueControl>
+            <SampledValueControl name="usvcb01" desc="unicast R-SV" smvID="ED21USVCB01"
+                                datSet="Measurements" confRev="1" smpRate="4000" nofASDU="1"
+                                multicast="false" smpMod="SmpPerPeriod">
+              <SmvOpts refreshTime="false" sampleSynchronized="true" sampleRate="false"
+                       dataSet="true" security="true" timestamp="true" synchSourceId="true"/>
+              <Protocol>R-SV</Protocol>
+            </SampledValueControl>
+            <LogControl name="lcb01" desc="event log" datSet="Measurements" logName="EventLog"
+                        logEna="true" reasonCode="true" bufTime="500" intgPd="0" lnClass="LLN0">
+              <TrgOps dchg="true" qchg="true" gi="true"/>
+            </LogControl>
+            <SettingControl numOfSGs="2" actSG="1" resvTms="30000"/>
+            <Inputs>
+              <ExtRef iedName="ED21" ldInst="LD0" prefix="" lnClass="GGIO" lnInst="1"
+                      doName="AnIn3" daName="phsA" intAddr="0"
+                      srcLdInst="LD0" srcPrefix="" srcLNClass="MMXU" srcLNInst="1" srcCBName="gcb01"/>
+            </Inputs>
+          </LN0>
+          <LN prefix="" lnClass="MMXU" inst="1" lnType="MMXU_1"/>
+          <LN prefix="" lnClass="GGIO" inst="1" lnType="GGIO_1">
+            <!-- One initial value per setting group: the SG group values
+                 are recorded per group, and the object keeps the value of
+                 the active group. -->
+            <DOI name="IntRange">
+              <DAI name="setVal">
+                <Val sGroup="1">50.5</Val>
+                <Val sGroup="2">60.5</Val>
+              </DAI>
+              <SDI name="setMag">
+                <DAI name="f"><Val sGroup="1">-1.5</Val><Val sGroup="2">-2.5</Val></DAI>
+              </SDI>
+            </DOI>
+            <!-- An array-valued attribute, addressed one element at a time. -->
+            <DOI name="AnIn1">
+              <SDI name="mag">
+                <DAI name="phsAngRef" sAddr="1"><Val>11.5</Val></DAI>
+                <DAI name="phsAngRef" sAddr="2"><Val>22.5</Val></DAI>
+                <DAI name="f"><Val>33.5</Val></DAI>
+              </SDI>
+            </DOI>
+            <!-- An element of the array-valued AnIn3.phsA, addressed by
+                 the SDI ix attribute. -->
+            <DOI name="AnIn3">
+              <SDI name="phsA" ix="3">
+                <SDI name="mag">
+                  <DAI name="f"><Val>99.5</Val></DAI>
+                </SDI>
+              </SDI>
+            </DOI>
+          </LN>
+          <LN prefix="" lnClass="PHC" inst="1" lnType="PHC_1"/>
+          <!-- Edition 2 and 2.1 common data classes, as 7-3 shapes them. -->
+          <LN prefix="" lnClass="GAPC" inst="1" lnType="GAPC_ED2">
+            <DOI name="Crv">
+              <DAI name="numPts"><Val>2</Val></DAI>
+              <DAI name="maxPts"><Val>5</Val></DAI>
+            </DOI>
+            <DOI name="Cur">
+              <DAI name="cur"><Val>EUR</Val></DAI>
+            </DOI>
+            <DOI name="InRef1">
+              <DAI name="setSrcRef"><Val>ED21LD0/GGIO1.Ind1</Val></DAI>
+            </DOI>
+          </LN>
+          <!-- Service tracking (IEC 61850-7-2 Edition 2), FC SR. -->
+          <LN prefix="" lnClass="LTRK" inst="1" lnType="LTRK_1"/>
+          <LN prefix="" lnClass="GGIO" inst="2" lnType="GGIO_1"/>
+        </LDevice>
+      </Server>
+      <GOOSESecurity>
+        <Subject>ED21</Subject>
+      </GOOSESecurity>
+    </AccessPoint>
+    <KDC iedName="ED21" apName="S1" ldInst="LD0" />
+  </IED>
+
+  <DataTypeTemplates>
+    <LNodeType id="LLN0_1" lnClass="LLN0">
+      <DO name="Mod" type="INC_1"/>
+      <DO name="Beh" type="INS_1"/>
+      <DO name="Health" type="ENS_1"/>
+    </LNodeType>
+    <LNodeType id="MMXU_1" lnClass="MMXU">
+      <DO name="TotW" type="MV_1"/>
+    </LNodeType>
+    <!-- A DO with a count: five phase currents. -->
+    <LNodeType id="GGIO_1" lnClass="GGIO">
+      <DO name="AnIn1" type="MV_1"/>
+      <DO name="AnIn3" type="WYE_1"/>
+      <DO name="StrVal" type="SPS_1"/>
+      <DO name="Beh" type="INS_1"/>
+      <!-- A control with a per-group initial value. -->
+      <DO name="IntRange" type="ASG_1"/>
+      <!-- An attribute of a basic type this library has no template for. -->
+      <DO name="VendorDO" type="VEND_1"/>
+    </LNodeType>
+    <!-- The same lnClass as GGIO_1, to exercise (id, lnClass) identity. -->
+    <LNodeType id="GGIO_1" lnClass="GGIO_2">
+      <DO name="AnIn9" type="MV_1"/>
+    </LNodeType>
+    <LNodeType id="GAPC_ED2" lnClass="GAPC">
+      <DO name="Hst" type="HST_1"/>
+      <DO name="ColChg" type="BAC_1"/>
+      <DO name="InRef1" type="ORG_1"/>
+      <DO name="StrTm" type="TSG_1"/>
+      <DO name="Cur" type="CUG_1"/>
+      <DO name="Txt" type="VSG_1"/>
+      <DO name="Crv" type="CSG_1"/>
+    </LNodeType>
+    <LNodeType id="LTRK_1" lnClass="LTRK">
+      <DO name="SpcTrk" type="CTS_1"/>
+      <DO name="GocbTrk" type="GTS_1"/>
+    </LNodeType>
+    <LNodeType id="PHC_1" lnClass="PHC">
+      <!-- The physical communication address: PhyComAddr. -->
+      <DO name="PhyCom" type="SEC_1"/>
+    </LNodeType>
+
+    <DOType id="INC_1" cdc="INC">
+      <DA name="stVal" bType="Enum" type="Mod" fc="ST" dchg="true" qchg="true"/>
+      <DA name="ctlModel" bType="Enum" type="CtlModels" fc="CF"/>
+    </DOType>
+    <DOType id="INS_1" cdc="INS">
+      <DA name="stVal" bType="Enum" type="Mod" fc="ST" dchg="true"/>
+      <DA name="q" bType="Quality" fc="ST" qchg="true"/>
+      <DA name="t" bType="Timestamp" fc="ST"/>
+      <!-- An unknown FC: carried verbatim. -->
+      <DA name="vendorFCAttr" bType="INT32" fc="ZX"/>
+    </DOType>
+    <DOType id="ENS_1" cdc="ENS">
+      <DA name="stVal" bType="Enum" type="Health" fc="ST" dchg="true"/>
+      <DA name="q" bType="Quality" fc="ST" qchg="true"/>
+    </DOType>
+    <DOType id="MV_1" cdc="MV">
+      <DA name="mag" bType="Struct" type="AnalogueValue_1" fc="MX" dchg="true" qchg="true" dupd="true"/>
+    </DOType>
+    <!-- An SDO with a count: five phases. -->
+    <DOType id="WYE_1" cdc="WYE">
+      <SDO name="phsA" type="CMV_1" count="5"/>
+    </DOType>
+    <DOType id="CMV_1" cdc="CMV">
+      <DA name="mag" bType="Struct" type="AnalogueValue_1" fc="MX" dchg="true" qchg="true"/>
+      <DA name="q" bType="Quality" fc="MX" qchg="true"/>
+      <DA name="t" bType="Timestamp" fc="MX" dchg="true"/>
+    </DOType>
+    <DOType id="SPS_1" cdc="SPS">
+      <DA name="stVal" bType="BOOLEAN" fc="ST" dchg="true"/>
+      <DA name="q" bType="Quality" fc="ST" qchg="true"/>
+      <DA name="t" bType="Timestamp" fc="ST" dchg="true"/>
+    </DOType>
+    <DOType id="ASG_1" cdc="ASG">
+      <DA name="setMag" bType="Struct" type="AnalogueValue_1" fc="SG" dchg="true"/>
+      <DA name="setVal" bType="FLOAT32" fc="SG" dchg="true"/>
+      <DA name="editMag" bType="Struct" type="AnalogueValue_1" fc="SE" dchg="true"/>
+    </DOType>
+    <DOType id="SEC_1" cdc="SEC">
+      <DA name="PhyComAddr" bType="PhyComAddr" fc="CF"/>
+    </DOType>
+    <!-- A basic type outside the 7-3 enumeration. -->
+    <DOType id="VEND_1" cdc="VSS">
+      <DA name="stVal" bType="VendorType7" fc="ST" dchg="true"/>
+      <DA name="opts" bType="SvOptFlds" fc="ST"/>
+      <DA name="lgOpts" bType="LogOptFlds" fc="ST"/>
+    </DOType>
+    <DOType id="HST_1" cdc="HST">
+      <DA name="hstVal" bType="INT32" fc="ST" count="4" dchg="true" dupd="true"/>
+      <DA name="q" bType="Quality" fc="ST" qchg="true"/>
+      <DA name="t" bType="Timestamp" fc="ST"/>
+      <DA name="numPts" bType="INT16U" fc="CF" dchg="true"/>
+      <DA name="hstRangeC" bType="Struct" type="Cell_1" fc="CF" count="4" dchg="true"/>
+      <DA name="xUnits" bType="Struct" type="Unit_1" fc="CF" dchg="true"/>
+      <DA name="maxPts" bType="INT16U" fc="CF" dchg="true"/>
+      <DA name="xD" bType="VisString255" fc="DC"/>
+    </DOType>
+    <DOType id="BAC_1" cdc="BAC">
+      <DA name="mxVal" bType="Struct" type="AnalogueValue_F" fc="MX" dchg="true" dupd="true"/>
+      <DA name="q" bType="Quality" fc="MX" qchg="true"/>
+      <DA name="t" bType="Timestamp" fc="MX"/>
+      <DA name="persistent" bType="BOOLEAN" fc="CF" dchg="true"/>
+      <DA name="ctlModel" bType="Enum" type="CtlModels" fc="CF"/>
+      <DA name="Oper" bType="Struct" type="BACOper_1" fc="CO"/>
+    </DOType>
+    <DOType id="ORG_1" cdc="ORG">
+      <DA name="setSrcRef" bType="ObjRef" fc="SP" dchg="true"/>
+      <DA name="setTstRef" bType="ObjRef" fc="SP" dchg="true"/>
+      <DA name="tstEna" bType="BOOLEAN" fc="SP" dchg="true"/>
+    </DOType>
+    <DOType id="TSG_1" cdc="TSG">
+      <DA name="setTm" bType="Timestamp" fc="SP" dchg="true"/>
+    </DOType>
+    <DOType id="CUG_1" cdc="CUG">
+      <DA name="cur" bType="Currency" fc="SP" dchg="true"/>
+    </DOType>
+    <DOType id="VSG_1" cdc="VSG">
+      <DA name="setVal" bType="VisString255" fc="SP" dchg="true"/>
+    </DOType>
+    <DOType id="CSG_1" cdc="CSG">
+      <DA name="numPts" bType="INT16U" fc="SP" dchg="true"/>
+      <DA name="crvPts" bType="Struct" type="Point_1" fc="SP" count="5" dchg="true"/>
+      <DA name="xUnits" bType="Struct" type="Unit_1" fc="CF" dchg="true"/>
+      <DA name="yUnits" bType="Struct" type="Unit_1" fc="CF" dchg="true"/>
+      <DA name="maxPts" bType="INT16U" fc="CF" dchg="true"/>
+      <DA name="xD" bType="VisString255" fc="DC"/>
+      <DA name="yD" bType="VisString255" fc="DC"/>
+    </DOType>
+    <DOType id="CTS_1" cdc="CTS">
+      <DA name="objRef" bType="ObjRef" fc="SR" dupd="true"/>
+      <DA name="serviceType" bType="Enum" type="ServiceType" fc="SR"/>
+      <DA name="errorCode" bType="Enum" type="ServiceError" fc="SR"/>
+      <DA name="t" bType="Timestamp" fc="SR"/>
+      <DA name="ctlVal" bType="BOOLEAN" fc="SR"/>
+      <DA name="origin" bType="Struct" type="Originator_1" fc="SR"/>
+      <DA name="ctlNum" bType="INT8U" fc="SR"/>
+      <DA name="T" bType="Timestamp" fc="SR"/>
+      <DA name="Test" bType="BOOLEAN" fc="SR"/>
+      <DA name="Check" bType="Check" fc="SR"/>
+      <DA name="respAddCause" bType="Enum" type="AddCause" fc="SR"/>
+    </DOType>
+    <DOType id="GTS_1" cdc="GTS">
+      <DA name="objRef" bType="ObjRef" fc="SR" dupd="true"/>
+      <DA name="serviceType" bType="Enum" type="ServiceType" fc="SR"/>
+      <DA name="errorCode" bType="Enum" type="ServiceError" fc="SR"/>
+      <DA name="t" bType="Timestamp" fc="SR"/>
+      <DA name="goEna" bType="BOOLEAN" fc="SR"/>
+      <DA name="goID" bType="VisString129" fc="SR"/>
+      <DA name="datSet" bType="ObjRef" fc="SR"/>
+      <DA name="confRev" bType="INT32U" fc="SR"/>
+      <DA name="ndsCom" bType="BOOLEAN" fc="SR"/>
+      <DA name="dstAddress" bType="PhyComAddr" fc="SR"/>
+    </DOType>
+
+    <DAType id="AnalogueValue_1">
+      <BDA name="f" bType="FLOAT32"/>
+      <!-- An array attribute, addressable by DAI@sAddr. -->
+      <BDA name="phsAngRef" bType="FLOAT32" count="3"/>
+    </DAType>
+
+    <DAType id="AnalogueValue_F">
+      <BDA name="f" bType="FLOAT32"/>
+    </DAType>
+    <DAType id="Unit_1">
+      <BDA name="SIUnit" bType="Enum" type="SIUnit"/>
+      <BDA name="multiplier" bType="Enum" type="Multiplier"/>
+    </DAType>
+    <DAType id="Cell_1">
+      <BDA name="xStart" bType="FLOAT32"/>
+      <BDA name="xEnd" bType="FLOAT32"/>
+    </DAType>
+    <DAType id="Point_1">
+      <BDA name="xVal" bType="FLOAT32"/>
+      <BDA name="yVal" bType="FLOAT32"/>
+    </DAType>
+    <DAType id="Originator_1">
+      <BDA name="orCat" bType="Enum" type="OrCat"/>
+      <BDA name="orIdent" bType="Octet64"/>
+    </DAType>
+    <DAType id="BACOper_1">
+      <BDA name="ctlVal" bType="Tcmd"/>
+      <BDA name="origin" bType="Struct" type="Originator_1"/>
+      <BDA name="ctlNum" bType="INT8U"/>
+      <BDA name="T" bType="Timestamp"/>
+      <BDA name="Test" bType="BOOLEAN"/>
+      <BDA name="Check" bType="Check"/>
+    </DAType>
+
+    <EnumType id="Mod">
+      <EnumVal ord="1">on</EnumVal>
+      <EnumVal ord="2">blocked</EnumVal>
+      <EnumVal ord="3">test</EnumVal>
+      <EnumVal ord="4">test/blocked</EnumVal>
+      <EnumVal ord="5">off</EnumVal>
+    </EnumType>
+    <EnumType id="Health">
+      <EnumVal ord="1">Ok</EnumVal>
+      <EnumVal ord="2">Warning</EnumVal>
+      <EnumVal ord="3">Alarm</EnumVal>
+    </EnumType>
+    <EnumType id="CtlModels">
+      <EnumVal ord="0">status-only</EnumVal>
+      <EnumVal ord="1">direct-with-normal-security</EnumVal>
+      <EnumVal ord="2">direct-with-enhanced-security</EnumVal>
+      <EnumVal ord="3">sbo-with-normal-security</EnumVal>
+      <EnumVal ord="4">sbo-with-enhanced-security</EnumVal>
+    </EnumType>
+    <EnumType id="SIUnit">
+      <EnumVal ord="1">none</EnumVal>
+      <EnumVal ord="29">V</EnumVal>
+    </EnumType>
+    <EnumType id="Multiplier">
+      <EnumVal ord="0"/>
+      <EnumVal ord="3">k</EnumVal>
+    </EnumType>
+    <EnumType id="OrCat">
+      <EnumVal ord="0">not-supported</EnumVal>
+      <EnumVal ord="1">bay-control</EnumVal>
+      <EnumVal ord="2">station-control</EnumVal>
+      <EnumVal ord="3">remote-control</EnumVal>
+    </EnumType>
+    <EnumType id="ServiceType">
+      <EnumVal ord="0">Unknown</EnumVal>
+      <EnumVal ord="54">Operate</EnumVal>
+    </EnumType>
+    <EnumType id="ServiceError">
+      <EnumVal ord="0">no-error</EnumVal>
+      <EnumVal ord="1">instance-not-available</EnumVal>
+    </EnumType>
+    <EnumType id="AddCause">
+      <EnumVal ord="0">Unknown</EnumVal>
+      <EnumVal ord="1">Not-supported</EnumVal>
+    </EnumType>
+  </DataTypeTemplates>
+</SCL>

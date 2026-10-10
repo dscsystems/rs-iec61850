@@ -2,6 +2,7 @@
 //! through the ordinary variable path, and holds their runtime state.
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::Mutex;
 use std::time::SystemTime;
 
@@ -78,6 +79,20 @@ pub struct RcbRuntime {
     /// through Resv, or implicitly by the first client to write it. Nobody
     /// else may change it until the owner lets go or leaves.
     pub owner: Option<ConnId>,
+    /// The address the owner connected from, which a BRCB's `Owner` names.
+    pub owner_ip: Option<IpAddr>,
+    /// The client the block is held for while no association of its holds
+    /// it: the one a `ClientLN` names (`resv_cfg`), or the owner of a BRCB
+    /// with a `ResvTms` after its association ended, until the reservation
+    /// times out. The block is then usable only from that address.
+    pub resv_ip: Option<IpAddr>,
+    /// The reservation was made by the configuration, and is not the
+    /// client's to give up.
+    pub resv_cfg: bool,
+    /// Ends a `ResvTms` reservation, when one is running.
+    pub resv_timer: Option<tokio::task::AbortHandle>,
+    /// Bumped whenever the reservation timer is replaced or stopped.
+    pub resv_gen: u64,
     /// The sequence number the next report carries.
     pub sq_num: u32,
     /// Cancels the integrity-period task, when one is running.
@@ -99,8 +114,6 @@ pub struct RcbRuntime {
     pub buffer: Vec<ReportEntry>,
     /// The index in `buffer` of the next report to transmit.
     pub next: usize,
-    /// A monotonic EntryID source.
-    pub entry_counter: u64,
     /// A client-requested resync point, from an EntryID write.
     pub resync_id: Option<Vec<u8>>,
     /// Set when entries were discarded before transmission.
@@ -118,6 +131,23 @@ impl RcbRuntime {
         self.next = 0;
         self.buf_overflow = false;
         self.resync_id = None;
+    }
+
+    pub fn stop_resv_timer(&mut self) {
+        if let Some(h) = self.resv_timer.take() {
+            h.abort();
+        }
+        self.resv_gen += 1;
+    }
+
+    /// Reports whether a client connected from `ip` may use the block: it
+    /// holds it, or nobody does, or the block is held for its address.
+    pub fn allowed(&self, conn: ConnId, ip: Option<IpAddr>) -> bool {
+        match (self.owner, self.resv_ip) {
+            (Some(o), _) => o == conn,
+            (None, Some(r)) => ip == Some(r),
+            (None, None) => true,
+        }
     }
 
     pub fn stop_integrity(&mut self) {
@@ -180,8 +210,23 @@ pub fn materialise_rcbs(m: &mut Model, buf_default: usize) -> HashMap<String, Rc
             let controls = ln.report_controls.clone();
             for rc in &controls {
                 let fc = if rc.buffered { Fc::Br } else { Fc::Rp };
-                for inst_name in rcb_instance_names(rc) {
-                    let object = build_rcb_object(&ld_name, &ln_name, rc, fc, &inst_name);
+                for (i, inst_name) in rcb_instance_names(rc).into_iter().enumerate() {
+                    let mut object = build_rcb_object(&ld_name, &ln_name, rc, fc, &inst_name);
+                    let mut rt = RcbRuntime::default();
+                    if let Some(ip) = rc.reservations.get(i).and_then(|r| r.as_ref()).and_then(|r| r.ip) {
+                        // Reserved by configuration: ResvTms -1 says so, and
+                        // Owner (or Resv) names the client from the start.
+                        rt.resv_ip = Some(ip);
+                        rt.resv_cfg = true;
+                        for a in &mut object.attributes {
+                            match a.name.as_str() {
+                                "ResvTms" => a.value = Some(Value::int16(-1)),
+                                "Owner" => a.value = Some(Value::octet_string(ip_octets(Some(ip)))),
+                                "Resv" => a.value = Some(Value::boolean(true)),
+                                _ => {}
+                            }
+                        }
+                    }
                     ln.objects.push(object);
                     let item = format!("{ln_name}${fc}${inst_name}");
                     registry.insert(
@@ -193,7 +238,7 @@ pub fn materialise_rcbs(m: &mut Model, buf_default: usize) -> HashMap<String, Rc
                             object_name: inst_name,
                             buffered: rc.buffered,
                             max_buffer: buffer_depth(rc, buf_default),
-                            state: Mutex::new(RcbRuntime::default()),
+                            state: Mutex::new(rt),
                         },
                     );
                 }
@@ -252,7 +297,9 @@ fn build_rcb_object(
 
     let attributes = if rc.buffered {
         // Buffered reports carry an EntryID and a TimeofEntry, so those option
-        // bits are always set whatever the configuration says.
+        // bits are always set whatever the configuration says. Owner names the
+        // client holding the block, and is the only way a client learns that,
+        // so it exists even while the block is unreserved.
         opt_flds |= OptFlds::ENTRY_ID | OptFlds::TIME_OF_ENTRY | OptFlds::BUF_OVFL;
         vec![
             attr("RptID", Value::visible_string(&rpt_id)),
@@ -266,6 +313,7 @@ fn build_rcb_object(
             attr("IntgPd", Value::uint32(rc.intg_pd)),
             attr("GI", Value::boolean(false)),
             attr("PurgeBuf", Value::boolean(false)),
+            attr("Owner", Value::octet_string(Vec::new())),
             attr("EntryID", Value::octet_string(vec![0u8; 8])),
             attr("TimeofEntry", Value::binary_time(binary_time_epoch())),
             attr("ResvTms", Value::int16(0)),
@@ -330,6 +378,19 @@ pub fn make_entry_id(n: u64) -> Vec<u8> {
     n.to_be_bytes().to_vec()
 }
 
+/// The `Owner` octet string for an address (IEC 61850-8-1): the four octets of
+/// an IPv4 address, sixteen for IPv6, empty for none.
+pub fn ip_octets(ip: Option<IpAddr>) -> Vec<u8> {
+    match ip {
+        None => Vec::new(),
+        Some(IpAddr::V4(a)) => a.octets().to_vec(),
+        Some(IpAddr::V6(a)) => match a.to_ipv4_mapped() {
+            Some(v4) => v4.octets().to_vec(),
+            None => a.octets().to_vec(),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -389,6 +450,7 @@ mod tests {
                     ..Default::default()
                 }],
             }],
+            ..Default::default()
         };
         let registry = materialise_rcbs(&mut m, 0);
         assert_eq!(registry.len(), 3);
@@ -426,6 +488,7 @@ mod tests {
                     ..Default::default()
                 }],
             }],
+            ..Default::default()
         };
         materialise_rcbs(&mut m, 0);
         let ln = m.device("ied1LD0").unwrap().node("LLN0").unwrap();

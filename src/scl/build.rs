@@ -1,23 +1,49 @@
 //! Instantiates the runtime object model from a parsed SCL document.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::net::IpAddr;
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::mms::{Type, Value};
-use crate::model;
+use crate::model::{self, Diagnostic};
 use crate::time_util;
 
 use super::types::*;
 use super::{parse_file, Error, Result};
 
+/// Receives each diagnostic as it is raised.
+pub type WarnFn = Arc<dyn Fn(&Diagnostic) + Send + Sync>;
+
 /// Adjusts model instantiation.
-#[derive(Debug, Clone, Default)]
+///
+/// The default is permissive: unrecognised constructs are recorded as
+/// diagnostics on the model and the model is still built.
+#[derive(Clone, Default)]
 pub struct BuildOptions {
     /// The IED to instantiate; the default is the first IED in the document.
     pub ied: String,
     /// The access point of the chosen IED; the default is the first access
     /// point that contains a `Server`.
     pub access_point: String,
+    /// Turns diagnostics into a load error. Use it to fail a configuration
+    /// check on a document that is not fully understood, for instance in a
+    /// conformance test harness.
+    pub strict: bool,
+    /// Called for each diagnostic as it is raised, for streaming progress on a
+    /// large document.
+    pub on_warn: Option<WarnFn>,
+}
+
+impl std::fmt::Debug for BuildOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BuildOptions")
+            .field("ied", &self.ied)
+            .field("access_point", &self.access_point)
+            .field("strict", &self.strict)
+            .field("on_warn", &self.on_warn.is_some())
+            .finish()
+    }
 }
 
 impl BuildOptions {
@@ -38,6 +64,37 @@ impl BuildOptions {
         self.access_point = name.into();
         self
     }
+
+    /// Makes a build fail when it raised any diagnostic, instead of returning
+    /// a usable model.
+    #[must_use]
+    pub fn strict(mut self, on: bool) -> BuildOptions {
+        self.strict = on;
+        self
+    }
+
+    /// Installs a callback invoked for each diagnostic as it is raised.
+    #[must_use]
+    pub fn on_warn(mut self, f: impl Fn(&Diagnostic) + Send + Sync + 'static) -> BuildOptions {
+        self.on_warn = Some(Arc::new(f));
+        self
+    }
+}
+
+/// Collects the diagnostics of one build.
+struct Diag {
+    on_warn: Option<WarnFn>,
+    all: Vec<Diagnostic>,
+}
+
+impl Diag {
+    fn add(&mut self, path: impl Into<String>, message: impl Into<String>) {
+        let d = Diagnostic::new(path, message);
+        if let Some(f) = &self.on_warn {
+            f(&d);
+        }
+        self.all.push(d);
+    }
 }
 
 /// Parses the SCL file at `path` and instantiates the runtime model of one
@@ -56,32 +113,82 @@ pub fn load_model(path: impl AsRef<Path>, opts: &BuildOptions) -> Result<model::
 /// (including GSE and SMV addresses from the Communication section) are
 /// resolved.
 ///
-/// Deliberate limitations: only the first `Val` of a `DAI` is applied, so
-/// setting-group specific values are ignored; array elements cannot be
-/// addressed by `DAI`; `Octet64` values must be hexadecimal; and report and
-/// log instances beyond the configuration are not created here.
+/// Initial values are applied per setting group (`Val@sGroup`) and per array
+/// element (`DAI@sAddr`, `DOI`/`SDI@ix`), and the group `SettingControl`
+/// declares active is the one the objects carry. What is not understood is
+/// recorded as a diagnostic on the model rather than failing the build, so a
+/// single unrecognised construct cannot make a whole IED unreadable; set
+/// [`BuildOptions::strict`] for the opposite behaviour.
+///
+/// Remaining limitations, kept deliberately: `Octet64` and `EntryID` values
+/// must be written as hexadecimal, a `Timestamp` must be ISO 8601, and report
+/// instances beyond those the configuration declares are not created.
 pub fn build_model(scl: &Scl, opts: &BuildOptions) -> Result<model::Model> {
+    let mut d = Diag {
+        on_warn: opts.on_warn.clone(),
+        all: Vec::new(),
+    };
+    for m in scl.edition().validate("SCL") {
+        d.add("SCL", m);
+    }
+    for (name, paths) in scl.dropped() {
+        for p in paths {
+            d.add(
+                p,
+                format!(
+                    "element <{name}> is present in the document and is not decoded, \
+                     along with anything nested inside it"
+                ),
+            );
+        }
+    }
+
     let ied = find_ied(scl, &opts.ied)?;
     let ap = find_ap(ied, &opts.access_point)?;
+    if let Some(svc) = &ap.services {
+        if !svc.name_length.is_empty() {
+            d.add(
+                format!("SCL/IED[{}]/AccessPoint[{}]/Services", ied.name, ap.name),
+                format!(
+                    "nameLength={}: the name-length limit is not enforced on object \
+                     references or item IDs",
+                    svc.name_length
+                ),
+            );
+        }
+        if let Some(s) = svc.sup_subscription {
+            if s.max_go > 0 || s.max_sv > 0 {
+                d.add(
+                    format!("SCL/IED[{}]/Services/SupSubscription", ied.name),
+                    "subscription supervision is declared but not implemented",
+                );
+            }
+        }
+    }
     let server = ap
         .server
         .as_ref()
         .expect("find_ap only returns access points with a Server");
 
-    let builder = Builder::new(scl);
+    let mut b = Builder::new(scl, d);
+    b.led = ied.name.clone();
     let mut m = model::Model {
         name: ied.name.clone(),
-        devices: Vec::new(),
+        ..Default::default()
     };
-
     for lde in &server.l_devices {
+        b.led_inst = lde.inst.clone();
         let mut ld = model::LogicalDevice {
             name: format!("{}{}", ied.name, lde.inst),
             inst: lde.inst.clone(),
             nodes: Vec::new(),
         };
         for lne in lde.all_lns() {
-            let ln = builder
+            // Diagnostics name the logical node as well as the object, so a
+            // shared data type template does not report the same attribute
+            // three times without saying where.
+            b.cur_ln = lne.instance_name();
+            let ln = b
                 .build_ln(&ied.name, &ap.name, &lde.inst, lne)
                 .map_err(|e| {
                     Error::model(format!(
@@ -91,7 +198,18 @@ pub fn build_model(scl: &Scl, opts: &BuildOptions) -> Result<model::Model> {
                         lne.instance_name()
                     ))
                 })?;
+            b.cur_ln.clear();
             ld.nodes.push(ln);
+        }
+        // The active setting group is declared once per logical device, on
+        // LN0, and its values are spread over every node. Applying it is
+        // therefore a whole-device step, after every node is built.
+        if let Some(act) = ld
+            .nodes
+            .iter()
+            .find_map(|ln| ln.setting_control.map(|sc| sc.act_sg))
+        {
+            b.apply_active_group(&mut ld, usize::from(act));
         }
         m.devices.push(ld);
     }
@@ -112,6 +230,20 @@ pub fn build_model(scl: &Scl, opts: &BuildOptions) -> Result<model::Model> {
             }
         }
     }
+    m.setting_groups = b.setting_groups();
+    m.diagnostics = std::mem::take(&mut b.diag.all);
+    if opts.strict && !m.diagnostics.is_empty() {
+        let msg = m
+            .diagnostics
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Err(Error::Strict {
+            diagnostics: m.diagnostics,
+            msg,
+        });
+    }
     Ok(m)
 }
 
@@ -119,7 +251,7 @@ pub fn build_model(scl: &Scl, opts: &BuildOptions) -> Result<model::Model> {
 /// declares none.
 fn report_max_buf(ied: &Ied, ap: &AccessPoint) -> usize {
     for svc in [ap.services.as_ref(), ied.services.as_ref()].into_iter().flatten() {
-        if let Some(c) = svc.conf_report_control {
+        if let Some(c) = &svc.conf_report_control {
             if c.max_buf > 0 {
                 return c.max_buf as usize;
             }
@@ -163,27 +295,67 @@ fn find_ap<'a>(ied: &'a Ied, name: &str) -> Result<&'a AccessPoint> {
     )))
 }
 
-/// Resolves data type templates and enum bindings.
+/// Bounds an array the document asks for, so a corrupt or hostile count
+/// cannot make the loader allocate without limit. It is well above anything a
+/// real device declares.
+const MAX_ARRAY_COUNT: usize = 1 << 16;
+
+/// How many instances of one indexed report control block the server names.
+/// IEC 61850-6 defines the two-digit suffix `01`..`99`; a document asking for
+/// more would need names the standard does not define, so the count is
+/// capped.
+const MAX_RCB_INSTANCES: usize = 99;
+
+/// Resolves data type templates and enum bindings, and collects what the
+/// build finds along the way.
 struct Builder<'a> {
     scl: &'a Scl,
+    diag: Diag,
     ln_types: HashMap<&'a str, &'a LNodeType>,
+    ln_types_by_class: HashMap<(&'a str, &'a str), &'a LNodeType>,
     do_types: HashMap<&'a str, &'a DoType>,
     da_types: HashMap<&'a str, &'a DaType>,
     enums: HashMap<&'a str, &'a EnumType>,
+    /// The per-setting-group initial values of FC SG and SE attributes, keyed
+    /// by logical device and then by group number. The device is part of the
+    /// key because an IED usually has several and they can have differently
+    /// named settings: keying on the group alone would apply one device's
+    /// value to another's same-named attribute.
+    group_values: BTreeMap<String, BTreeMap<usize, Vec<(String, Value)>>>,
+    /// The logical node and the dotted path of the data object being built,
+    /// for diagnostics.
+    cur_ln: String,
+    cur_do: String,
+    /// The IED name and logical-device instance being built, so
+    /// setting-group values are recorded against a full reference.
+    led: String,
+    led_inst: String,
 }
 
 impl<'a> Builder<'a> {
-    fn new(scl: &'a Scl) -> Builder<'a> {
+    fn new(scl: &'a Scl, diag: Diag) -> Builder<'a> {
         let mut b = Builder {
             scl,
+            diag,
             ln_types: HashMap::new(),
+            ln_types_by_class: HashMap::new(),
             do_types: HashMap::new(),
             da_types: HashMap::new(),
             enums: HashMap::new(),
+            group_values: BTreeMap::new(),
+            cur_ln: String::new(),
+            cur_do: String::new(),
+            led: String::new(),
+            led_inst: String::new(),
         };
         if let Some(t) = &scl.data_type_templates {
+            // LNodeType identity is the pair (id, lnClass), so index both
+            // ways: by id alone for the common case, and by id and class so a
+            // document reusing an id across node classes still resolves.
             for x in &t.ln_node_types {
-                b.ln_types.insert(x.id.as_str(), x);
+                b.ln_types.entry(x.id.as_str()).or_insert(x);
+                b.ln_types_by_class
+                    .insert((x.id.as_str(), x.ln_class.as_str()), x);
             }
             for x in &t.do_types {
                 b.do_types.insert(x.id.as_str(), x);
@@ -198,16 +370,35 @@ impl<'a> Builder<'a> {
         b
     }
 
+    /// The name of the logical device being built, which is the MMS domain
+    /// name: IED name plus the device instance.
+    fn led_ref(&self) -> String {
+        format!("{}{}", self.led, self.led_inst)
+    }
+
+    /// Builds a diagnostic path from the attribute name being built.
+    fn path(&self, name: &str) -> String {
+        join_path(&join_path(&self.cur_ln, &self.cur_do), name)
+    }
+
+    /// Resolves a logical node type, preferring an exact (id, lnClass) match
+    /// and falling back to the id alone.
+    fn ln_type(&self, id: &str, ln_class: &str) -> Option<&'a LNodeType> {
+        self.ln_types_by_class
+            .get(&(id, ln_class))
+            .or_else(|| self.ln_types.get(id))
+            .copied()
+    }
+
     fn build_ln(
-        &self,
+        &mut self,
         ied_name: &str,
         ap_name: &str,
         ld_inst: &str,
         lne: &Ln,
     ) -> Result<model::LogicalNode> {
         let lnt = self
-            .ln_types
-            .get(lne.ln_type.as_str())
+            .ln_type(&lne.ln_type, &lne.ln_class)
             .ok_or_else(|| Error::model(format!("LNodeType {:?} not found", lne.ln_type)))?;
 
         let mut ln = model::LogicalNode {
@@ -223,16 +414,57 @@ impl<'a> Builder<'a> {
         }
 
         // Apply instance values.
+        let ln_name = lne.instance_name();
         for doi in &lne.dois {
-            let object = ln
-                .object_mut(&doi.name)
-                .ok_or_else(|| {
-                    Error::model(format!(
-                        "DOI {:?} has no matching DO in type {:?}",
-                        doi.name, lne.ln_type
-                    ))
-                })?;
-            self.apply_doi(object, &doi.dais, &doi.sdis)
+            let mut name = doi.name.clone();
+            if ln.object(&name).is_none() {
+                if let Some((base, _)) = split_array_name(&doi.name) {
+                    name = base.to_string();
+                }
+            }
+            if ln.object(&name).is_none() {
+                return Err(Error::model(format!(
+                    "DOI {:?} has no matching DO in type {:?}",
+                    doi.name, lne.ln_type
+                )));
+            }
+            let path = join_path(&ln_name, &doi.name);
+            // A DOI with an ix addresses one element of an array-valued DO,
+            // which the model holds as "Name(n)".
+            let mut element: Option<String> = None;
+            let ix = doi.ix.trim();
+            if !ix.is_empty() {
+                match array_index(ix) {
+                    Some(n) => {
+                        let el = format!("{}({n})", doi.name);
+                        if ln.object(&name).is_some_and(|o| o.child(&el).is_some()) {
+                            element = Some(el);
+                        } else {
+                            self.diag.add(
+                                path.clone(),
+                                format!(
+                                    "DOI ix={ix} addresses an instance of {:?} that the type \
+                                     does not declare as an array",
+                                    doi.name
+                                ),
+                            );
+                        }
+                    }
+                    None => self.diag.add(
+                        path.clone(),
+                        format!(
+                            "DOI ix={ix:?} is not an array index; the value is applied to the \
+                             object as a whole"
+                        ),
+                    ),
+                }
+            }
+            let object = ln.object_mut(&name).expect("checked above");
+            let object = match &element {
+                Some(el) => object.child_mut(el).expect("checked above"),
+                None => object,
+            };
+            self.apply_doi(object, &doi.dais, &doi.sdis, &path)
                 .map_err(|e| Error::model(format!("DOI {}: {e}", doi.name)))?;
         }
 
@@ -240,60 +472,73 @@ impl<'a> Builder<'a> {
             ln.data_sets.push(build_data_set(ied_name, ld_inst, dse)?);
         }
         for r in &lne.report_controls {
-            ln.report_controls.push(build_report_control(r));
+            let rc = self.build_report_control(r);
+            ln.report_controls.push(rc);
         }
         for g in &lne.gse_controls {
-            ln.gse_controls
-                .push(self.build_gse_control(ied_name, ap_name, ld_inst, g));
+            let gc = self.build_gse_control(ied_name, ap_name, ld_inst, g);
+            ln.gse_controls.push(gc);
         }
         for s in &lne.sampled_value_controls {
-            ln.sv_controls
-                .push(self.build_sv_control(ied_name, ap_name, ld_inst, s));
+            let sc = self.build_sv_control(ied_name, ap_name, ld_inst, s);
+            ln.sv_controls.push(sc);
         }
         for l in &lne.log_controls {
             ln.log_controls.push(build_log_control(l));
         }
+        ln.logs = lne.logs.clone();
         if let Some(sg) = lne.setting_control {
             ln.setting_control = Some(model::SettingControl {
                 num_of_sgs: sg.num_of_sgs,
                 act_sg: sg.act_sg,
+                resv_tms: sg.resv_tms,
             });
         }
         Ok(ln)
     }
 
     /// Expands a `DOType`, and its `SDO`s recursively, into a data object.
-    fn build_do(&self, name: &str, type_id: &str, depth: usize) -> Result<model::DataObject> {
+    fn build_do(&mut self, name: &str, type_id: &str, depth: usize) -> Result<model::DataObject> {
         if depth > 16 {
             return Err(Error::model(format!("SDO nesting too deep at {type_id:?}")));
         }
-        let dot = self
+        let dot = *self
             .do_types
             .get(type_id)
             .ok_or_else(|| Error::model(format!("DOType {type_id:?} not found")))?;
+        let prev_do = std::mem::take(&mut self.cur_do);
+        self.cur_do = join_path(&prev_do, name);
+        let result = self.build_do_body(name, dot, depth);
+        self.cur_do = prev_do;
+        result
+    }
 
+    fn build_do_body(
+        &mut self,
+        name: &str,
+        dot: &'a DoType,
+        depth: usize,
+    ) -> Result<model::DataObject> {
         let mut object = model::DataObject {
             name: name.to_string(),
             cdc: dot.cdc.clone(),
             ..Default::default()
         };
+        if !dot.cdc.is_empty() && !model::known_cdc(&dot.cdc) {
+            let p = self.path(name);
+            self.diag.add(
+                p,
+                format!(
+                    "common data class {:?} is not one this library has attribute templates \
+                     for; the SCL-provided attributes are used as they are",
+                    dot.cdc
+                ),
+            );
+        }
         for dae in &dot.das {
-            let fc: model::Fc = dae
-                .fc
-                .parse()
-                .map_err(|e| Error::model(format!("DA {}: {e}", dae.name)))?;
-            let mut trg = model::TrgOps::default();
-            if dae.dchg {
-                trg |= model::TrgOps::DATA_CHANGE;
-            }
-            if dae.qchg {
-                trg |= model::TrgOps::QUALITY_CHANGE;
-            }
-            if dae.dupd {
-                trg |= model::TrgOps::DATA_UPDATE;
-            }
+            let trg = trg_ops_of_flags(model::TrgOps::default(), dae.dchg, dae.qchg, dae.dupd);
             let da = self
-                .build_da(&dae.name, fc, &dae.btype, &dae.kind, &dae.count, trg, &dae.vals, 0)
+                .build_da(&dae.name, &dae.fc, &dae.btype, &dae.kind, &dae.count, trg, &dae.vals, 0)
                 .map_err(|e| Error::model(format!("DA {}: {e}", dae.name)))?;
             object.attributes.push(da);
         }
@@ -301,24 +546,48 @@ impl<'a> Builder<'a> {
             let sub = self
                 .build_do(&sdo.name, &sdo.kind, depth + 1)
                 .map_err(|e| Error::model(format!("SDO {}: {e}", sdo.name)))?;
-            object.objects.push(sub);
+            // An SDO with a count is an array: the sub-object is repeated,
+            // which is how multi-instance data objects such as phsA are
+            // expressed, and how a DO with a count reaches the model at all.
+            match array_count(&sdo.count) {
+                ArrayCount::TooBig => {
+                    let p = self.path(&sdo.name);
+                    self.diag.add(
+                        p,
+                        format!(
+                            "count={:?} is beyond the {MAX_ARRAY_COUNT}-element limit this \
+                             library will allocate; no instances were created",
+                            sdo.count
+                        ),
+                    );
+                }
+                ArrayCount::Array(n) => {
+                    for ix in 1..=n {
+                        let mut el = sub.clone();
+                        el.name = format!("{}({ix})", sdo.name);
+                        object.objects.push(el);
+                    }
+                }
+                ArrayCount::Scalar => object.objects.push(sub),
+            }
         }
         Ok(object)
     }
 
     /// Expands one `DA` or `BDA`.
     ///
-    /// `BDA` members inherit the constraint of the enclosing `DA`. Arrays of
-    /// basic types get an array value with per-element defaults; arrays of
-    /// constructed types keep the count with no value.
+    /// `fc_raw` is the functional-constraint mnemonic as written, which is
+    /// kept alongside the parsed constraint so an unknown one is still usable.
+    /// Arrays of basic types get an array value with per-element defaults;
+    /// arrays of constructed types keep the count with no value.
     // A DA and a BDA are expanded by the same code, and between them they
     // carry this many independent SCL attributes; bundling them into a struct
     // would only move the list.
     #[allow(clippy::too_many_arguments)]
     fn build_da(
-        &self,
+        &mut self,
         name: &str,
-        fc: model::Fc,
+        fc_raw: &str,
         btype: &str,
         type_id: &str,
         count: &str,
@@ -331,9 +600,21 @@ impl<'a> Builder<'a> {
                 "attribute nesting too deep at {name:?}"
             )));
         }
+        let fc = model::parse_fc_lenient(fc_raw);
+        if fc == model::Fc::Unknown {
+            let p = self.path(name);
+            self.diag.add(
+                p,
+                format!(
+                    "functional constraint {fc_raw:?} on DA {name} is not one this library \
+                     knows; it is carried verbatim and the attribute is readable under it"
+                ),
+            );
+        }
         let mut da = model::DataAttribute {
             name: name.to_string(),
             fc,
+            fc_name: fc_raw.to_string(),
             btype: btype.to_string(),
             // Only meaningful for Enum, where it names the EnumType whose
             // literals the value is drawn from.
@@ -345,26 +626,49 @@ impl<'a> Builder<'a> {
             trg_ops: trg,
             ..Default::default()
         };
-        // Non-numeric counts (rarely, an enum value name) are ignored.
-        let n: usize = count.trim().parse().unwrap_or(0);
+        let n = match array_count(count) {
+            ArrayCount::TooBig => {
+                let p = self.path(name);
+                self.diag.add(
+                    p,
+                    format!(
+                        "count={count:?} is beyond the {MAX_ARRAY_COUNT}-element limit this \
+                         library will allocate; the attribute is present but has no elements"
+                    ),
+                );
+                0
+            }
+            ArrayCount::Array(n) => n,
+            ArrayCount::Scalar => 0,
+        };
 
         if btype == "Struct" {
-            let dat = self
-                .da_types
-                .get(type_id)
-                .ok_or_else(|| Error::model(format!("DAType {type_id:?} not found")))?;
             da.kind = Some(Type::Structure);
+            let Some(dat) = self.da_types.get(type_id).copied() else {
+                // Without the type template the structure's members are
+                // unknown, but the object still exists; record it and leave
+                // it valueless rather than failing the whole load.
+                let p = self.path(name);
+                self.diag.add(
+                    p,
+                    format!(
+                        "DAType {type_id:?} of structured DA {name} not found; the structure \
+                         is present but has no members"
+                    ),
+                );
+                return Ok(da);
+            };
             for bda in &dat.bdas {
+                // A DA's trigger options cover all its components: a change to
+                // mag.f is a change of mag (IEC 61850-7-2).
                 let child = self
                     .build_da(
                         &bda.name,
-                        fc,
+                        fc_raw,
                         &bda.btype,
                         &bda.kind,
                         &bda.count,
-                        // A DA's trigger options cover all its components: a
-                        // change to mag.f is a change of mag (IEC 61850-7-2).
-                        trg,
+                        trg_ops_of_flags(trg, bda.dchg, bda.qchg, bda.dupd),
                         &bda.vals,
                         depth + 1,
                     )
@@ -378,7 +682,29 @@ impl<'a> Builder<'a> {
             return Ok(da);
         }
 
-        let kind = kind_of(btype)?;
+        if btype == "PhyComAddr" {
+            // IEC 61850-8-1 maps PhyComAddr to a structure, the one a GoCB's
+            // DstAddress and the tracking classes' dstAddress are served as.
+            da.kind = Some(Type::Structure);
+            da.children = phy_com_addr(fc, fc_raw, trg);
+            if n > 0 {
+                da.kind = Some(Type::Array);
+                da.count = n;
+            }
+            return Ok(da);
+        }
+
+        let Some(kind) = kind_of(btype) else {
+            let p = self.path(name);
+            self.diag.add(
+                p,
+                format!(
+                    "basic type {btype:?} of DA {name} is not in the IEC 61850-8-1 type \
+                     enumeration; the attribute has no value until one is written"
+                ),
+            );
+            return Ok(da);
+        };
         if n > 0 {
             da.kind = Some(Type::Array);
             da.count = n;
@@ -426,26 +752,20 @@ impl<'a> Builder<'a> {
 
         let v = match da.kind {
             Some(Type::Boolean) => match s {
-                "true" | "1" => Value::boolean(true),
-                "false" | "0" => Value::boolean(false),
+                "true" | "1" | "TRUE" | "True" | "t" | "T" => Value::boolean(true),
+                "false" | "0" | "FALSE" | "False" | "f" | "F" => Value::boolean(false),
                 _ => return Err(fail("expected a boolean".into())),
             },
-            Some(Type::Integer) => Value::int64(
-                s.parse::<i64>()
-                    .map_err(|e| fail(e.to_string()))?,
-            ),
-            Some(Type::Unsigned) => Value::uint32(
-                s.parse::<u32>()
-                    .map_err(|e| fail(e.to_string()))?,
-            ),
-            Some(Type::Float32) => Value::float32(
-                s.parse::<f32>()
-                    .map_err(|e| fail(e.to_string()))?,
-            ),
-            Some(Type::Float64) => Value::float64(
-                s.parse::<f64>()
-                    .map_err(|e| fail(e.to_string()))?,
-            ),
+            Some(Type::Integer) => Value::int64(s.parse::<i64>().map_err(|e| fail(e.to_string()))?),
+            Some(Type::Unsigned) => {
+                Value::uint32(s.parse::<u32>().map_err(|e| fail(e.to_string()))?)
+            }
+            Some(Type::Float32) => {
+                Value::float32(s.parse::<f32>().map_err(|e| fail(e.to_string()))?)
+            }
+            Some(Type::Float64) => {
+                Value::float64(s.parse::<f64>().map_err(|e| fail(e.to_string()))?)
+            }
             Some(Type::VisibleString) => Value::visible_string(s),
             Some(Type::MmsString) => Value::mms_string(s),
             Some(Type::OctetString) => {
@@ -478,31 +798,45 @@ impl<'a> Builder<'a> {
     /// Walks `DAI` and `SDI` elements below a data object.
     ///
     /// An `SDI` names either a sub data object or a structured data attribute,
-    /// and the two are told apart by which one exists.
+    /// and the two are told apart by which one exists. `path` is the dotted
+    /// path of the object, for diagnostics and setting-group values.
     fn apply_doi(
-        &self,
+        &mut self,
         object: &mut model::DataObject,
         dais: &[Dai],
         sdis: &[Sdi],
+        path: &str,
     ) -> Result<()> {
         for dai in dais {
-            let da = object
-                .attribute_mut(&dai.name)
-                .ok_or_else(|| Error::model(format!("DAI {:?} has no matching DA", dai.name)))?;
-            if let Some(v) = dai.vals.first() {
-                self.set_value(da, &v.value)?;
+            let mut name = dai.name.clone();
+            if object.attribute(&name).is_none() {
+                // Array members are named "AnIn(2)" in the model but the DAI
+                // may address the whole array by its base name.
+                match split_array_name(&dai.name) {
+                    Some((base, _)) if object.attribute(base).is_some() => name = base.to_string(),
+                    _ => {
+                        return Err(Error::model(format!(
+                            "DAI {:?} has no matching DA",
+                            dai.name
+                        )))
+                    }
+                }
             }
+            let da = object.attribute_mut(&name).expect("checked above");
+            self.apply_vals(da, dai, path);
         }
         for sdi in sdis {
-            if object.child(&sdi.name).is_some() {
-                let sub = object.child_mut(&sdi.name).expect("just checked");
-                self.apply_doi(sub, &sdi.dais, &sdi.sdis)
+            if let Some(target) = self.sdi_target(object, sdi, path) {
+                let sub = object.child_mut(&target).expect("sdi_target checked");
+                let sub_path = join_path(path, &target);
+                self.apply_doi(sub, &sdi.dais, &sdi.sdis, &sub_path)
                     .map_err(|e| Error::model(format!("SDI {}: {e}", sdi.name)))?;
                 continue;
             }
             if object.attribute(&sdi.name).is_some() {
                 let da = object.attribute_mut(&sdi.name).expect("just checked");
-                self.apply_sdi_on_da(da, sdi)
+                let sub_path = join_path(path, &sdi.name);
+                self.apply_sdi_on_da(da, sdi, &sub_path)
                     .map_err(|e| Error::model(format!("SDI {}: {e}", sdi.name)))?;
                 continue;
             }
@@ -514,27 +848,376 @@ impl<'a> Builder<'a> {
         Ok(())
     }
 
-    fn apply_sdi_on_da(&self, da: &mut model::DataAttribute, sdi: &Sdi) -> Result<()> {
+    /// Resolves an `SDI` to the name of the sub-object it addresses.
+    ///
+    /// An `SDI` naming an array-valued sub-object without its index selects
+    /// the first element, which is what `SDI@ix` overrides.
+    fn sdi_target(&mut self, object: &model::DataObject, sdi: &Sdi, path: &str) -> Option<String> {
+        if object.child(&sdi.name).is_some() {
+            return Some(sdi.name.clone());
+        }
+        // "phsA" with an ix of n addresses "phsA(n)"; without one, the first.
+        if split_array_name(&sdi.name).is_some() {
+            return None;
+        }
+        let ix = sdi.ix.trim();
+        let mut n = 1;
+        if !ix.is_empty() {
+            match array_index(ix) {
+                Some(v) => n = v,
+                None => self.diag.add(
+                    join_path(path, &sdi.name),
+                    format!("SDI ix={:?} is not an array index; the first element is used", sdi.ix),
+                ),
+            }
+        }
+        let el = format!("{}({n})", sdi.name);
+        if object.child(&el).is_some() {
+            return Some(el);
+        }
+        if !ix.is_empty() {
+            self.diag.add(
+                join_path(path, &sdi.name),
+                format!(
+                    "SDI ix={ix} addresses element {n} of {:?}, which the type does not \
+                     declare as an array",
+                    sdi.name
+                ),
+            );
+        }
+        None
+    }
+
+    /// Applies the `Val` elements of a `DAI`, honouring the `sAddr`
+    /// sub-address and the `sGroup` setting group.
+    fn apply_vals(&mut self, da: &mut model::DataAttribute, dai: &Dai, path: &str) {
+        let da_path = join_path(path, &da.name);
+        // An sAddr names an element of an array attribute; a DAI without one
+        // applies to the whole attribute.
+        let mut elem: Option<usize> = None;
+        let s_addr = dai.s_addr.trim();
+        if !s_addr.is_empty() {
+            if da.kind != Some(Type::Array) {
+                self.diag.add(
+                    da_path.clone(),
+                    format!(
+                        "DAI sAddr={:?} is given, but {} is not an array; the value is \
+                         applied to the whole attribute",
+                        dai.s_addr, da.name
+                    ),
+                );
+            } else {
+                match array_index(s_addr) {
+                    Some(n) if n >= 1 && n <= da.count => elem = Some(n - 1),
+                    _ => self.diag.add(
+                        da_path.clone(),
+                        format!(
+                            "DAI sAddr={:?} does not select an element of the {}-element \
+                             array {}",
+                            dai.s_addr, da.count, da.name
+                        ),
+                    ),
+                }
+            }
+        }
+        for v in &dai.vals {
+            // A Val carrying an sGroup other than the active one defines a
+            // setting group. It is applied, recorded, and then rolled back,
+            // so the group value is kept without becoming the served one.
+            let group = self.group_of(&v.s_group);
+
+            if let Some(i) = elem {
+                let Some(prev) = da.value.as_ref().and_then(|a| a.index(i)).cloned() else {
+                    self.diag.add(
+                        da_path.clone(),
+                        format!(
+                            "sAddr {:?} does not select an element of the {}-element array",
+                            dai.s_addr, da.count
+                        ),
+                    );
+                    continue;
+                };
+                // The value is parsed against a stand-in attribute, because
+                // that is how set_value resolves an enum literal and the
+                // element carries no type of its own. The stand-in carries
+                // the enum binding, or an Enum array would reject every
+                // literal.
+                let mut tmp = model::DataAttribute {
+                    name: da.name.clone(),
+                    fc: da.fc,
+                    fc_name: da.fc_name.clone(),
+                    kind: Some(prev.type_of()),
+                    btype: da.btype.clone(),
+                    enum_type: da.enum_type.clone(),
+                    trg_ops: da.trg_ops,
+                    ..Default::default()
+                };
+                if let Err(e) = self.set_value(&mut tmp, &v.value) {
+                    self.diag.add(da_path.clone(), e.to_string());
+                    continue;
+                }
+                let arr = da.value.as_mut().expect("indexed above");
+                arr.set_index(i, tmp.value.unwrap_or(Value::None));
+                if group > 0 {
+                    // The recorded value is the whole array with that one
+                    // position changed, because that is what the group holds;
+                    // the served array is then put back.
+                    let elem_attr = model::DataAttribute {
+                        name: da.name.clone(),
+                        fc: da.fc,
+                        value: da.value.clone(),
+                        ..Default::default()
+                    };
+                    if self.record_group_value(group, &elem_attr, path) {
+                        da.value.as_mut().expect("present").set_index(i, prev);
+                    }
+                }
+                continue;
+            }
+
+            // The value is applied to the attribute itself, because that is
+            // what resolves an enum literal against its EnumType. A Val
+            // carrying an sGroup other than the active one is then rolled
+            // back, leaving only the per-group record.
+            let prev = da.value.clone();
+            if let Err(e) = self.set_value(da, &v.value) {
+                self.diag.add(da_path.clone(), e.to_string());
+                continue;
+            }
+            if group > 0 && self.record_group_value(group, da, path) {
+                // Only a setting-group value is rolled back: a Val carrying an
+                // sGroup on an attribute of another constraint is just a value,
+                // and discarding it would lose the document's meaning.
+                da.value = prev;
+            }
+        }
+    }
+
+    /// Resolves an `sGroup` attribute to a group number. A `Val` without one
+    /// applies to the active group, numbered 0. A group number that is not a
+    /// plain integer is reported and ignored.
+    fn group_of(&mut self, s_group: &str) -> usize {
+        let s = s_group.trim();
+        if s.is_empty() {
+            return 0;
+        }
+        match s.parse::<usize>() {
+            Ok(n) if n <= 255 => n,
+            _ => {
+                self.diag.add(
+                    "",
+                    format!(
+                        "Val sGroup={s_group:?} is not a setting-group number (0..255); the \
+                         value is applied to the active group only"
+                    ),
+                );
+                0
+            }
+        }
+    }
+
+    /// Notes a `Val@sGroup` value of an FC SG or SE attribute for the logical
+    /// device being built, so the setting-group machinery can serve it.
+    ///
+    /// It reports whether the value was recorded: a `Val` carrying an
+    /// `sGroup` on an attribute of another constraint is not a setting-group
+    /// value, and the caller must then leave it applied rather than roll it
+    /// back.
+    fn record_group_value(&mut self, group: usize, da: &model::DataAttribute, path: &str) -> bool {
+        if da.fc != model::Fc::Sg && da.fc != model::Fc::Se {
+            return false;
+        }
+        let led = self.led_ref();
+        let reference = format!("{led}/{}", join_path(path, &da.name));
+        self.group_values
+            .entry(led)
+            .or_default()
+            .entry(group)
+            .or_default()
+            .push((reference, da.value.clone().unwrap_or(Value::None)));
+        true
+    }
+
+    /// Writes the values of setting group `n` onto the attributes they name,
+    /// so the model serves the group the device declares active. Group 0 is
+    /// the active group of `Val` elements that carried no `sGroup`, which
+    /// [`Builder::apply_vals`] has already applied.
+    fn apply_active_group(&self, ld: &mut model::LogicalDevice, n: usize) {
+        if n == 0 {
+            return;
+        }
+        let Some(values) = self.group_values.get(&ld.name).and_then(|g| g.get(&n)) else {
+            return;
+        };
+        for (path, value) in values {
+            let Some((_, rest)) = path.split_once('/') else {
+                continue;
+            };
+            let segs: Vec<&str> = rest.split('.').collect();
+            if segs.len() < 2 {
+                continue;
+            }
+            let Some(object) = ld.node_mut(segs[0]).and_then(|ln| ln.object_mut(segs[1])) else {
+                continue;
+            };
+            if let Some(da) = resolve_path(object, &segs[2..]) {
+                da.value = Some(value.clone());
+            }
+        }
+    }
+
+    /// Turns the recorded per-group values into setting groups, ordered by
+    /// device and then group number so the active group comes first.
+    fn setting_groups(&self) -> Vec<model::SettingGroup> {
+        let mut out = Vec::new();
+        for (ld, groups) in &self.group_values {
+            for (number, values) in groups {
+                out.push(model::SettingGroup {
+                    number: *number,
+                    ld: ld.clone(),
+                    values: values.iter().cloned().collect(),
+                });
+            }
+        }
+        out
+    }
+
+    fn apply_sdi_on_da(&mut self, da: &mut model::DataAttribute, sdi: &Sdi, path: &str) -> Result<()> {
         for dai in &sdi.dais {
             let c = da.child_mut(&dai.name).ok_or_else(|| {
                 Error::model(format!("DAI {:?} has no matching member", dai.name))
             })?;
-            if let Some(v) = dai.vals.first() {
-                self.set_value(c, &v.value)?;
-            }
+            self.apply_vals(c, dai, path);
         }
         for sub in &sdi.sdis {
             let c = da.child_mut(&sub.name).ok_or_else(|| {
                 Error::model(format!("SDI {:?} has no matching member", sub.name))
             })?;
-            self.apply_sdi_on_da(c, sub)
+            self.apply_sdi_on_da(c, sub, &join_path(path, &sub.name))
                 .map_err(|e| Error::model(format!("SDI {}: {e}", sub.name)))?;
         }
         Ok(())
     }
 
+    fn build_report_control(&mut self, r: &ReportControl) -> model::ReportControl {
+        let mut rc = self.report_control_of(r);
+        if let Some(re) = &r.rpt_enabled {
+            if !re.client_lns.is_empty() {
+                self.reserve_instances(&mut rc, &re.client_lns);
+            }
+        }
+        rc
+    }
+
+    /// Resolves each `ClientLN` of a report control block to the IP address of
+    /// the client IED's access point, which is how the server recognises that
+    /// client when it connects. `ClientLN` i reserves instance i+1. One that
+    /// names an IED with no IP address in the Communication section cannot be
+    /// enforced, so its instance is left free and reported.
+    fn reserve_instances(&mut self, rc: &mut model::ReportControl, clients: &[ClientLn]) {
+        let n = rc.rpt_enabled;
+        let mut clients = clients;
+        if clients.len() > n {
+            self.diag.add(
+                format!("ReportControl {}", rc.name),
+                format!(
+                    "{} ClientLN reservations for {n} instance(s); the extra ones are ignored",
+                    clients.len()
+                ),
+            );
+            clients = &clients[..n];
+        }
+        rc.reservations = vec![None; clients.len()];
+        for (i, cl) in clients.iter().enumerate() {
+            let ap = if cl.ap_ref.is_empty() { &cl.ap_name } else { &cl.ap_ref };
+            match client_ip(self.scl, &cl.ied_name, ap) {
+                Some(ip) => {
+                    rc.reservations[i] = Some(model::ClientReservation {
+                        ied_name: cl.ied_name.clone(),
+                        ip: Some(ip),
+                    });
+                }
+                None => self.diag.add(
+                    format!("ReportControl {}", rc.name),
+                    format!(
+                        "ClientLN {} names IED {:?}, which has no IP address in the \
+                         Communication section; the instance is left unreserved",
+                        i + 1,
+                        cl.ied_name
+                    ),
+                ),
+            }
+        }
+    }
+
+    fn report_control_of(&mut self, r: &ReportControl) -> model::ReportControl {
+        let mut rc = model::ReportControl {
+            name: r.name.clone(),
+            rpt_id: r.rpt_id.clone(),
+            data_set: r.dat_set.clone(),
+            conf_rev: r.conf_rev,
+            buffered: r.buffered,
+            buf_time: r.buf_time,
+            intg_pd: r.intg_pd,
+            trg_ops: trg_ops_of(r.trg_ops.as_ref()),
+            rpt_enabled: 1,
+            ..Default::default()
+        };
+        if let Some(re) = &r.rpt_enabled {
+            if re.max > 0 {
+                rc.rpt_enabled = re.max as usize;
+            }
+        }
+        // IEC 61850-6: an unindexed block is a single instance under its own
+        // name, whatever RptEnabled says.
+        if !r.indexed {
+            rc.not_indexed = true;
+            rc.rpt_enabled = 1;
+        }
+        if rc.rpt_enabled > MAX_RCB_INSTANCES {
+            self.diag.add(
+                format!("ReportControl {}", r.name),
+                format!(
+                    "RptEnabled max={} exceeds the {MAX_RCB_INSTANCES} two-digit instance names \
+                     IEC 61850-6 defines; capped",
+                    rc.rpt_enabled
+                ),
+            );
+            rc.rpt_enabled = MAX_RCB_INSTANCES;
+        }
+        if let Some(of) = &r.opt_fields {
+            let mut flags = model::OptFlds::default();
+            let mut set = |on: bool, f: model::OptFlds| {
+                if on {
+                    flags |= f;
+                }
+            };
+            set(of.seq_num, model::OptFlds::SEQ_NUM);
+            set(of.time_stamp, model::OptFlds::TIME_OF_ENTRY);
+            set(of.reason_code, model::OptFlds::REASON_CODE);
+            set(of.data_set, model::OptFlds::DATA_SET_NAME);
+            set(of.data_ref, model::OptFlds::DATA_REF);
+            set(of.buf_ovfl, model::OptFlds::BUF_OVFL);
+            set(of.entry_id, model::OptFlds::ENTRY_ID);
+            set(of.config_ref, model::OptFlds::CONF_REV);
+            set(of.segmentation, model::OptFlds::SEGMENTATION);
+            rc.opt_flds = flags;
+        }
+        // The Ed 1 per-block buffer depth, superseded in Ed 2 by the
+        // device-wide Services/ConfReportControl@maxBuf. Honoured when present
+        // so an Ed 1 file keeps its configured depth.
+        if r.buf_depth > 0 && r.buffered {
+            rc.max_queue_size = r.buf_depth as usize;
+        }
+        rc
+    }
+
+    /// Instantiates a GOOSE control block. `type` selects the legacy GSSE
+    /// variant, and `Protocol` names the transmission profile: `R-GOOSE` for
+    /// routable GOOSE, which [`crate::rsession`] sends to the block's IP
+    /// destination.
     fn build_gse_control(
-        &self,
+        &mut self,
         ied_name: &str,
         ap_name: &str,
         ld_inst: &str,
@@ -549,22 +1232,54 @@ impl<'a> Builder<'a> {
             },
             data_set: g.dat_set.clone(),
             conf_rev: g.conf_rev,
+            kind: gs_type_of(&g.kind),
+            protocol: protocol_of(g.protocol.as_ref()),
+            fixed_offs: g.fixed_offs,
             ..Default::default()
         };
+        let what = format!("GSEControl {}", g.name);
+        if gc.kind != model::GsType::Goose {
+            self.diag.add(
+                what.clone(),
+                format!(
+                    "type={:?} is a legacy or vendor GOOSE variant; it is configured as a plain \
+                     GOOSE control block",
+                    g.kind
+                ),
+            );
+        }
+        if g.fixed_offs {
+            self.diag.add(
+                what.clone(),
+                "fixedOffs requests the fixed-offset GOOSE encoding, which is not implemented; \
+                 a publisher built from this block encodes its dataset with variable lengths",
+            );
+        }
         if let Some(gse) = find_gse(self.scl, ied_name, ap_name, ld_inst, &g.name) {
             let (mac, app_id, vlan_id, prio) = address_of(gse.address.as_ref());
             gc.dst_mac = mac;
             gc.app_id = app_id;
             gc.vlan_id = vlan_id;
             gc.vlan_pri = prio;
+            gc.dst_ip = ip_of(gse.address.as_ref());
             gc.min_time = gse.min_time.as_ref().map_or(0, DurUnits::millis);
             gc.max_time = gse.max_time.as_ref().map_or(0, DurUnits::millis);
+        }
+        if gc.protocol == "R-GOOSE" && gc.dst_ip.is_none() {
+            self.diag.add(
+                what,
+                "Protocol is R-GOOSE but the GSE address has no IP or IPv6 destination; the \
+                 block cannot be sent routably",
+            );
         }
         gc
     }
 
+    /// Instantiates a sampled-value control block, including the Ed 2
+    /// `SmvOpts` optional-field set and the sample mode. An R-SV block is sent
+    /// by [`crate::rsession`] to its IP destination.
     fn build_sv_control(
-        &self,
+        &mut self,
         ied_name: &str,
         ap_name: &str,
         ld_inst: &str,
@@ -578,27 +1293,158 @@ impl<'a> Builder<'a> {
             smp_rate: s.smp_rate,
             no_asdu: s.nof_asdu,
             multicast: s.multicast,
+            smp_mod: smp_mod_of(&s.smp_mod),
+            sv_type: s.sv_type.trim().to_string(),
+            protocol: protocol_of(s.protocol.as_ref()),
             ..Default::default()
         };
+        if let Some(o) = &s.smv_opts {
+            sc.opts = model::SvOpts {
+                refresh_time: o.refresh_time,
+                sample_synchronized: o.sample_synchronized,
+                sample_rate: o.sample_rate,
+                data_set: o.data_set,
+                security: o.security,
+                timestamp: o.timestamp,
+                synch_source_id: o.synch_source_id,
+            };
+        }
         if let Some(smv) = find_smv(self.scl, ied_name, ap_name, ld_inst, &s.name) {
             let (mac, app_id, vlan_id, prio) = address_of(smv.address.as_ref());
             sc.dst_mac = mac;
             sc.app_id = app_id;
             sc.vlan_id = vlan_id;
             sc.vlan_pri = prio;
+            sc.dst_ip = ip_of(smv.address.as_ref());
+        }
+        if sc.protocol == "R-SV" && sc.dst_ip.is_none() {
+            self.diag.add(
+                format!("SampledValueControl {}", s.name),
+                "Protocol is R-SV but the SMV address has no IP or IPv6 destination; the block \
+                 cannot be sent routably",
+            );
         }
         sc
     }
 }
 
+/// Walks the remaining segments of an attribute path from a data object,
+/// descending through sub-objects and structured attributes alike, and
+/// returns the attribute the path names.
+fn resolve_path<'m>(
+    object: &'m mut model::DataObject,
+    segs: &[&str],
+) -> Option<&'m mut model::DataAttribute> {
+    let (first, rest) = segs.split_first()?;
+    if object.child(first).is_some() {
+        return resolve_path(object.child_mut(first)?, rest);
+    }
+    let mut da = object.attribute_mut(first)?;
+    for name in rest {
+        da = da.child_mut(name)?;
+    }
+    Some(da)
+}
+
+/// The outcome of parsing a `count` attribute.
+enum ArrayCount {
+    /// Not an array: absent, zero, or an enumeration literal, which the
+    /// schema's union type permits.
+    Scalar,
+    Array(usize),
+    /// A numeric count beyond [`MAX_ARRAY_COUNT`], which is a corrupt or
+    /// hostile value rather than a legitimate one.
+    TooBig,
+}
+
+fn array_count(count: &str) -> ArrayCount {
+    match count.trim().parse::<i64>() {
+        Ok(v) if v > MAX_ARRAY_COUNT as i64 => ArrayCount::TooBig,
+        Ok(v) if v > 0 => ArrayCount::Array(v as usize),
+        _ => ArrayCount::Scalar,
+    }
+}
+
+/// Reads an SCL array index (the `ix` attribute of a `DOI`, `SDI`, `DAI` or
+/// `FCDA`, or a `DAI@sAddr`) as a one-based element number.
+///
+/// The base of `ix` is not settled by the standard: IEC 61850-6 TISSUE 1808
+/// asks the question, and both spellings occur in files from different tools.
+/// Treating 0 as the first element is the only reading under which both work,
+/// so `ix=0` and `ix=1` both name element one, and an `ix` of n names element
+/// n above one.
+fn array_index(s: &str) -> Option<usize> {
+    match s.trim().parse::<i64>() {
+        Ok(0) => Some(1),
+        Ok(n) if n > 0 => usize::try_from(n).ok(),
+        _ => None,
+    }
+}
+
+/// Splits `AnIn(3)` into `AnIn` and 3.
+fn split_array_name(s: &str) -> Option<(&str, usize)> {
+    let i = s.rfind('(')?;
+    let inner = s[i + 1..].strip_suffix(')')?;
+    let n: usize = inner.parse().ok()?;
+    (n > 0).then_some((&s[..i], n))
+}
+
+fn join_path(prefix: &str, name: &str) -> String {
+    match (prefix.is_empty(), name.is_empty()) {
+        (true, _) => name.to_string(),
+        (_, true) => prefix.to_string(),
+        _ => format!("{prefix}.{name}"),
+    }
+}
+
+/// Adds the trigger flags of a `DA` or `BDA` to the inherited options: a
+/// `BDA` inherits the options of the enclosing `DA`.
+fn trg_ops_of_flags(inherited: model::TrgOps, dchg: bool, qchg: bool, dupd: bool) -> model::TrgOps {
+    let mut trg = inherited;
+    if dchg {
+        trg |= model::TrgOps::DATA_CHANGE;
+    }
+    if qchg {
+        trg |= model::TrgOps::QUALITY_CHANGE;
+    }
+    if dupd {
+        trg |= model::TrgOps::DATA_UPDATE;
+    }
+    trg
+}
+
+/// The `PHYCOMADDR` structure of IEC 61850-8-1: the MAC address, VLAN
+/// priority and identifier, and APPID of a stream.
+fn phy_com_addr(fc: model::Fc, fc_raw: &str, trg: model::TrgOps) -> Vec<model::DataAttribute> {
+    let leaf = |name: &str, kind: Type, v: Value| model::DataAttribute {
+        name: name.to_string(),
+        fc,
+        fc_name: fc_raw.to_string(),
+        kind: Some(kind),
+        trg_ops: trg,
+        value: Some(v),
+        ..Default::default()
+    };
+    vec![
+        leaf("Addr", Type::OctetString, Value::octet_string(vec![0; 6])),
+        leaf("PRIORITY", Type::Unsigned, Value::uint8(0)),
+        leaf("VID", Type::Unsigned, Value::uint16(0)),
+        leaf("APPID", Type::Unsigned, Value::uint16(0)),
+    ]
+}
+
 /// Maps an SCL basic type name to an MMS value type.
 ///
-/// Unknown basic types are an error rather than a silent default: a model that
-/// silently loses an attribute's type serves the wrong thing forever after.
-fn kind_of(btype: &str) -> Result<Type> {
+/// The full `tPredefinedBasicTypeEnum` of IEC 61850-8-1 is covered. A type
+/// outside it yields `None`: the build records a diagnostic and keeps the
+/// attribute in the tree, valueless, so that datasets, report control blocks
+/// and control models which name it still resolve.
+fn kind_of(btype: &str) -> Option<Type> {
     let t = match btype {
         "BOOLEAN" => Type::Boolean,
-        "INT8" | "INT16" | "INT24" | "INT32" | "INT64" | "INT128" | "Enum" => Type::Integer,
+        "INT8" | "INT16" | "INT24" | "INT32" | "INT64" | "INT128" | "Enum" | "DACount" => {
+            Type::Integer
+        }
         "INT8U" | "INT16U" | "INT24U" | "INT32U" | "INT64U" => Type::Unsigned,
         "FLOAT32" => Type::Float32,
         "FLOAT64" => Type::Float64,
@@ -606,21 +1452,23 @@ fn kind_of(btype: &str) -> Result<Type> {
         | "ObjRef" | "Currency" => Type::VisibleString,
         "Unicode255" => Type::MmsString,
         "Octet6" | "Octet16" | "Octet64" | "EntryID" => Type::OctetString,
-        "Quality" | "Dbpos" | "Tcmd" | "Check" | "TrgOps" | "OptFlds" => Type::BitString,
+        "Quality" | "Dbpos" | "Tcmd" | "Check" | "TrgOps" | "OptFlds" | "SvOptFlds"
+        | "LogOptFlds" => Type::BitString,
         "Timestamp" => Type::UtcTime,
         "EntryTime" => Type::BinaryTime,
-        other => return Err(Error::model(format!("unsupported bType {other:?}"))),
+        _ => return None,
     };
-    Ok(t)
+    Some(t)
 }
 
-/// Returns the bit-string width of a bit-string basic type.
+/// Returns the bit-string width of a bit-string basic type. The widths are
+/// fixed by IEC 61850-8-1.
 fn bit_len_of(btype: &str) -> usize {
     match btype {
         "Quality" => 13,
         "Dbpos" | "Tcmd" | "Check" => 2,
         "TrgOps" => 6,
-        "OptFlds" => 10,
+        "OptFlds" | "SvOptFlds" | "LogOptFlds" => 10,
         _ => 8,
     }
 }
@@ -653,17 +1501,16 @@ fn default_value(kind: Type, btype: &str) -> Value {
 /// Resolves `FCDA` entries to object references.
 ///
 /// Array index notation in `doName`/`daName` (for example `phsA(2)`) is passed
-/// through verbatim, as the reference form has no other way to express it.
+/// through verbatim, and `FCDA@ix` is the Ed 2 alternative that names the same
+/// instance numerically. A member under a constraint this crate does not know
+/// is carried verbatim, so it still resolves and still reports.
 fn build_data_set(ied_name: &str, ld_inst: &str, dse: &DataSet) -> Result<model::DataSet> {
     let mut ds = model::DataSet {
         name: dse.name.clone(),
-        entries: Vec::new(),
+        ..Default::default()
     };
     for f in &dse.fcdas {
-        let fc: model::Fc = f
-            .fc
-            .parse()
-            .map_err(|e| Error::model(format!("dataset {}: {e}", dse.name)))?;
+        let fc = model::parse_fc_lenient(&f.fc);
         let li = if f.ld_inst.is_empty() {
             ld_inst
         } else {
@@ -674,65 +1521,61 @@ fn build_data_set(ied_name: &str, ld_inst: &str, dse: &DataSet) -> Result<model:
         } else {
             format!("{}{}{}", f.prefix, f.ln_class, f.ln_inst)
         };
-        let mut reference = format!("{ied_name}{li}/{ln}");
-        if !f.do_name.is_empty() {
-            reference.push('.');
-            reference.push_str(&f.do_name);
+        let mut do_name = f.do_name.clone();
+        let mut da_name = f.da_name.clone();
+        if let Some(n) = array_index(&f.ix).filter(|_| !f.ix.trim().is_empty()) {
+            // ix selects an element of the innermost array the member names.
+            // Where the member names an attribute, the usual case when the
+            // array is an attribute array, the index goes there; otherwise it
+            // goes on the data object.
+            let target = if da_name.is_empty() { &mut do_name } else { &mut da_name };
+            if !target.is_empty() && split_array_name(target).is_none() {
+                *target = format!("{target}({n})");
+            }
         }
-        if !f.da_name.is_empty() {
+        let mut reference = format!("{ied_name}{li}/{ln}");
+        if !do_name.is_empty() {
             reference.push('.');
-            reference.push_str(&f.da_name);
+            reference.push_str(&do_name);
+        }
+        if !da_name.is_empty() {
+            reference.push('.');
+            reference.push_str(&da_name);
         }
         let r = model::ObjectReference::parse(reference)
             .map_err(|e| Error::model(format!("dataset {}: {e}", dse.name)))?;
-        ds.entries.push(model::Fcda { reference: r, fc });
+        ds.entries.push(model::Fcda {
+            reference: r,
+            fc,
+            fc_name: f.fc.clone(),
+        });
     }
     Ok(ds)
 }
 
-fn build_report_control(r: &ReportControl) -> model::ReportControl {
-    let mut rc = model::ReportControl {
-        name: r.name.clone(),
-        rpt_id: r.rpt_id.clone(),
-        data_set: r.dat_set.clone(),
-        conf_rev: r.conf_rev,
-        buffered: r.buffered,
-        buf_time: r.buf_time,
-        intg_pd: r.intg_pd,
-        trg_ops: trg_ops_of(r.trg_ops.as_ref()),
-        rpt_enabled: 1,
-        ..Default::default()
-    };
-    if let Some(re) = r.rpt_enabled {
-        if re.max > 0 {
-            rc.rpt_enabled = re.max as usize;
+/// Finds the IP address of an IED's access point, preferring the named access
+/// point and otherwise the first one of the IED that has an address.
+fn client_ip(scl: &Scl, ied_name: &str, ap_name: &str) -> Option<IpAddr> {
+    let comm = scl.communication.as_ref()?;
+    if ied_name.is_empty() {
+        return None;
+    }
+    let mut fallback = None;
+    for sn in &comm.sub_networks {
+        for cap in &sn.connected_aps {
+            if cap.ied_name != ied_name {
+                continue;
+            }
+            let Some(ip) = cap.ip().and_then(|s| s.parse::<IpAddr>().ok()) else {
+                continue;
+            };
+            if ap_name.is_empty() || cap.ap_name == ap_name {
+                return Some(ip);
+            }
+            fallback.get_or_insert(ip);
         }
     }
-    // IEC 61850-6: an unindexed block is a single instance under its own
-    // name, whatever RptEnabled says.
-    if !r.indexed {
-        rc.not_indexed = true;
-        rc.rpt_enabled = 1;
-    }
-    if let Some(of) = &r.opt_fields {
-        let mut flags = model::OptFlds::default();
-        let mut set = |on: bool, f: model::OptFlds| {
-            if on {
-                flags |= f;
-            }
-        };
-        set(of.seq_num, model::OptFlds::SEQ_NUM);
-        set(of.time_stamp, model::OptFlds::TIME_OF_ENTRY);
-        set(of.reason_code, model::OptFlds::REASON_CODE);
-        set(of.data_set, model::OptFlds::DATA_SET_NAME);
-        set(of.data_ref, model::OptFlds::DATA_REF);
-        set(of.buf_ovfl, model::OptFlds::BUF_OVFL);
-        set(of.entry_id, model::OptFlds::ENTRY_ID);
-        set(of.config_ref, model::OptFlds::CONF_REV);
-        set(of.segmentation, model::OptFlds::SEGMENTATION);
-        rc.opt_flds = flags;
-    }
-    rc
+    fallback
 }
 
 /// Converts a `TrgOps` element.
@@ -744,16 +1587,7 @@ fn trg_ops_of(t: Option<&TrgOpsElem>) -> model::TrgOps {
     let Some(t) = t else {
         return model::TrgOps::GI;
     };
-    let mut ops = model::TrgOps::default();
-    if t.dchg {
-        ops |= model::TrgOps::DATA_CHANGE;
-    }
-    if t.qchg {
-        ops |= model::TrgOps::QUALITY_CHANGE;
-    }
-    if t.dupd {
-        ops |= model::TrgOps::DATA_UPDATE;
-    }
+    let mut ops = trg_ops_of_flags(model::TrgOps::default(), t.dchg, t.qchg, t.dupd);
     if t.period {
         ops |= model::TrgOps::INTEGRITY;
     }
@@ -763,7 +1597,33 @@ fn trg_ops_of(t: Option<&TrgOpsElem>) -> model::TrgOps {
     ops
 }
 
+/// Maps the `type` attribute of a `GSEControl`.
+fn gs_type_of(t: &str) -> model::GsType {
+    if t.trim().eq_ignore_ascii_case("GSSE") {
+        model::GsType::Gsse
+    } else {
+        model::GsType::Goose
+    }
+}
+
+/// Returns the value of a `Protocol` element.
+fn protocol_of(p: Option<&Protocol>) -> String {
+    p.map(|p| p.value.trim().to_string()).unwrap_or_default()
+}
+
+/// Maps the `smpMod` attribute, defaulting to samples per period.
+fn smp_mod_of(s: &str) -> model::SmpMod {
+    match s.trim() {
+        "SmpPerSec" => model::SmpMod::SmpPerSec,
+        "SecPerSmp" => model::SmpMod::SecPerSmp,
+        _ => model::SmpMod::SmpPerPeriod,
+    }
+}
+
 fn build_log_control(l: &LogControl) -> model::LogControl {
+    // lnClass is what names the node holding the log: a prefix or instance
+    // without one does not.
+    let class = l.ln_class.trim();
     model::LogControl {
         name: l.name.clone(),
         data_set: l.dat_set.clone(),
@@ -771,6 +1631,14 @@ fn build_log_control(l: &LogControl) -> model::LogControl {
         trg_ops: trg_ops_of(l.trg_ops.as_ref()),
         intg_pd: l.intg_pd,
         log_ena: l.log_ena,
+        buf_time: l.buf_time,
+        reason_code: l.reason_code,
+        log_ld_inst: l.ld_inst.trim().to_string(),
+        log_ln: if class.is_empty() {
+            String::new()
+        } else {
+            format!("{}{class}{}", l.prefix.trim(), l.ln_inst.trim())
+        },
     }
 }
 
@@ -865,6 +1733,22 @@ fn address_of(a: Option<&Address>) -> ([u8; 6], u16, u16, u8) {
     (mac, app_id, vlan_id, prio)
 }
 
+/// The destination IP address of a routable (R-GOOSE, R-SV) control block:
+/// the `IP` or `IPv6` parameter of its address, without a prefix length.
+fn ip_of(a: Option<&Address>) -> Option<IpAddr> {
+    let a = a?;
+    for name in ["IP", "IPv6"] {
+        let Some(s) = a.get(name) else {
+            continue;
+        };
+        let s = s.split('/').next().unwrap_or(s);
+        if let Ok(ip) = s.parse() {
+            return Some(ip);
+        }
+    }
+    None
+}
+
 /// Parses `01-0C-CD-01-00-01`, or the colon-separated form.
 fn parse_mac(s: &str) -> Option<[u8; 6]> {
     let parts: Vec<&str> = s.split(['-', ':']).filter(|p| !p.is_empty()).collect();
@@ -884,7 +1768,7 @@ fn decode_hex(s: &str) -> Option<Vec<u8>> {
     }
     (0..s.len())
         .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+        .map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok())
         .collect()
 }
 
@@ -1207,14 +2091,28 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_basic_types_are_rejected() {
-        assert!(kind_of("BOOLEAN").is_ok());
-        assert!(kind_of("Nonsense").is_err());
+    fn unknown_basic_types_have_no_kind() {
+        assert_eq!(kind_of("BOOLEAN"), Some(Type::Boolean));
+        assert_eq!(kind_of("SvOptFlds"), Some(Type::BitString));
+        assert!(kind_of("Nonsense").is_none());
         // Every bit-string type has its standard width.
         assert_eq!(bit_len_of("Quality"), 13);
         assert_eq!(bit_len_of("Dbpos"), 2);
         assert_eq!(bit_len_of("Check"), 2);
         assert_eq!(bit_len_of("TrgOps"), 6);
         assert_eq!(bit_len_of("OptFlds"), 10);
+        assert_eq!(bit_len_of("LogOptFlds"), 10);
+    }
+
+    #[test]
+    fn array_indices_accept_both_bases() {
+        assert_eq!(array_index("0"), Some(1));
+        assert_eq!(array_index("1"), Some(1));
+        assert_eq!(array_index("3"), Some(3));
+        assert_eq!(array_index("-1"), None);
+        assert_eq!(array_index("x"), None);
+        assert_eq!(split_array_name("AnIn(3)"), Some(("AnIn", 3)));
+        assert_eq!(split_array_name("AnIn(0)"), None);
+        assert_eq!(split_array_name("AnIn"), None);
     }
 }

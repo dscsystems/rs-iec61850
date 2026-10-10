@@ -39,11 +39,17 @@ pub mod mms;
 pub mod client;
 pub mod ethernet;
 pub mod goose;
+#[cfg(feature = "gdoi")]
+pub mod gdoi;
+#[cfg(feature = "tls")]
+pub mod iec62351;
 pub mod model;
 pub mod osi;
 pub mod scl;
+pub mod rsession;
 pub mod server;
 pub mod sv;
+pub mod x509;
 
 /// Crate version, from `Cargo.toml`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

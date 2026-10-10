@@ -30,13 +30,31 @@ tokio = { version = "1", features = [
     "signal",
 ] }
 tokio-util = { version = "0.7", features = ["codec"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 bytes = "1"
 tracing = "0.1"
 quick-xml = "0.37"
 
+# R-GOOSE and R-SV (IEC 61850-90-5) message security.
+hmac = "0.12"
+sha2 = "0.10"
+sha3 = "0.10"
+aes-gcm = "0.10"
+getrandom = "0.2"
+# Multicast group membership and socket options for the session protocol.
+socket2 = { version = "0.5", features = ["all"] }
+
 # TLS (IEC 62351-3) support.
 tokio-rustls = { version = "0.26", optional = true }
 rustls = { version = "0.23", optional = true }
+webpki = { package = "rustls-webpki", version = "0.103", optional = true }
+
+# GDOI group key management (IEC 62351-9): IKEv1 phase 1 and GROUPKEY-PULL.
+aes = { version = "0.8", optional = true }
+num-bigint = { version = "0.4", optional = true }
+p256 = { version = "0.13", features = ["ecdh", "ecdsa", "pkcs8"], optional = true }
+p384 = { version = "0.13", features = ["ecdh", "ecdsa", "pkcs8"], optional = true }
+rsa = { version = "0.9", optional = true }
 
 # Raw layer-2 access (AF_PACKET) on Linux.
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -44,11 +62,17 @@ libc = "0.2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
+# Certificates and CRLs for the TLS profile and GDOI tests.
+rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "pem", "crypto"] }
+time = "0.3"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [features]
 default = []
-tls = ["dep:tokio-rustls", "dep:rustls"]
+tls = ["dep:tokio-rustls", "dep:rustls", "dep:webpki"]
+# GDOI key distribution (IEC 62351-9) for R-GOOSE and R-SV keys. It verifies
+# certificates as the TLS profile does, so it needs that too.
+gdoi = ["tls", "dep:aes", "dep:num-bigint", "dep:p256", "dep:p384", "dep:rsa"]
 # Terminal UI client (iedx).
 tui = ["dep:ratatui", "dep:crossterm"]
 

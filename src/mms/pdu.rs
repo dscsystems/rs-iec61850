@@ -11,17 +11,26 @@ pub(crate) const TAG_CONFIRMED_RESPONSE: Tag = context_constructed(1);
 pub(crate) const TAG_CONFIRMED_ERROR: Tag = context_constructed(2);
 pub(crate) const TAG_UNCONFIRMED: Tag = context_constructed(3);
 pub(crate) const TAG_REJECT_PDU: Tag = context_constructed(4);
+/// Cancel-RequestPDU `[5] IMPLICIT Unsigned32`.
+pub(crate) const TAG_CANCEL_REQUEST: Tag = context_primitive(5);
+/// Cancel-ResponsePDU `[6] IMPLICIT Unsigned32`.
+pub(crate) const TAG_CANCEL_RESPONSE: Tag = context_primitive(6);
+/// Cancel-ErrorPDU `[7] IMPLICIT SEQUENCE`.
+pub(crate) const TAG_CANCEL_ERROR: Tag = context_constructed(7);
 pub(crate) const TAG_INITIATE_REQUEST: Tag = context_constructed(8);
 pub(crate) const TAG_INITIATE_RESPONSE: Tag = context_constructed(9);
 pub(crate) const TAG_INITIATE_ERROR: Tag = context_constructed(10);
-pub(crate) const TAG_CONCLUDE_REQUEST: Tag = context_constructed(11);
-pub(crate) const TAG_CONCLUDE_RESPONSE: Tag = context_constructed(12);
+/// Conclude-RequestPDU and -ResponsePDU are NULL: `[11]` and `[12]` IMPLICIT
+/// make them the primitive octets `8B 00` and `8C 00`. Earlier versions sent
+/// them constructed (`AB 00`, `AC 00`), which peers such as libiec61850 do
+/// not recognise; those are still accepted on receipt.
+pub(crate) const TAG_CONCLUDE_REQUEST: Tag = context_primitive(11);
+pub(crate) const TAG_CONCLUDE_RESPONSE: Tag = context_primitive(12);
+pub(crate) const TAG_CONCLUDE_REQUEST_LEGACY: Tag = context_constructed(11);
+pub(crate) const TAG_CONCLUDE_RESPONSE_LEGACY: Tag = context_constructed(12);
 
 /// Confirmed service CHOICE tags used within ConfirmedRequest/Response
 /// (ISO 9506-2 `ConfirmedServiceRequest`).
-/// The MMS `status` service, which this crate does not issue but names for
-/// completeness of the service table.
-#[allow(dead_code)]
 pub(crate) const SVC_STATUS: u32 = 0;
 pub(crate) const SVC_GET_NAME_LIST: u32 = 1;
 pub(crate) const SVC_IDENTIFY: u32 = 2;
@@ -31,15 +40,27 @@ pub(crate) const SVC_GET_VARIABLE_ACCESS: u32 = 6;
 pub(crate) const SVC_DEFINE_NAMED_VAR_LIST: u32 = 11;
 pub(crate) const SVC_GET_NAMED_VAR_LIST_ATTR: u32 = 12;
 pub(crate) const SVC_DELETE_NAMED_VAR_LIST: u32 = 13;
+pub(crate) const SVC_OBTAIN_FILE: u32 = 46;
 pub(crate) const SVC_READ_JOURNAL: u32 = 65;
+pub(crate) const SVC_INITIALIZE_JOURNAL: u32 = 67;
+pub(crate) const SVC_REPORT_JOURNAL_STATUS: u32 = 68;
 pub(crate) const SVC_FILE_OPEN: u32 = 72;
 pub(crate) const SVC_FILE_READ: u32 = 73;
 pub(crate) const SVC_FILE_CLOSE: u32 = 74;
+pub(crate) const SVC_FILE_RENAME: u32 = 75;
 pub(crate) const SVC_FILE_DELETE: u32 = 76;
 pub(crate) const SVC_FILE_DIRECTORY: u32 = 77;
 
 /// Unconfirmed service CHOICE tags.
 pub(crate) const UNCONF_INFORMATION_REPORT: u32 = 0;
+
+/// The largest MMS PDU this crate proposes or accepts.
+///
+/// IEC 61850-7-2 fixes it at 65001 octets; the number is negotiated downwards
+/// to the smaller of the two peers' proposals, so proposing less than the
+/// standard requires costs interoperability with a peer that insists on the
+/// value.
+pub const MMS_MAX: i32 = 65001;
 
 /// The negotiated service bitmap.
 ///
@@ -84,7 +105,7 @@ impl Default for InitiateRequest {
     /// Typical client initiate parameters.
     fn default() -> InitiateRequest {
         InitiateRequest {
-            local_detail: 65000,
+            local_detail: MMS_MAX,
             max_serv_outstanding: 10,
             nesting_level: 5,
             services: default_service_support(),
@@ -103,7 +124,7 @@ impl InitiateRequest {
     /// answers with its own parameters instead.
     pub fn server_default() -> InitiateRequest {
         InitiateRequest {
-            local_detail: 65000,
+            local_detail: MMS_MAX,
             max_serv_outstanding: 10,
             nesting_level: 10,
             services: ServiceSupport::with(&[
@@ -135,10 +156,14 @@ pub mod service {
     pub const DEFINE_NAMED_VARIABLE_LIST: usize = 11;
     pub const GET_NAMED_VARIABLE_LIST_ATTRIBUTES: usize = 12;
     pub const DELETE_NAMED_VARIABLE_LIST: usize = 13;
+    pub const OBTAIN_FILE: usize = 46;
     pub const READ_JOURNAL: usize = 65;
+    pub const INITIALIZE_JOURNAL: usize = 67;
+    pub const REPORT_JOURNAL_STATUS: usize = 68;
     pub const FILE_OPEN: usize = 72;
     pub const FILE_READ: usize = 73;
     pub const FILE_CLOSE: usize = 74;
+    pub const FILE_RENAME: usize = 75;
     pub const FILE_DELETE: usize = 76;
     pub const FILE_DIRECTORY: usize = 77;
     pub const INFORMATION_REPORT: usize = 79;
@@ -293,7 +318,7 @@ pub fn parse_initiate_response(pdu: &[u8]) -> Result<InitiateRequest> {
         Err(e) => {
             // Some servers answer an unacceptable proposal with InitiateError.
             if Decoder::new(pdu).peek_is(TAG_INITIATE_ERROR) {
-                return Err(Error::Rejected("InitiateError".into()));
+                return Err(Error::protocol("the peer answered with an InitiateError"));
             }
             Err(e.into())
         }
@@ -359,7 +384,7 @@ fn parse_initiate_body(content: &[u8]) -> Result<InitiateRequest> {
         }
     }
     if req.local_detail == 0 {
-        req.local_detail = 65000;
+        req.local_detail = MMS_MAX;
     }
     if req.max_serv_outstanding == 0 {
         req.max_serv_outstanding = 1;
@@ -544,7 +569,7 @@ mod tests {
     fn initiate_parameters_round_trip() {
         let req = InitiateRequest::default();
         let back = parse_initiate_request(&encode_initiate_request(&req)).unwrap();
-        assert_eq!(back.local_detail, 65000);
+        assert_eq!(back.local_detail, MMS_MAX);
         assert_eq!(back.max_serv_outstanding, 10);
         assert_eq!(back.nesting_level, 5);
         // The service bitmap must survive: clients gate feature use on it.
@@ -601,7 +626,7 @@ mod tests {
         let pdu = cons(TAG_INITIATE_ERROR, []).encode();
         assert!(matches!(
             parse_initiate_response(&pdu),
-            Err(Error::Rejected(_))
+            Err(Error::Protocol(_))
         ));
     }
 

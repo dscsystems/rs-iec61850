@@ -3,12 +3,15 @@
 //! the client selects groups.
 
 use std::collections::BTreeMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::mms::{DataAccessError, Value};
 use crate::model::{
-    DataAttribute, DataObject, Fc, LogicalDevice, Model, ObjectReference,
+    DataAttribute, DataObject, Fc, LogicalDevice, Model, ObjectReference, SettingControl,
+    SettingGroup,
 };
+
+use super::tx::Clock;
 
 /// The fixed MMS name of the setting group control block.
 pub const SGCB_NAME: &str = "SGCB";
@@ -30,6 +33,10 @@ struct Setting {
 pub struct SettingGroupManager {
     pub domain: String,
     pub num_of_sg: u8,
+    /// The reservation time in milliseconds from SCL, zero when the document
+    /// declares none.
+    pub resv_tms: u32,
+    clock: Arc<Clock>,
     state: Mutex<SgState>,
 }
 
@@ -40,25 +47,79 @@ struct SgState {
     settings: Vec<Setting>,
 }
 
-/// Materialises an SGCB into the `LLN0` of every logical device that has
-/// setting-constrained attributes.
+/// Creates one setting-group manager per logical device that has setting
+/// attributes, and materialises its SGCB in LLN0.
 ///
-/// Returns one manager per such device, keyed by domain name.
-pub fn materialise_sgcbs(
+/// Exactly one manager per device, because each one appends an SGCB to LLN0:
+/// two managers for one device would leave two SGCB objects in the model, and
+/// a write would reach the one the read path does not resolve.
+///
+/// A device that declares its groups in SCL uses the declared count, active
+/// group and reservation time, and gets an SGCB even with no settings behind
+/// it, as libiec61850 serves one; otherwise `num_of_sg` supplies a default
+/// count for every device with settings, and zero creates none. Each group
+/// starts from the values the configuration records for it
+/// (`Model::setting_groups`).
+#[cfg(test)]
+pub fn materialise_sgcbs(m: &mut Model, num_of_sg: u8) -> BTreeMap<String, SettingGroupManager> {
+    materialise_sgcbs_with(m, num_of_sg, Arc::new(Clock::default()))
+}
+
+pub(crate) fn materialise_sgcbs_with(
     m: &mut Model,
     num_of_sg: u8,
+    clock: Arc<Clock>,
 ) -> BTreeMap<String, SettingGroupManager> {
-    let num_of_sg = num_of_sg.max(1);
+    let seeds = m.setting_groups.clone();
     let mut out = BTreeMap::new();
     for ld in &mut m.devices {
-        if let Some(mgr) = build_manager(ld, num_of_sg) {
-            out.insert(ld.name.clone(), mgr);
+        let declared = declared_setting_groups(ld);
+        let mut n = num_of_sg;
+        let mut resv_tms = 0;
+        if let Some(d) = declared {
+            if d.num_of_sgs > 0 {
+                n = d.num_of_sgs;
+            }
+            resv_tms = d.resv_tms;
         }
+        if n == 0 {
+            continue;
+        }
+        let Some(mut mgr) = build_manager(ld, n, resv_tms, Arc::clone(&clock), declared.is_some())
+        else {
+            continue;
+        };
+        mgr.seed_groups(&seeds);
+        if let Some(act) = declared.map(|d| d.act_sg).filter(|a| (1..=n).contains(a)) {
+            mgr.state.get_mut().unwrap().act_sg = act;
+            if let Some(a) = ld
+                .node_mut("LLN0")
+                .and_then(|ln| ln.object_mut(SGCB_NAME))
+                .and_then(|o| o.attribute_mut("ActSG"))
+            {
+                a.value = Some(Value::uint8(act));
+            }
+        }
+        out.insert(ld.name.clone(), mgr);
     }
     out
 }
 
-fn build_manager(ld: &mut LogicalDevice, num_of_sg: u8) -> Option<SettingGroupManager> {
+/// Returns the setting-group declaration of a logical device, which
+/// IEC 61850-6 puts on its LLN0.
+fn declared_setting_groups(ld: &LogicalDevice) -> Option<SettingControl> {
+    ld.nodes
+        .iter()
+        .find_map(|ln| ln.setting_control.filter(|sc| sc.num_of_sgs > 0))
+}
+
+fn build_manager(
+    ld: &mut LogicalDevice,
+    num_of_sg: u8,
+    resv_tms: u32,
+    clock: Arc<Clock>,
+    declared: bool,
+) -> Option<SettingGroupManager> {
     // Pair SG and SE attributes by their path within the device.
     let mut sg_paths: BTreeMap<String, ObjectReference> = BTreeMap::new();
     let mut se_paths: BTreeMap<String, ObjectReference> = BTreeMap::new();
@@ -68,7 +129,7 @@ fn build_manager(ld: &mut LogicalDevice, num_of_sg: u8) -> Option<SettingGroupMa
             collect_setting_attrs(&base, object, &mut sg_paths, &mut se_paths);
         }
     }
-    if sg_paths.is_empty() {
+    if sg_paths.is_empty() && !declared {
         return None;
     }
 
@@ -76,12 +137,7 @@ fn build_manager(ld: &mut LogicalDevice, num_of_sg: u8) -> Option<SettingGroupMa
     // starts with its SCL values in all of them.
     let mut settings = Vec::new();
     for (key, sg) in &sg_paths {
-        let current = ld
-            .nodes
-            .iter()
-            .find_map(|_| None)
-            .or_else(|| lookup_value(ld, sg, Fc::Sg))
-            .unwrap_or(Value::None);
+        let current = lookup_value(ld, sg, Fc::Sg).unwrap_or(Value::None);
         settings.push(Setting {
             sg: sg.clone(),
             se: se_paths.get(key).cloned(),
@@ -90,11 +146,13 @@ fn build_manager(ld: &mut LogicalDevice, num_of_sg: u8) -> Option<SettingGroupMa
     }
 
     let lln0 = ld.node_mut("LLN0")?;
-    lln0.objects.push(build_sgcb(num_of_sg));
+    lln0.objects.push(build_sgcb(num_of_sg, resv_tms, clock.now()));
 
     Some(SettingGroupManager {
         domain: ld.name.clone(),
         num_of_sg,
+        resv_tms,
+        clock,
         state: Mutex::new(SgState {
             act_sg: 1,
             edit_sg: 0,
@@ -168,7 +226,10 @@ fn collect_setting_attr(
     }
 }
 
-fn build_sgcb(num_of_sg: u8) -> DataObject {
+/// Materialises the setting group control block of IEC 61850-7-2 under FC SP
+/// in LLN0. ResvTms, the reservation time, is present only when the
+/// configuration declares one.
+fn build_sgcb(num_of_sg: u8, resv_tms: u32, l_act_tm: Value) -> DataObject {
     let attr = |name: &str, v: Value| DataAttribute {
         name: name.to_string(),
         fc: Fc::Sp,
@@ -183,8 +244,11 @@ fn build_sgcb(num_of_sg: u8) -> DataObject {
             attr("ActSG", Value::uint8(1)),
             attr("EditSG", Value::uint8(0)),
             attr("CnfEdit", Value::boolean(false)),
-            attr("LActTm", Value::utc_time_now()),
-        ],
+            attr("LActTm", l_act_tm),
+        ]
+        .into_iter()
+        .chain((resv_tms > 0).then(|| attr("ResvTms", Value::uint32(resv_tms))))
+        .collect(),
         ..Default::default()
     }
 }
@@ -200,6 +264,26 @@ pub fn is_sgcb_write(item: &str) -> Option<&str> {
 }
 
 impl SettingGroupManager {
+    /// Fills each setting group's store with the value the source
+    /// configuration recorded for it, so a document that gives one initial
+    /// value per sGroup is served as configured instead of every group
+    /// starting from the first. A group the document does not mention keeps
+    /// the attribute's own value, the active group's.
+    fn seed_groups(&mut self, groups: &[SettingGroup]) {
+        let n = usize::from(self.num_of_sg);
+        let st = self.state.get_mut().unwrap();
+        for g in groups {
+            if g.ld != self.domain || g.number == 0 || g.number > n {
+                continue;
+            }
+            for s in &mut st.settings {
+                if let Some(v) = g.values.get(s.sg.as_str()) {
+                    s.groups[g.number - 1] = v.clone();
+                }
+            }
+        }
+    }
+
     /// Validates an SGCB write before it is stored (IEC 61850-7-2 setting
     /// group services).
     ///
@@ -235,7 +319,7 @@ impl SettingGroupManager {
                 }
                 st.act_sg = g;
                 self.set_sgcb(model, "ActSG", Value::uint8(g));
-                self.set_sgcb(model, "LActTm", Value::utc_time_now());
+                self.set_sgcb(model, "LActTm", self.clock.now());
                 // The chosen group's values become the ones in effect.
                 let updates: Vec<(ObjectReference, Value)> = st
                     .settings
@@ -374,6 +458,7 @@ mod tests {
                     },
                 ],
             }],
+            ..Default::default()
         }
     }
 
@@ -467,6 +552,7 @@ mod tests {
                 }],
                 ..Default::default()
             }],
+            ..Default::default()
         };
         assert!(materialise_sgcbs(&mut m, 4).is_empty());
         assert!(m

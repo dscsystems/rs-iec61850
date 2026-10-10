@@ -52,9 +52,9 @@ impl Client {
                 continue;
             }
             let (ln, fc_str, object) = (parts[0], parts[1], parts[2]);
-            let Ok(fc) = fc_str.parse::<Fc>() else {
-                continue;
-            };
+            // A constraint this crate does not know is carried verbatim, so
+            // the object is still retrieved rather than silently dropped.
+            let fc = crate::model::parse_fc_lenient(fc_str);
             if !ln_order.iter().any(|l| l == ln) {
                 ln_order.push(ln.to_string());
             }
@@ -74,7 +74,7 @@ impl Client {
             };
             let ln_node = ensure_ln(&mut ld, ln);
             let do_node = ensure_do(ln_node, object);
-            expand_type_spec(do_node, &ts, fc);
+            expand_type_spec(do_node, &ts, fc, fc_str);
         }
 
         // Logical nodes with no readable objects still appear.
@@ -128,13 +128,17 @@ fn ln_class(name: &str) -> String {
 
 /// Grafts an MMS structure type spec onto a data object as data attributes
 /// under the given functional constraint.
-fn expand_type_spec(object: &mut DataObject, ts: &TypeSpec, fc: Fc) {
+/// Expands the type of `LN$FC$DO` into the object's attributes. `fc_name` is
+/// the constraint as the server spelled it, kept for one this crate does not
+/// know.
+fn expand_type_spec(object: &mut DataObject, ts: &TypeSpec, fc: Fc, fc_name: &str) {
     if ts.kind != Some(Type::Structure) {
         // A data object whose view under this constraint is a single value:
         // represent it as one attribute named after the object.
         object.attributes.push(DataAttribute {
             name: object.name.clone(),
             fc,
+            fc_name: fc_name.to_string(),
             kind: ts.kind,
             value: Some(ts.default_value()),
             ..Default::default()
@@ -144,21 +148,22 @@ fn expand_type_spec(object: &mut DataObject, ts: &TypeSpec, fc: Fc) {
     for comp in &ts.components {
         object
             .attributes
-            .push(attr_from_spec(&comp.name, &comp.spec, fc));
+            .push(attr_from_spec(&comp.name, &comp.spec, fc, fc_name));
     }
 }
 
-fn attr_from_spec(name: &str, ts: &TypeSpec, fc: Fc) -> DataAttribute {
+fn attr_from_spec(name: &str, ts: &TypeSpec, fc: Fc, fc_name: &str) -> DataAttribute {
     let mut da = DataAttribute {
         name: name.to_string(),
         fc,
+        fc_name: fc_name.to_string(),
         kind: ts.kind,
         ..Default::default()
     };
     match ts.kind {
         Some(Type::Structure) => {
             for comp in &ts.components {
-                da.children.push(attr_from_spec(&comp.name, &comp.spec, fc));
+                da.children.push(attr_from_spec(&comp.name, &comp.spec, fc, fc_name));
             }
         }
         Some(Type::Array) => {
@@ -211,7 +216,7 @@ mod tests {
             name: "AnIn1".into(),
             ..Default::default()
         };
-        expand_type_spec(&mut object, &ts, Fc::Mx);
+        expand_type_spec(&mut object, &ts, Fc::Mx, "MX");
 
         let names: Vec<&str> = object.attributes.iter().map(|a| a.name.as_str()).collect();
         assert_eq!(names, ["mag", "q", "t"]);
@@ -230,7 +235,7 @@ mod tests {
             name: "Beh".into(),
             ..Default::default()
         };
-        expand_type_spec(&mut object, &TypeSpec::sized(Type::Integer, 32), Fc::St);
+        expand_type_spec(&mut object, &TypeSpec::sized(Type::Integer, 32), Fc::St, "ST");
         assert_eq!(object.attributes.len(), 1);
         assert_eq!(object.attributes[0].name, "Beh");
         assert_eq!(object.attributes[0].kind, Some(Type::Integer));
@@ -243,6 +248,7 @@ mod tests {
             "arr",
             &TypeSpec::array(4, TypeSpec::scalar(Type::Boolean)),
             Fc::St,
+            "ST",
         );
         assert_eq!(da.count, 4);
         assert_eq!(da.value.as_ref().unwrap().len(), 4);
@@ -263,6 +269,7 @@ mod tests {
                 spec: TypeSpec::scalar(Type::Boolean),
             }]),
             Fc::St,
+            "ST",
         );
         expand_type_spec(
             &mut object,
@@ -271,6 +278,7 @@ mod tests {
                 spec: TypeSpec::sized(Type::Integer, 8),
             }]),
             Fc::Cf,
+            "CF",
         );
         assert_eq!(object.attributes.len(), 2);
         assert_eq!(object.fcs(), [Fc::St, Fc::Cf]);

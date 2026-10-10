@@ -89,6 +89,9 @@ pub struct ControlOptions {
     /// How long an enhanced-security operate waits for its
     /// CommandTermination.
     pub termination_timeout: Duration,
+    /// The quality of the operate timestamp `T` for this command, overriding
+    /// [`Client::set_time_quality`].
+    pub time_quality: Option<TimeQuality>,
 }
 
 /// The default bound on the wait for the CommandTermination of an
@@ -105,6 +108,7 @@ impl Default for ControlOptions {
             synchro_check: false,
             model: None,
             termination_timeout: TERMINATION_TIMEOUT,
+            time_quality: None,
         }
     }
 }
@@ -148,6 +152,14 @@ impl ControlOptions {
     #[must_use]
     pub fn with_termination_timeout(mut self, d: Duration) -> ControlOptions {
         self.termination_timeout = d;
+        self
+    }
+
+    /// States the quality of the operate timestamp `T` for this command,
+    /// overriding [`Client::set_time_quality`].
+    #[must_use]
+    pub fn with_time_quality(mut self, q: TimeQuality) -> ControlOptions {
+        self.time_quality = Some(q);
         self
     }
 
@@ -361,7 +373,7 @@ impl ControlObject<'_> {
     /// how the server identifies it.
     pub async fn cancel(&self, opts: &ControlOptions) -> Result<()> {
         let num = self.begin_sequence();
-        let oper = self.build_oper(Value::boolean(false), opts, num);
+        let oper = self.build_cancel(opts, num);
         let item = format!("{}$Cancel", self.object);
         let result = self.client.mms().write(&self.domain, &[&item], &[oper]).await;
         self.end_sequence();
@@ -470,10 +482,22 @@ impl ControlObject<'_> {
             value,
             origin,
             Value::uint8(ctl_num),
-            Value::utc_time(SystemTime::now(), TimeQuality::accuracy(10)),
+            Value::utc_time(SystemTime::now(), self.time_quality(opts)),
             Value::boolean(opts.test),
             check_bits(opts),
         ])
+    }
+
+    /// Constructs the cancel structure, which has the operate's fields except
+    /// `Check` (IEC 61850-7-2).
+    fn build_cancel(&self, opts: &ControlOptions, ctl_num: u8) -> Value {
+        let oper = self.build_oper(Value::boolean(false), opts, ctl_num);
+        Value::structure(oper.children()[..5].to_vec())
+    }
+
+    /// The quality `T` is stamped with: the command's own, else the client's.
+    fn time_quality(&self, opts: &ControlOptions) -> TimeQuality {
+        opts.time_quality.unwrap_or_else(|| self.client.time_quality())
     }
 
     /// Returns the additional cause the server gave for refusing `phase`

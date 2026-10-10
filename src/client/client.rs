@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -23,6 +24,9 @@ pub struct Options {
     pub calling: mms::AcseIdentity,
     /// Overrides the proposed MMS association parameters.
     pub initiate: Option<mms::InitiateRequest>,
+    /// The ACSE application context to propose: the plain MMS one by
+    /// default, or the IEC 61850 ACSI one for a server that accepts only it.
+    pub application_context: mms::ApplicationContext,
     /// Enables TLS per IEC 62351-3. The default MMS-over-TLS port is 3782.
     #[cfg(feature = "tls")]
     pub tls: Option<Arc<tokio_rustls::rustls::ClientConfig>>,
@@ -65,6 +69,20 @@ impl Options {
         self
     }
 
+    /// Proposes the given ACSE application context.
+    #[must_use]
+    pub fn with_application_context(mut self, ctx: mms::ApplicationContext) -> Options {
+        self.application_context = ctx;
+        self
+    }
+
+    /// Overrides the proposed MMS association parameters.
+    #[must_use]
+    pub fn with_initiate(mut self, init: mms::InitiateRequest) -> Options {
+        self.initiate = Some(init);
+        self
+    }
+
     /// Enables TLS per IEC 62351-3.
     #[cfg(feature = "tls")]
     #[must_use]
@@ -80,6 +98,7 @@ impl Options {
             connect_timeout: self.timeout,
             called: self.called,
             calling: self.calling,
+            application_context: self.application_context,
             #[cfg(feature = "tls")]
             tls: self.tls,
             #[cfg(feature = "tls")]
@@ -101,6 +120,9 @@ pub struct Client {
     outstanding: Semaphore,
     /// The association's LastApplError and CommandTermination reports.
     pub(crate) ctl: Arc<ControlReports>,
+    /// The quality of this client's clock plus one, zero when unset; see
+    /// [`Client::set_time_quality`].
+    time_quality: AtomicU32,
 }
 
 impl Client {
@@ -133,6 +155,29 @@ impl Client {
             conn: Arc::new(conn),
             outstanding: Semaphore::new(permits),
             ctl,
+            time_quality: AtomicU32::new(0),
+        }
+    }
+
+    /// States the quality of this client's clock, which the operate timestamp
+    /// `T` of every control carries (IEC 61850-7-2): whether leap seconds are
+    /// known, whether the clock has failed or is not synchronised, and how
+    /// many bits of the fraction are accurate.
+    ///
+    /// `T` is the client's statement of when it decided to operate, and a
+    /// server that audits commands can only trust it as far as this says. It
+    /// is safe to call concurrently with controls. Until it is called the
+    /// client uses [`mms::TimeQuality::DEFAULT`]; a single command can
+    /// override it with [`ControlOptions::with_time_quality`](super::ControlOptions::with_time_quality).
+    pub fn set_time_quality(&self, q: mms::TimeQuality) {
+        self.time_quality.store(u32::from(q.0) + 1, Ordering::Relaxed);
+    }
+
+    /// Returns the quality the client stamps operate times with.
+    pub fn time_quality(&self) -> mms::TimeQuality {
+        match self.time_quality.load(Ordering::Relaxed) {
+            0 => mms::TimeQuality::DEFAULT,
+            v => mms::TimeQuality((v - 1) as u8),
         }
     }
 
@@ -156,6 +201,20 @@ impl Client {
     pub async fn close(&self) -> Result<()> {
         self.conn.close().await?;
         Ok(())
+    }
+
+    /// Ends the association abruptly (ACSE A-ABORT) instead of releasing it as
+    /// [`close`](Client::close) does; requests still outstanding fail with
+    /// [`mms::Error::Aborted`].
+    pub async fn abort(&self) -> Result<()> {
+        self.conn.abort().await?;
+        Ok(())
+    }
+
+    /// Asks the server for the status of its device (MMS Status). `extended`
+    /// asks it to derive the status afresh.
+    pub async fn server_status(&self, extended: bool) -> Result<mms::ServerStatus> {
+        Ok(self.conn.status(extended).await?)
     }
 
     /// Reports the connection state.

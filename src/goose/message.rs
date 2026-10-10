@@ -40,6 +40,11 @@ pub struct Message {
     pub num_dat_set_entries: u32,
     pub values: Vec<Value>,
     pub app_id: u16,
+    /// The quality of `t`. `None` means the crate default, leap seconds known
+    /// and accuracy 10. It is an option because every value of the octet is a
+    /// real quality, 0 included, and a parsed message re-marshals with the
+    /// quality it arrived with.
+    pub time_quality: Option<TimeQuality>,
 
     pub anomalies: Anomalies,
 }
@@ -47,26 +52,29 @@ pub struct Message {
 impl Message {
     /// Encodes the full APDU: APPID, Length, two reserved words, then the
     /// `[APPLICATION 1]` goosePdu.
+    ///
+    /// goID `[3]` is always emitted, as an empty VisibleString if need be. The
+    /// Edition 1 ASN.1 marks it OPTIONAL, but the Edition 2 message carries it
+    /// unconditionally and subscribers configured from SCL match on it, so
+    /// leaving it out is a stream they cannot identify. [`parse`] still
+    /// accepts its absence, from an Edition 1 publisher.
+    ///
+    /// It does not check the size; the [`Publisher`](super::Publisher)
+    /// refuses an APDU that does not fit a frame.
     pub fn marshal(&self) -> Vec<u8> {
         let all_data = cons(
             context_constructed(11),
             self.values.iter().filter_map(data_element),
         );
         let t = match self.t {
-            Some(t) => Value::utc_time(t, TimeQuality::accuracy(10)),
+            Some(t) => Value::utc_time(t, self.time_quality.unwrap_or(TimeQuality::DEFAULT)),
             None => Value::UtcTime([0; 8]),
         };
-        let mut fields = vec![
+        let fields = [
             prim(context_primitive(0), self.go_cb_ref.as_bytes().to_vec()),
             uint_elem(context_primitive(1), u64::from(self.time_allowed_to_live)),
             prim(context_primitive(2), self.dat_set.as_bytes().to_vec()),
-        ];
-        // goID [3] is OPTIONAL in 8-1: an unset identifier is absent, not a
-        // zero-length VisibleString.
-        if !self.go_id.is_empty() {
-            fields.push(prim(context_primitive(3), self.go_id.as_bytes().to_vec()));
-        }
-        fields.extend([
+            prim(context_primitive(3), self.go_id.as_bytes().to_vec()),
             prim(context_primitive(4), t.bytes().to_vec()),
             uint_elem(context_primitive(5), u64::from(self.st_num)),
             uint_elem(context_primitive(6), u64::from(self.sq_num)),
@@ -75,7 +83,7 @@ impl Message {
             bool_elem(context_primitive(9), self.nds_com),
             uint_elem(context_primitive(10), u64::from(self.num_dat_set_entries)),
             all_data,
-        ]);
+        ];
         let pdu = cons(pdu_tag(), fields);
         let length = HEADER_LEN + pdu.size();
         let mut buf = Vec::with_capacity(length);
@@ -125,9 +133,9 @@ pub fn parse(apdu: &[u8]) -> Result<Message> {
     let b = d
         .expect(context_primitive(4))
         .map_err(|e| Error::Codec(format!("t: {e}")))?;
-    m.t = Value::utc_time_raw(b)
-        .map_err(|e| Error::Codec(format!("t: {e}")))?
-        .time();
+    let tv = Value::utc_time_raw(b).map_err(|e| Error::Codec(format!("t: {e}")))?;
+    m.t = tv.time();
+    m.time_quality = Some(tv.time_quality());
 
     m.st_num = uint32_field(&mut d, 5, "stNum")?;
     m.sq_num = uint32_field(&mut d, 6, "sqNum")?;
@@ -193,8 +201,34 @@ mod tests {
             num_dat_set_entries: 2,
             values: vec![Value::boolean(true), Quality::GOOD.value()],
             app_id: 0x1000,
+            time_quality: Some(TimeQuality::DEFAULT),
             anomalies: Anomalies::default(),
         }
+    }
+
+    /// Re-encodes `apdu` without its goID, as an Edition 1 publisher sends it.
+    fn without_go_id(apdu: &[u8]) -> Vec<u8> {
+        let content = Decoder::new(&apdu[HEADER_LEN..]).expect(pdu_tag()).unwrap();
+        let mut d = Decoder::new(content);
+        let mut fields = Vec::new();
+        while d.more() {
+            let (t, v) = d.read_tlv().unwrap();
+            if t == context_primitive(3) {
+                continue;
+            }
+            fields.push(if t.constructed {
+                crate::asn1::raw_content(t, v.to_vec())
+            } else {
+                prim(t, v.to_vec())
+            });
+        }
+        let pdu = cons(pdu_tag(), fields);
+        let length = HEADER_LEN + pdu.size();
+        let mut out = apdu[..2].to_vec();
+        out.extend_from_slice(&(length as u16).to_be_bytes());
+        out.extend_from_slice(&[0, 0, 0, 0]);
+        pdu.append(&mut out);
+        out
     }
 
     /// Returns the top-level tag numbers of the goosePdu in `apdu`.
@@ -211,18 +245,16 @@ mod tests {
         tags
     }
 
-    /// `goID [3]` is OPTIONAL in 8-1: unset means absent, not a zero-length
-    /// VisibleString. A subscriber filtering on goID must see it missing
-    /// rather than blank.
+    /// goID `[3]` is always emitted: the Edition 2 message carries it, and
+    /// subscribers configured from SCL match on it. A message without it, from
+    /// an Edition 1 publisher, still decodes.
     #[test]
-    fn an_unset_go_id_is_omitted_rather_than_sent_empty() {
+    fn go_id_is_always_emitted_and_its_absence_still_parses() {
         let mut m = sample();
         m.go_id = String::new();
-        let apdu = m.marshal();
-        assert!(
-            !pdu_tags(&apdu).contains(&3),
-            "an empty goID must not be encoded as [3]"
-        );
+        assert!(pdu_tags(&m.marshal()).contains(&3), "an empty goID is still [3]");
+        let apdu = without_go_id(&m.marshal());
+        assert!(!pdu_tags(&apdu).contains(&3));
 
         // Every other field still decodes with the optional one absent.
         let back = parse(&apdu).expect("decodes");
@@ -308,9 +340,7 @@ mod tests {
     /// stream on its own, so the message must still decode.
     #[test]
     fn an_absent_optional_field_still_decodes() {
-        let mut m = sample();
-        m.go_id = String::new();
-        let back = parse(&m.marshal()).expect("decodes without a goID");
+        let back = parse(&without_go_id(&sample().marshal())).expect("decodes without a goID");
         assert_eq!(back.go_id, "");
         assert_eq!(back.st_num, 7);
     }

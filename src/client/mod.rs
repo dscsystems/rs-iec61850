@@ -24,6 +24,7 @@ mod log;
 mod report;
 mod retrieve;
 mod settinggroup;
+mod svcb;
 
 #[allow(clippy::module_inception)]
 mod client;
@@ -36,6 +37,7 @@ pub use directory::{AcsiClass, DirectoryEntry};
 pub use file::FileReader;
 pub use report::{Rcb, Report, ReportEntry, ReportSubscription};
 pub use settinggroup::SettingGroups;
+pub use svcb::{PhyComAddr, Svcb};
 
 /// A log entry, as returned by a journal query.
 pub type LogEntry = crate::mms::JournalEntry;
@@ -63,6 +65,24 @@ pub enum Error {
 impl Error {
     pub(crate) fn client(msg: impl Into<String>) -> Error {
         Error::Client(msg.into())
+    }
+
+    /// Returns the data access error the server answered with, whether it
+    /// came back per item or as the whole service's failure.
+    pub fn as_access_error(&self) -> Option<crate::mms::DataAccessError> {
+        match self {
+            Error::Access(e) => Some(*e),
+            Error::Mms(e) => e.as_access_error(),
+            _ => None,
+        }
+    }
+
+    /// Returns the confirmed error or reject the server answered with.
+    pub fn as_service_error(&self) -> Option<&crate::mms::ServiceError> {
+        match self {
+            Error::Mms(e) => e.as_service_error(),
+            _ => None,
+        }
     }
 }
 
