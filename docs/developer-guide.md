@@ -182,12 +182,21 @@ the number.
 - `cargo test` runs everything with no external dependencies: unit and codec
   tests, plus `tests/mms_loopback.rs` and `tests/acsi_loopback.rs`, which drive
   a real client against a real server over an in-memory duplex stream.
-- The terminal UI is behind a feature, so its tests only run with it on:
-  `cargo test --features tui`.
-- `cargo clippy --all-targets --features tui` is expected to be clean.
-- **Interop is the primary correctness oracle.** `interop/run.sh` runs both
-  directions against an independent implementation, plus the reference against
-  itself as a control. See [interop/README.md](../interop/README.md).
+- The terminal UI, the TLS profile and GDOI are behind features, so their tests
+  only run with them on: `cargo test --all-features`.
+- `cargo clippy --all-targets --all-features` is expected to be clean.
+- The Edition 2/2.1 server features have their own suites, each a port of the
+  Go library's tests: `server_ed2.rs` (control blocks, SVCBs, setting groups,
+  unknown types and constraints), `server_logs.rs`, `server_tracking.rs`,
+  `server_services.rs` (authentication, Status, Abort, files, data set
+  deletion), `server_rules.rs` (reservations by client address, clock
+  quality, control rules, Ed2 class shapes) and `scl_edition.rs`.
+- **Interop is the primary correctness oracle.** `interop/run.sh` runs the MMS
+  services both ways against go-iec61850, plus the reference against itself as
+  a control; `interop/go-security.sh` does R-GOOSE/R-SV, GDOI and TLS against
+  it; `interop/libiec.sh` runs everything against libiec61850. The interop
+  tests (`tests/interop_*.rs`) skip unless their peer is named in the
+  environment. See [interop/README.md](../interop/README.md).
 
 Layer-2 codecs are tested over `ethernet::pipe()`, an in-memory segment, so no
 NIC is needed. Network-facing decoders are tested against truncated and
@@ -285,12 +294,16 @@ not be reproduced beyond short factual references.
 | `src/model/` | Object model, FCs, Quality/Timestamp, control enums, CDCs |
 | `src/scl/` | SCL parser and model instantiation |
 | `src/client/` | ACSI client |
-| `src/server/` | ACSI server (reporting, control, setting groups, files) |
+| `src/server/` | ACSI server (reporting, control, setting groups, files, logs, service tracking, GOOSE/SV/log control blocks) |
 | `src/ethernet/` | Raw layer 2, AF_PACKET and `pipe` |
-| `src/goose/`, `src/sv/` | Process-bus publish/subscribe |
+| `src/goose/`, `src/sv/` | Process-bus publish/subscribe, and publishers built from a model |
+| `src/rsession/` | R-GOOSE/R-SV session protocol (IEC 61850-90-5): SPDU codec, keys, replay window, UDP `Session` |
+| `src/iec62351.rs` | IEC 62351-3 TLS profile on rustls and webpki (`tls`), with X.509 v1 leaves verified directly |
+| `src/gdoi/` | IEC 62351-9 GDOI: ISAKMP codec, phase 1 crypto, TEKs, member, key keeper, key server (`gdoi`) |
+| `src/x509.rs` | The certificate and CRL fields the security layers read themselves |
 | `src/bin/` | `ied-server`, `ied-client`, `goose-sniff`, `iedx` (the `tui` feature) |
 | `examples/` | Runnable snippets |
-| `interop/` | Bidirectional interop harness |
+| `interop/` | Interop harnesses: `run.sh` (MMS vs Go), `go-security.sh` (security vs Go, with the Go peer in `interop/go/`), `libiec.sh` (vs libiec61850) |
 | `testdata/` | SCL files and fixtures |
 | `.github/workflows/` | `release.yml`: tag-driven binary builds and the GitHub release |
 | `SKILL.md` | Guide for building applications on the crate; its code is compile-checked by `tests/skill_snippets.rs`, so keep the two in step |

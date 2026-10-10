@@ -17,6 +17,10 @@ pub use frame::{parse_frame, Frame, VlanTag};
 /// EtherType values used by the IEC 61850 layer-2 protocols.
 pub const ETHER_TYPE_GOOSE: u16 = 0x88b8;
 pub const ETHER_TYPE_SV: u16 = 0x88ba;
+
+/// The largest payload an Ethernet II frame carries: the 1500-octet MTU,
+/// which the 802.1Q tag does not reduce.
+pub const MAX_PAYLOAD: usize = 1500;
 /// The 802.1Q tag protocol identifier.
 pub(crate) const ETHER_TYPE_VLAN: u16 = 0x8100;
 

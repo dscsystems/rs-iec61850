@@ -42,6 +42,14 @@ pub enum Error {
     /// The peer closed the association (COTP DR, or a clean EOF).
     #[error("association closed by peer")]
     Closed,
+    /// The peer refused the session CONNECT (a REFUSE SPDU); the user data
+    /// is the presentation CPR carrying the rejecting AARE.
+    #[error("session: connection refused (reason {reason})")]
+    Refused { reason: u8, user_data: Vec<u8> },
+    /// The peer aborted the session (an ABORT SPDU); the user data is the
+    /// presentation ARU carrying the ACSE ABRT.
+    #[error("session: connection aborted by the peer")]
+    Aborted { user_data: Vec<u8> },
 }
 
 /// Result alias for the OSI stack.

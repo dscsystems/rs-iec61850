@@ -223,6 +223,11 @@ impl Client {
         // entries just carry no reference.
         let members = self.dataset_members_for_rcb(rcb).await.unwrap_or_default();
 
+        // Reserve an unbuffered block before configuring it, so another
+        // client cannot take it between the writes.
+        if !rcb.buffered {
+            self.write_rcb(rcb, "Resv", Value::boolean(true)).await?;
+        }
         if rcb.opt_flds != OptFlds::default() {
             self.write_rcb(rcb, "OptFlds", rcb.opt_flds.value()).await?;
         }
@@ -354,20 +359,24 @@ pub(crate) fn decode_report(ir: &InformationReport, members: &[VarRef]) -> Optio
         .collect();
 
     // Optional data-reference strings precede the values, one per included
-    // member. The positions are already known from the dataset, so they are
-    // skipped rather than parsed.
+    // member. They label an entry when the dataset could not be read.
+    let mut data_refs = Vec::new();
     if opt.has(OptFlds::DATA_REF) {
         for _ in &included {
-            next();
+            data_refs.push(next().map(Value::text).unwrap_or_default());
         }
     }
 
     let mut entries = Vec::with_capacity(included.len());
-    for idx in &included {
+    for (k, idx) in included.iter().enumerate() {
         let value = next().cloned().unwrap_or(Value::None);
-        let (reference, fc) = match members.get(*idx) {
-            Some(m) => model::from_mms(&m.domain, &m.item),
-            None => (ObjectReference::default(), Fc::None),
+        let (reference, fc) = match (members.get(*idx), data_refs.get(k)) {
+            (Some(m), _) => model::from_mms(&m.domain, &m.item),
+            (None, Some(r)) if r.contains('/') => {
+                let (domain, item) = r.split_once('/').expect("checked");
+                model::from_mms(domain, item)
+            }
+            _ => (ObjectReference::default(), Fc::None),
         };
         entries.push(ReportEntry {
             index: *idx,

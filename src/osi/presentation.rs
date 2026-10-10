@@ -30,6 +30,98 @@ fn oid_ber() -> Oid {
 }
 
 /// Default presentation selectors used by common IEC 61850 stacks.
+/// One presentation context a peer proposed: the identifier it chose for it,
+/// the abstract syntax it means, and the transfer syntax it proposes for that
+/// syntax.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Context {
+    pub id: i64,
+    pub abstract_syntax: Option<Oid>,
+    pub transfer_syntax: Option<Oid>,
+}
+
+impl Context {
+    /// Reports whether the context carries ACSE. The identifier does not say
+    /// so: a peer is free to number its contexts as it likes, and only the
+    /// abstract syntax decides what each one is for.
+    pub fn is_acse(&self) -> bool {
+        self.abstract_syntax.as_ref() == Some(&oid_acse())
+    }
+
+    /// Reports whether the context carries MMS.
+    pub fn is_mms(&self) -> bool {
+        self.abstract_syntax.as_ref() == Some(&oid_mms())
+    }
+
+    /// Reports whether the context proposes the basic encoding rules, the
+    /// only transfer syntax this crate implements.
+    pub fn ber(&self) -> bool {
+        self.transfer_syntax.as_ref() == Some(&oid_ber())
+    }
+
+    /// Reports whether this crate can serve the context.
+    pub fn acceptable(&self) -> bool {
+        (self.is_acse() || self.is_mms()) && self.ber()
+    }
+}
+
+/// Which of the contexts a peer proposed this crate accepted, under the
+/// identifiers the peer gave them.
+///
+/// A presentation context identifier is chosen by the proposer, not agreed
+/// as a constant: the ACSE and MMS contexts are conventionally numbered 1 and
+/// 3, but that is a convention of the stacks that use it. A responder that
+/// assumes 3 and a proposer that chose 2 agree on nothing, and every
+/// subsequent PDU is mis-tagged, which a client sees as silence rather than as
+/// an error.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Negotiated {
+    /// The identifier the peer assigned to the ACSE context, zero when it
+    /// proposed none.
+    pub acse: i64,
+    /// The identifier the peer assigned to the MMS context, zero when it
+    /// proposed none.
+    pub mms: i64,
+}
+
+impl Negotiated {
+    pub fn has_acse(&self) -> bool {
+        self.acse != 0
+    }
+
+    pub fn has_mms(&self) -> bool {
+        self.mms != 0
+    }
+}
+
+/// Decides which of the proposed contexts this crate accepts, without
+/// building anything. A responder needs the outcome before the CPA: the AARE
+/// inside it names the MMS context by the identifier the peer chose.
+pub fn negotiate(proposed: &[Context]) -> Negotiated {
+    let mut neg = Negotiated::default();
+    for c in proposed {
+        if !c.acceptable() {
+            continue;
+        }
+        if c.is_acse() {
+            neg.acse = c.id;
+        } else if c.is_mms() {
+            neg.mms = c.id;
+        }
+    }
+    neg
+}
+
+/// The per-context outcome in a CPA's result list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextResult {
+    Acceptance = 0,
+    /// The responder cannot serve the context.
+    ProviderRejection = 1,
+    /// The abstract syntax is unknown.
+    AbstractSyntaxNotSupported = 2,
+}
+
 pub const DEFAULT_CALLING_PSEL: &[u8] = &[0x00, 0x00, 0x00, 0x01];
 pub const DEFAULT_CALLED_PSEL: &[u8] = &[0x00, 0x00, 0x00, 0x01];
 
@@ -55,35 +147,114 @@ pub fn build_cp(calling_psel: &[u8], called_psel: &[u8], acse_data: &[u8]) -> Ve
     cons(TAG_SET, [mode_selector(), normal]).encode() // CP-type ::= SET
 }
 
-/// Builds a CPA (Connect Presentation Accept) PDU accepting the contexts the
-/// peer proposed and wrapping `acse_data` (the ACSE AARE).
+/// Builds a CPA (Connect Presentation Accept) PDU wrapping `acse_data` (the
+/// ACSE AARE), accepting the contexts this crate can serve and rejecting the
+/// rest.
+///
+/// The result list has one entry per proposal, in proposal order, which is
+/// how the peer maps it back to its own contexts.
 ///
 /// The CPA is not a CP with a different name: ISO 8823 gives its normal-mode
 /// parameters their own tags, where the responder states one
-/// responding-presentation-selector [3] and there is no place for the calling
-/// [1] or called [2] selectors a CP carries. A CPA built from the CP's tags
-/// decodes as a malformed CPA, and a peer that validates it drops the
-/// connection before any user data is exchanged.
-///
-/// `contexts` is the number of presentation contexts the peer proposed: the
-/// result list has one entry per proposal, matched by position, so a fixed
-/// pair would misreport any peer that proposes a different number.
-pub fn build_cpa(responding_psel: &[u8], contexts: usize, acse_data: &[u8]) -> Vec<u8> {
+/// responding-presentation-selector [3] rather than echoing the calling and
+/// called ones [1] and [2]. A CPA built with the CP's tags decodes as a
+/// malformed CPA, and a peer that validates it drops the connection before
+/// any user data is exchanged.
+pub fn build_cpa(responding_psel: &[u8], proposed: &[Context], acse_data: &[u8]) -> (Negotiated, Vec<u8>) {
+    let neg = negotiate(proposed);
     let mut normal = Element::seq(context_constructed(2));
     if !responding_psel.is_empty() {
         // responding-presentation-selector [3] IMPLICIT OCTET STRING
         normal.push(prim(context_primitive(3), responding_psel.to_vec()));
     }
-    // Default to the ACSE and MMS pair every MMS peer proposes.
-    let contexts = if contexts == 0 { 2 } else { contexts };
-    let mut results = Element::seq(context_constructed(5));
-    for _ in 0..contexts {
-        results.push(context_result(0)); // acceptance
-    }
-    normal.push(results);
-    normal.push(user_data(CONTEXT_ACSE, acse_data));
+    normal.push(result_list(proposed));
+    normal.push(user_data(acse_context_or_default(neg), acse_data));
+    (neg, cons(TAG_SET, [mode_selector(), normal]).encode())
+}
 
-    cons(TAG_SET, [mode_selector(), normal]).encode()
+/// The context that carries the AARE. A peer that proposed no ACSE context
+/// cannot receive it; the CPA is then built with the conventional identifier
+/// and the peer will reject it.
+fn acse_context_or_default(neg: Negotiated) -> i64 {
+    if neg.acse == 0 {
+        CONTEXT_ACSE
+    } else {
+        neg.acse
+    }
+}
+
+/// The presentation-context-definition-result-list [5]: one result per
+/// proposed context, in order.
+fn result_list(proposed: &[Context]) -> Element {
+    let mut results = Element::seq(context_constructed(5));
+    for c in proposed {
+        results.push(context_result(if c.acceptable() {
+            ContextResult::Acceptance
+        } else {
+            ContextResult::ProviderRejection
+        }));
+    }
+    results
+}
+
+/// Builds a CPR (Connect Presentation Reject) PDU for a connection the
+/// presentation user refuses, an association the ACSE rejects, carrying
+/// `acse_data` (the rejecting AARE) in the ACSE context.
+///
+/// Its normal-mode parameters are a SEQUENCE (ISO 8823), with the responding
+/// selector and the per-context results as in a CPA.
+pub fn build_cpr(responding_psel: &[u8], proposed: &[Context], acse_data: &[u8]) -> Vec<u8> {
+    let neg = negotiate(proposed);
+    let mut seq = Element::seq(TAG_SEQUENCE);
+    if !responding_psel.is_empty() {
+        seq.push(prim(context_primitive(3), responding_psel.to_vec()));
+    }
+    seq.push(result_list(proposed));
+    seq.push(user_data(acse_context_or_default(neg), acse_data));
+    seq.encode()
+}
+
+/// Extracts the ACSE user data (the AARE) from a CPR PDU.
+pub fn parse_cpr_user_data(pdu: &[u8]) -> Result<Vec<u8>> {
+    let seq = Decoder::new(pdu)
+        .expect(TAG_SEQUENCE)
+        .map_err(|e| Error::Presentation(format!("CPR not a SEQUENCE: {e}")))?;
+    find_fully_encoded(seq)
+}
+
+/// Builds an ARU (abnormal release by the user) PDU carrying `abrt` (the ACSE
+/// ABRT) in the ACSE presentation context: its normal-mode parameters,
+/// `[0] IMPLICIT SEQUENCE`, hold only the user data.
+pub fn wrap_abort(acse_context_id: i64, abrt: &[u8]) -> Vec<u8> {
+    let id = if acse_context_id == 0 {
+        CONTEXT_ACSE
+    } else {
+        acse_context_id
+    };
+    cons(context_constructed(0), [user_data(id, abrt)]).encode()
+}
+
+/// Extracts the user data (the ACSE ABRT) from an ARU PDU. A SEQUENCE in
+/// place of the `[0]` tag is accepted too.
+pub fn unwrap_abort(pdu: &[u8]) -> Result<Vec<u8>> {
+    let (tag, content) = Decoder::new(pdu).read_tlv()?;
+    if tag != context_constructed(0) && tag != TAG_SEQUENCE {
+        return Err(Error::Presentation(format!("ARU of tag {tag}")));
+    }
+    find_fully_encoded(content)
+}
+
+/// Returns the data of the first fully-encoded-data element among a PDU's
+/// parameters.
+fn find_fully_encoded(content: &[u8]) -> Result<Vec<u8>> {
+    let mut dec = Decoder::new(content);
+    while dec.more() {
+        let (t, c) = dec.read_tlv()?;
+        if t == application_constructed(1) {
+            return Ok(parse_pdv_list(c)?.1);
+        }
+    }
+    Err(Error::Presentation("no user data".into()))
 }
 
 /// What a responder needs from a peer's CP: the selector it addressed and how
@@ -92,7 +263,8 @@ pub fn build_cpa(responding_psel: &[u8], contexts: usize, acse_data: &[u8]) -> V
 pub struct Cp {
     pub calling_psel: Vec<u8>,
     pub called_psel: Vec<u8>,
-    pub contexts: usize,
+    /// The presentation contexts the peer proposed.
+    pub contexts: Vec<Context>,
     /// The ACSE AARQ.
     pub user_data: Vec<u8>,
 }
@@ -118,7 +290,7 @@ pub fn parse_cp(pdu: &[u8]) -> Result<Cp> {
                 x if x == context_primitive(1) => cp.calling_psel = c.to_vec(),
                 x if x == context_primitive(2) => cp.called_psel = c.to_vec(),
                 // context-definition-list
-                x if x == context_constructed(4) => cp.contexts = count_sequences(c),
+                x if x == context_constructed(4) => cp.contexts = parse_context_list(c),
                 // fully-encoded-data
                 x if x == application_constructed(1) => {
                     cp.user_data = parse_pdv_list(c)?.1;
@@ -134,23 +306,72 @@ pub fn parse_cp(pdu: &[u8]) -> Result<Cp> {
     Ok(cp)
 }
 
-/// Counts the SEQUENCE entries in a list.
-fn count_sequences(content: &[u8]) -> usize {
+/// Decodes a context-definition-list.
+///
+/// Each entry is `PresentationContextDefinition ::= SEQUENCE {
+/// presentation-context-identifier INTEGER, abstract-syntax,
+/// transfer-syntax-name }`, and the last may instead be the abbreviated form
+/// without a transfer syntax.
+fn parse_context_list(content: &[u8]) -> Vec<Context> {
     let mut dec = Decoder::new(content);
-    let mut n = 0;
+    let mut out = Vec::new();
     while dec.more() {
-        match dec.read_tlv() {
-            Ok((tag, _)) if tag == TAG_SEQUENCE => n += 1,
-            Ok(_) => {}
-            Err(_) => return n,
+        let Ok((tag, body)) = dec.read_tlv() else {
+            return out;
+        };
+        if tag != TAG_SEQUENCE {
+            // An entry that does not decode ends the list; the caller's
+            // acceptance check reports the shortfall.
+            return out;
         }
+        let mut entry = Decoder::new(body);
+        let mut c = Context::default();
+        while entry.more() {
+            let Ok((t, v)) = entry.read_tlv() else {
+                return out;
+            };
+            if t == TAG_INTEGER {
+                if let Ok(n) = asn1::decode_int(v) {
+                    c.id = n;
+                }
+            } else if t == TAG_OID {
+                // The abbreviated form names the transfer syntax directly.
+                let Ok(oid) = asn1::decode_oid(v) else {
+                    return out;
+                };
+                if c.abstract_syntax.is_none() {
+                    c.abstract_syntax = Some(oid);
+                } else {
+                    c.transfer_syntax = Some(oid);
+                }
+            } else if t == TAG_SEQUENCE {
+                // transfer-syntax-name, a CHOICE of OIDs.
+                let mut ts = Decoder::new(v);
+                while ts.more() {
+                    let Ok((ot, ov)) = ts.read_tlv() else {
+                        break;
+                    };
+                    if ot == TAG_OID {
+                        if let Ok(oid) = asn1::decode_oid(ov) {
+                            c.transfer_syntax = Some(oid);
+                        }
+                    }
+                }
+            }
+        }
+        out.push(c);
     }
-    n
+    out
 }
 
-/// Wraps an MMS PDU in fully-encoded-data for the MMS context.
-pub fn wrap_data(mms_pdu: &[u8]) -> Vec<u8> {
-    user_data(CONTEXT_MMS, mms_pdu).encode()
+/// Wraps an MMS PDU in fully-encoded-data for the MMS presentation context.
+///
+/// `context_id` is the identifier the peer assigned to it, which is not
+/// necessarily [`CONTEXT_MMS`]: the identifier is the proposer's choice. Zero
+/// uses the conventional one.
+pub fn wrap_data(context_id: i64, mms_pdu: &[u8]) -> Vec<u8> {
+    let id = if context_id == 0 { CONTEXT_MMS } else { context_id };
+    user_data(id, mms_pdu).encode()
 }
 
 /// Extracts the user data (an MMS PDU) from a data-phase presentation PDU,
@@ -202,15 +423,16 @@ fn context_entry(id: i64, abstract_syntax: &Oid) -> Element {
     )
 }
 
-fn context_result(result: i64) -> Element {
-    // Result ::= SEQUENCE { result [0] INTEGER, transfer-syntax-name [1] }
-    cons(
-        TAG_SEQUENCE,
-        [
-            int_elem(context_primitive(0), result),
-            oid_elem(context_primitive(1), &oid_ber()),
-        ],
-    )
+/// Builds one entry of a CPA result list: `Result ::= SEQUENCE { result [0]
+/// INTEGER, transfer-syntax-name [1] }`. An accepted context names the
+/// transfer syntax it is accepted with; a rejected one carries only the
+/// reason.
+fn context_result(result: ContextResult) -> Element {
+    let mut e = cons(TAG_SEQUENCE, [int_elem(context_primitive(0), result as i64)]);
+    if result == ContextResult::Acceptance {
+        e.push(oid_elem(context_primitive(1), &oid_ber()));
+    }
+    e
 }
 
 /// Builds a fully-encoded-data [APPLICATION 1] wrapping `payload` in the
@@ -292,9 +514,67 @@ mod tests {
     /// conforming decoder accepts, and peers that validate it drop the
     /// connection before any user data is exchanged. Real devices answer with
     /// responding [3] alone.
+    fn default_contexts() -> Vec<Context> {
+        vec![ctx(CONTEXT_ACSE, oid_acse(), oid_ber()), ctx(CONTEXT_MMS, oid_mms(), oid_ber())]
+    }
+
+    fn ctx(id: i64, abstract_syntax: Oid, transfer_syntax: Oid) -> Context {
+        Context {
+            id,
+            abstract_syntax: Some(abstract_syntax),
+            transfer_syntax: Some(transfer_syntax),
+        }
+    }
+
+    fn count_entries(content: &[u8]) -> usize {
+        tags_of(content).iter().filter(|t| **t == TAG_SEQUENCE).count()
+    }
+
+    /// Decodes a CPA's result list into (result, names a transfer syntax).
+    fn result_list(cpa: &[u8]) -> Vec<(i64, bool)> {
+        let params = normal_mode_params(cpa);
+        let mut dec = Decoder::new(&params);
+        while dec.more() {
+            let (tag, content) = dec.read_tlv().unwrap();
+            if tag != context_constructed(5) {
+                continue;
+            }
+            let mut out = Vec::new();
+            let mut entries = Decoder::new(content);
+            while entries.more() {
+                let (_, body) = entries.read_tlv().unwrap();
+                let mut inner = Decoder::new(body);
+                let mut e = (-1, false);
+                while inner.more() {
+                    let (rt, rc) = inner.read_tlv().unwrap();
+                    if rt == context_primitive(0) {
+                        e.0 = asn1::decode_int(rc).unwrap();
+                    } else if rt == context_primitive(1) {
+                        e.1 = true;
+                    }
+                }
+                out.push(e);
+            }
+            return out;
+        }
+        panic!("no result list in the CPA");
+    }
+
+    fn set_user_data(cpa: &[u8]) -> Vec<u8> {
+        let params = normal_mode_params(cpa);
+        let mut dec = Decoder::new(&params);
+        while dec.more() {
+            let (tag, content) = dec.read_tlv().unwrap();
+            if tag == application_constructed(1) {
+                return content.to_vec();
+            }
+        }
+        panic!("no user data in the CPA");
+    }
+
     #[test]
     fn cpa_uses_the_responding_selector_only() {
-        let cpa = build_cpa(&[0x00, 0x00, 0x00, 0x01], 2, &[0x61, 0x00]);
+        let (_, cpa) = build_cpa(&[0x00, 0x00, 0x00, 0x01], &default_contexts(), &[0x61, 0x00]);
         let tags = tags_of(&normal_mode_params(&cpa));
 
         assert!(
@@ -317,25 +597,100 @@ mod tests {
 
     /// The result list is matched to the proposal by position, so its length
     /// has to follow what the peer actually proposed.
+    /// The result list is matched to the proposal by position, so its length
+    /// has to follow what the peer actually proposed.
     #[test]
-    fn cpa_results_match_the_number_of_proposed_contexts() {
-        for contexts in [1usize, 2, 3] {
-            let cpa = build_cpa(&[], contexts, &[0x61, 0x00]);
+    fn cpa_results_match_the_proposed_contexts() {
+        for n in [1usize, 2, 3] {
+            let mut contexts = default_contexts();
+            contexts.push(ctx(7, Oid::new(vec![1, 2, 3, 4]), oid_ber()));
+            contexts.truncate(n);
+            let (_, cpa) = build_cpa(&[], &contexts, &[0x61, 0x00]);
             let params = normal_mode_params(&cpa);
             let mut dec = Decoder::new(&params);
             let mut found = None;
             while dec.more() {
                 let (tag, c) = dec.read_tlv().unwrap();
                 if tag == context_constructed(5) {
-                    found = Some(count_sequences(c));
+                    found = Some(count_entries(c));
                 }
             }
-            assert_eq!(
-                found,
-                Some(contexts),
-                "{contexts} proposed contexts produced {found:?} results"
-            );
+            assert_eq!(found, Some(n), "{n} proposed contexts produced {found:?} results");
         }
+    }
+
+    /// The presentation-context-identifier is the proposer's choice, so a
+    /// responder that assumes the conventional 3 and a peer that chose
+    /// something else agree on nothing.
+    #[test]
+    fn the_negotiated_context_is_the_proposers_choice() {
+        let cases = [
+            (default_contexts(), CONTEXT_ACSE, CONTEXT_MMS),
+            (vec![ctx(1, oid_acse(), oid_ber()), ctx(2, oid_mms(), oid_ber())], 1, 2),
+            (vec![ctx(2, oid_mms(), oid_ber()), ctx(1, oid_acse(), oid_ber())], 1, 2),
+            (vec![ctx(9, oid_mms(), oid_ber()), ctx(4, oid_acse(), oid_ber())], 4, 9),
+        ];
+        for (contexts, acse, mms) in cases {
+            let (neg, _) = build_cpa(&[], &contexts, &[0x61, 0x00]);
+            assert_eq!((neg.acse, neg.mms), (acse, mms), "{contexts:?}");
+            assert!(neg.has_acse() && neg.has_mms());
+        }
+    }
+
+    /// A context this crate cannot serve is rejected rather than accepted.
+    #[test]
+    fn an_unacceptable_context_is_rejected() {
+        let contexts = vec![
+            ctx(1, oid_acse(), oid_ber()),
+            ctx(2, Oid::new(vec![1, 2, 3]), oid_ber()),
+            ctx(3, oid_mms(), Oid::new(vec![2, 1, 2])),
+            ctx(4, oid_mms(), oid_ber()),
+        ];
+        let (neg, cpa) = build_cpa(&[], &contexts, &[0x61, 0x00]);
+        assert_eq!(neg.mms, 4);
+        let results = result_list(&cpa);
+        assert_eq!(results, [(0, true), (1, false), (1, false), (0, true)]);
+    }
+
+    /// A peer that proposes no MMS context gets an answer that says so.
+    #[test]
+    fn no_mms_context() {
+        let (neg, _) = build_cpa(&[], &[ctx(1, oid_acse(), oid_ber())], &[0x61, 0x00]);
+        assert!(!neg.has_mms() && neg.has_acse());
+    }
+
+    /// The CPA carries the AARE in the ACSE context the peer proposed.
+    #[test]
+    fn the_cpa_user_data_uses_the_negotiated_acse_context() {
+        for id in [1, 2, 5, 17] {
+            let contexts = vec![ctx(id, oid_acse(), oid_ber()), ctx(id + 1, oid_mms(), oid_ber())];
+            let (_, cpa) = build_cpa(&[], &contexts, &[0x61, 0x2a]);
+            let (got, data) = parse_pdv_list(&set_user_data(&cpa)).unwrap();
+            assert_eq!(got, id);
+            assert_eq!(data.first(), Some(&0x61));
+        }
+    }
+
+    /// Data PDUs go into the negotiated MMS context.
+    #[test]
+    fn wrap_data_uses_the_negotiated_context() {
+        for id in [0, CONTEXT_MMS, 2, 9] {
+            let pdu = wrap_data(id, &[0xa0, 0x01, 0x02]);
+            let (got, data) = parse_user_data(&pdu).unwrap();
+            assert_eq!(got, if id == 0 { CONTEXT_MMS } else { id });
+            assert_eq!(data, [0xa0, 0x01, 0x02]);
+        }
+    }
+
+    /// A CPR and an ARU carry their ACSE APDU in the ACSE context, and parse
+    /// back.
+    #[test]
+    fn cpr_and_aru_round_trip() {
+        let cpr = build_cpr(&[0, 0, 0, 1], &default_contexts(), &[0x61, 0x00]);
+        assert_eq!(parse_cpr_user_data(&cpr).unwrap(), [0x61, 0x00]);
+        let aru = wrap_abort(0, &[0x64, 0x03, 0x80, 0x01, 0x00]);
+        assert_eq!(unwrap_abort(&aru).unwrap(), [0x64, 0x03, 0x80, 0x01, 0x00]);
+        assert!(unwrap_abort(&[0x31, 0x00]).is_err());
     }
 
     /// The CP a real client sends must yield the selector it addressed and
@@ -357,7 +712,9 @@ mod tests {
             [0x00, 0x00, 0x00, 0x01],
             "called PSel mismatch"
         );
-        assert_eq!(cp.contexts, 2, "contexts should be the ACSE and MMS pair");
+        assert_eq!(cp.contexts.len(), 2, "contexts should be the ACSE and MMS pair");
+        let neg = negotiate(&cp.contexts);
+        assert_eq!((neg.acse, neg.mms), (1, 3));
         assert_eq!(
             cp.user_data.first(),
             Some(&0x60),
@@ -372,7 +729,10 @@ mod tests {
         let parsed = parse_cp(&cp).unwrap();
         assert_eq!(parsed.calling_psel, DEFAULT_CALLING_PSEL);
         assert_eq!(parsed.called_psel, DEFAULT_CALLED_PSEL);
-        assert_eq!(parsed.contexts, 2);
+        assert_eq!(parsed.contexts, default_contexts());
+        let (neg, cpa) = build_cpa(&parsed.called_psel, &parsed.contexts, &[0x61, 0x00]);
+        assert_eq!((neg.acse, neg.mms), (CONTEXT_ACSE, CONTEXT_MMS));
+        assert!(normal_mode_params(&cpa).windows(4).any(|w| w == DEFAULT_CALLED_PSEL));
         assert_eq!(parsed.user_data, [0x60, 0x02, 0x01, 0x00]);
         assert_eq!(parse_cp_user_data(&cp).unwrap(), parsed.user_data);
     }
@@ -380,7 +740,7 @@ mod tests {
     #[test]
     fn data_phase_wrapping_round_trips() {
         let mms = [0xa0u8, 0x03, 0x02, 0x01, 0x2a];
-        let wrapped = wrap_data(&mms);
+        let wrapped = wrap_data(CONTEXT_MMS, &mms);
         assert_eq!(unwrap_data(&wrapped).unwrap(), mms);
         // The MMS context identifier must be the one the CP defined.
         assert_eq!(parse_user_data(&wrapped).unwrap().0, CONTEXT_MMS);

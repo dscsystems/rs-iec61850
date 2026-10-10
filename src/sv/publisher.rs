@@ -1,9 +1,28 @@
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
 
 use crate::ethernet::{Frame, Interface, VlanTag, ETHER_TYPE_SV};
+use crate::mms::TimeQuality;
+use crate::model::SmpMod;
 
 use super::{encode_le_sample, Asdu, Error, LeSample, Pdu, Result, SMP_SYNCH_GLOBAL};
+
+/// Selects the optional fields of a sampled-value ASDU (IEC 61850-9-2 and the
+/// SmvOpts of IEC 61850-6). The default includes none beyond the mandatory
+/// ones, which is the 9-2LE profile.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AsduOpts {
+    /// smpRate `[6]`.
+    pub sample_rate: bool,
+    /// The reference timestamp refrTm `[4]`.
+    pub refresh_time: bool,
+    /// The data set name datSet `[1]`.
+    pub data_set: bool,
+    /// The sample mode smpMod `[8]`.
+    pub smp_mod: bool,
+    /// The grandmaster identity gmIdentity `[9]` (IEC 61850-9-2 Amendment 1).
+    pub synch_source_id: bool,
+}
 
 /// Configures a 9-2LE publisher.
 #[derive(Debug, Clone)]
@@ -19,6 +38,26 @@ pub struct LeConfig {
     pub samples_per_cycle: u32,
     /// The power system frequency, 50 or 60.
     pub nominal_hz: u32,
+    /// The number of consecutive samples sent in one frame: 1 for the 9-2LE
+    /// protection stream, 8 for the metering one. Zero means 1.
+    pub no_asdu: u32,
+    /// The sample mode declared in smpMod `[8]` when `opts.smp_mod` is set, and
+    /// the unit smpRate `[6]` is expressed in when `opts.sample_rate` is:
+    /// samples per period (the default, and what an Edition 1 receiver
+    /// assumes) or per second. Seconds per sample cannot express a rate of one
+    /// sample a second or faster and is refused.
+    pub smp_mod: SmpMod,
+    /// The data set reference to declare when `opts.data_set` is set.
+    pub dat_set: String,
+    /// The quality of the publisher's clock, stamped on refrTm. `None` stamps
+    /// [`TimeQuality::DEFAULT`]. A merging unit whose time source is lost has
+    /// to say so here.
+    pub time_quality: Option<TimeQuality>,
+    /// The initial grandmaster identity declared when `opts.synch_source_id`
+    /// is set; [`LePublisher::set_gm_identity`] changes it.
+    pub gm_identity: [u8; 8],
+    /// The optional ASDU fields to include.
+    pub opts: AsduOpts,
 }
 
 impl Default for LeConfig {
@@ -32,6 +71,12 @@ impl Default for LeConfig {
             vlan: None,
             samples_per_cycle: 80,
             nominal_hz: 50,
+            no_asdu: 1,
+            smp_mod: SmpMod::SmpPerPeriod,
+            dat_set: String::new(),
+            time_quality: None,
+            gm_identity: [0; 8],
+            opts: AsduOpts::default(),
         }
     }
 }
@@ -46,12 +91,13 @@ pub fn default_mac(sel: u16) -> [u8; 6] {
     [0x01, 0x0c, 0xcd, 0x04, hi & 0x01, lo]
 }
 
-/// Emits one ASDU per frame at the configured sample rate.
+/// Emits `no_asdu` samples per frame at the configured sample rate.
 #[derive(Debug)]
 pub struct LePublisher {
     iface: Arc<dyn Interface>,
     cfg: LeConfig,
     rate: u32,
+    gm_identity: Mutex<[u8; 8]>,
 }
 
 impl LePublisher {
@@ -67,8 +113,32 @@ impl LePublisher {
         if cfg.nominal_hz == 0 {
             cfg.nominal_hz = 50;
         }
+        if cfg.no_asdu == 0 {
+            cfg.no_asdu = 1;
+        }
         let rate = cfg.samples_per_cycle * cfg.nominal_hz;
-        Ok(LePublisher { iface, cfg, rate })
+        if cfg.smp_mod == SmpMod::SecPerSmp {
+            return Err(Error::Config(format!(
+                "sample mode {} cannot express a rate of {rate} samples per second",
+                cfg.smp_mod
+            )));
+        }
+        let p = LePublisher {
+            gm_identity: Mutex::new(cfg.gm_identity),
+            iface,
+            cfg,
+            rate,
+        };
+        if p.smp_rate() > u32::from(u16::MAX) {
+            return Err(Error::Config(format!("smpRate {} does not fit its 16 bits", p.smp_rate())));
+        }
+        if p.cfg.no_asdu > rate {
+            return Err(Error::Config(format!(
+                "{} ASDUs per frame at {rate} samples per second",
+                p.cfg.no_asdu
+            )));
+        }
+        Ok(p)
     }
 
     /// Returns the number of samples emitted per second.
@@ -81,12 +151,28 @@ impl LePublisher {
         Duration::from_nanos(1_000_000_000 / u64::from(self.rate))
     }
 
+    /// Changes the grandmaster identity declared in gmIdentity `[9]`, for
+    /// instance when the PTP best master clock algorithm selects a new
+    /// grandmaster. It takes effect with the next frame.
+    pub fn set_gm_identity(&self, id: [u8; 8]) {
+        *self.gm_identity.lock().unwrap() = id;
+    }
+
+    /// The value of smpRate `[6]` in the unit the sample mode names.
+    fn smp_rate(&self) -> u32 {
+        match self.cfg.smp_mod {
+            SmpMod::SmpPerSec => self.rate,
+            _ => self.cfg.samples_per_cycle,
+        }
+    }
+
     /// Drives the sample clock until `cancel` resolves, calling `fill` to
     /// populate each sample.
     ///
     /// The sample count wraps once per second, which is the 9-2LE convention:
     /// a subscriber uses it to align streams within the second and takes the
-    /// second itself from the refresh time.
+    /// second itself from the refresh time. With `no_asdu` above 1, each frame
+    /// carries the last `no_asdu` samples, the oldest first.
     ///
     /// `fill` must not block: it runs on the sample clock, and a late sample
     /// is a lost sample.
@@ -104,6 +190,7 @@ impl LePublisher {
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         let mut smp_cnt: u16 = 0;
+        let mut batch: Vec<LeSample> = Vec::with_capacity(self.cfg.no_asdu as usize);
         let mut cancel = std::pin::pin!(cancel);
         loop {
             tokio::select! {
@@ -115,7 +202,11 @@ impl LePublisher {
                         ..Default::default()
                     };
                     fill(smp_cnt, &mut sample);
-                    self.emit(&sample)?;
+                    batch.push(sample);
+                    if batch.len() == self.cfg.no_asdu as usize {
+                        self.emit_all(&batch)?;
+                        batch.clear();
+                    }
 
                     smp_cnt = smp_cnt.wrapping_add(1);
                     if u32::from(smp_cnt) >= self.rate {
@@ -126,19 +217,16 @@ impl LePublisher {
         }
     }
 
-    /// Sends one sample immediately, outside the clock.
+    /// Sends one sample immediately, outside the clock, in a frame of its own.
     pub fn emit(&self, s: &LeSample) -> Result<()> {
+        self.emit_all(std::slice::from_ref(s))
+    }
+
+    /// Sends samples immediately, outside the clock, in one frame.
+    pub fn emit_all(&self, samples: &[LeSample]) -> Result<()> {
         let pdu = Pdu {
             app_id: self.cfg.app_id,
-            asdus: vec![Asdu {
-                sv_id: self.cfg.sv_id.clone(),
-                smp_cnt: s.smp_cnt,
-                conf_rev: self.cfg.conf_rev,
-                smp_synch: s.smp_synch,
-                smp_rate: self.cfg.samples_per_cycle.min(u32::from(u16::MAX)) as u16,
-                sample: encode_le_sample(s),
-                ..Default::default()
-            }],
+            asdus: samples.iter().map(|s| self.asdu(s)).collect(),
         };
         self.iface.write_frame(&Frame {
             dst: self.cfg.dst_mac,
@@ -148,6 +236,25 @@ impl LePublisher {
             payload: pdu.marshal(),
         })?;
         Ok(())
+    }
+
+    /// Builds the ASDU for one sample, with the optional fields the
+    /// configuration asks for.
+    fn asdu(&self, s: &LeSample) -> Asdu {
+        let o = &self.cfg.opts;
+        Asdu {
+            sv_id: self.cfg.sv_id.clone(),
+            dat_set: if o.data_set { self.cfg.dat_set.clone() } else { String::new() },
+            smp_cnt: s.smp_cnt,
+            conf_rev: self.cfg.conf_rev,
+            refr_tm: o.refresh_time.then(SystemTime::now),
+            refr_tm_quality: if o.refresh_time { self.cfg.time_quality } else { None },
+            smp_synch: s.smp_synch,
+            smp_rate: if o.sample_rate { self.smp_rate() as u16 } else { 0 },
+            sample: encode_le_sample(s),
+            smp_mod: o.smp_mod.then_some(self.cfg.smp_mod),
+            gm_identity: o.synch_source_id.then(|| *self.gm_identity.lock().unwrap()),
+        }
     }
 }
 
@@ -297,3 +404,7 @@ mod tests {
         assert_ne!(default_mac(1)[3], crate::goose::default_mac(1)[3]);
     }
 }
+
+#[cfg(test)]
+#[path = "ed21_tests.rs"]
+mod ed21_tests;

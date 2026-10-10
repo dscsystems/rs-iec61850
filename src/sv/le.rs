@@ -9,6 +9,13 @@ use super::{Asdu, Error, Result};
 /// value and a `UINT32` quality word.
 pub const LE_SAMPLE_LEN: usize = 8 * 8;
 
+/// The 13 bits of a 9-2LE quality word that are the IEC 61850-7-3 quality.
+const LE_QUALITY_MASK: u32 = 0x1fff;
+
+/// The validity the first 9-2LE guideline used for invalid, and 9-2:2011 for
+/// reserved.
+const LE_VALIDITY_LEGACY_INVALID: u32 = 0x0001;
+
 /// A decoded 9-2LE dataset: four currents and four voltages, each an `INT32`
 /// scaled value with a 32-bit quality word.
 ///
@@ -33,18 +40,39 @@ impl LeSample {
     /// Returns the quality of channel `i`: 0..=3 are currents, 4..=7 voltages.
     ///
     /// The quality word carries the 13-bit IEC 61850-7-3 quality in its low
-    /// bits; the rest is reserved and masked off here.
+    /// bits, position k of the quality string being bit k of the word; bit 13
+    /// is the derived flag 9-2LE adds and the bits above are reserved.
+    ///
+    /// The orientation is easy to get backwards, and backwards it yields
+    /// plausible nonsense rather than an error. The masks Wireshark's SV
+    /// dissector decodes and libiec61850 writes pin it down: invalid 0x0002,
+    /// questionable 0x0003, test 0x0800, derived 0x2000. A word is therefore
+    /// the same integer as [`Quality`].
+    ///
+    /// The first 9-2LE guideline wrote invalid as 0x0001, which 9-2:2011 makes
+    /// the reserved value. Merging units built to it are still in service, so
+    /// 0x0001 reads as invalid: a receiver that took it for "reserved" and used
+    /// the sample would be using one its source has disowned.
     pub fn quality(&self, i: usize) -> Quality {
         match self.q.get(i) {
-            Some(q) => Quality((*q & 0x1fff) as u16),
+            Some(q) => {
+                let quality = Quality((*q & LE_QUALITY_MASK) as u16);
+                if *q & 3 == LE_VALIDITY_LEGACY_INVALID {
+                    quality.with_validity(crate::model::Validity::Invalid)
+                } else {
+                    quality
+                }
+            }
             None => Quality::GOOD,
         }
     }
 
-    /// Sets the quality of channel `i`.
+    /// Writes a 13-bit quality into channel `i`, leaving the derived and
+    /// reserved bits of the word alone. It always writes the 9-2:2011
+    /// validity.
     pub fn set_quality(&mut self, i: usize, q: Quality) {
         if let Some(slot) = self.q.get_mut(i) {
-            *slot = u32::from(q.0);
+            *slot = (*slot & !LE_QUALITY_MASK) | (u32::from(q.0) & LE_QUALITY_MASK);
         }
     }
 }

@@ -6,8 +6,8 @@
 //! here is a pure function of the model, which is what makes the server's
 //! wire behaviour testable without a socket.
 
-use crate::mms::{Component, Type, TypeSpec, Value};
-use crate::model::{DataAttribute, DataObject, Fc, LogicalDevice, LogicalNode};
+use crate::mms::{Component, DataAccessError, Type, TypeSpec, Value};
+use crate::model::{parse_fc_lenient, DataAttribute, DataObject, Fc, LogicalDevice, LogicalNode};
 
 /// Enumerates the MMS variable item IDs a client sees via `getNameList` for
 /// one logical device.
@@ -33,7 +33,9 @@ pub fn names_for_domain(ld: &LogicalDevice) -> Vec<String> {
         order.sort_unstable();
 
         for fc in order {
-            let prefix = format!("{}${fc}", ln.name);
+            // The verbatim mnemonic of a constraint this crate does not know,
+            // so the item IDs are the ones the peer would use.
+            let prefix = format!("{}${}", ln.name, fc_name_for(ln, fc));
             names.push(prefix.clone());
             for object in &ln.objects {
                 if !has_fc(object, fc) {
@@ -86,12 +88,13 @@ pub fn has_fc(object: &DataObject, fc: Fc) -> bool {
 /// Splits an item ID into its logical node, functional constraint and the
 /// remaining path.
 ///
-/// Returns `None` when the item is not `LN$FC[...]`, or names a constraint
-/// that does not exist.
+/// Returns `None` when the item is not `LN$FC[...]`. A constraint this crate
+/// does not know parses as [`Fc::Unknown`], so an object under it stays
+/// readable.
 fn split_item(item: &str) -> Option<(&str, Fc, Vec<&str>)> {
     let mut parts = item.split('$');
     let ln = parts.next()?;
-    let fc: Fc = parts.next()?.parse().ok()?;
+    let fc = parse_fc_lenient(parts.next()?);
     Some((ln, fc, parts.collect()))
 }
 
@@ -101,7 +104,15 @@ fn split_item(item: &str) -> Option<(&str, Fc, Vec<&str>)> {
 /// A read of `LN$FC` yields every object under that constraint, a read of
 /// `LN$FC$DO` yields the object, and a read down to a leaf yields its value.
 pub fn resolve_read(ln: &LogicalNode, item: &str) -> Option<Value> {
-    let (_, fc, rest) = split_item(item)?;
+    resolve_read_err(ln, item).ok()
+}
+
+/// [`resolve_read`] with the access error that explains a failure, so a
+/// caller can answer with a reason rather than the generic
+/// object-non-existent.
+pub fn resolve_read_err(ln: &LogicalNode, item: &str) -> Result<Value, DataAccessError> {
+    let not_found = DataAccessError::ObjectNonExistent;
+    let (_, fc, rest) = split_item(item).ok_or(not_found)?;
     if rest.is_empty() {
         // "LN$FC": a structure of every data object under that constraint.
         let members: Vec<Value> = ln
@@ -109,14 +120,21 @@ pub fn resolve_read(ln: &LogicalNode, item: &str) -> Option<Value> {
             .iter()
             .filter_map(|object| do_value(object, fc))
             .collect();
-        return Some(Value::Structure(members));
+        return Ok(Value::Structure(members));
     }
-    let (object, rest) = descend_objects(ln.object(rest[0])?, &rest[1..]);
+    let (object, rest) = descend_objects(ln.object(rest[0]).ok_or(not_found)?, &rest[1..]);
     if rest.is_empty() {
-        return do_value(object, fc);
+        // The data object is not exposed under this constraint, so the item
+        // does not exist on the device: a missing item rather than a type
+        // problem.
+        return do_value(object, fc).ok_or(not_found);
     }
-    let da = descend_attributes(object, fc, rest)?;
-    Some(da_value(da))
+    let da = descend_attributes(object, fc, rest).ok_or(not_found)?;
+    // A leaf whose basic type this crate does not know has no value it could
+    // encode. A zero of some other type would be a lie the client cannot
+    // detect, so the read reports the type as inconsistent: the object is
+    // there, and the client can tell the two cases apart.
+    da_value_opt(da).ok_or(DataAccessError::TypeInconsistent)
 }
 
 /// Descends sub-objects while the path keeps matching one.
@@ -157,14 +175,15 @@ fn descend_attributes<'a>(
 /// its matching attributes and sub-objects.
 ///
 /// Returns `None` when the object exposes nothing under that constraint, which
-/// is what keeps an empty structure off the wire.
+/// is what keeps an empty structure off the wire, and when one of its members
+/// cannot be produced: the rest would encode a structure with fewer
+/// components than the type specification declares, which a client reads
+/// against the wrong member names.
 pub fn do_value(object: &DataObject, fc: Fc) -> Option<Value> {
-    let mut members: Vec<Value> = object
-        .attributes
-        .iter()
-        .filter(|a| a.fc == fc)
-        .map(da_value)
-        .collect();
+    let mut members: Vec<Value> = Vec::new();
+    for a in object.attributes.iter().filter(|a| a.fc == fc) {
+        members.push(da_value_opt(a)?);
+    }
     for sub in &object.objects {
         if let Some(v) = do_value(sub, fc) {
             if !v.is_empty() {
@@ -179,12 +198,33 @@ pub fn do_value(object: &DataObject, fc: Fc) -> Option<Value> {
 }
 
 /// Returns the value of a data attribute: its leaf value, or a structure of
-/// its children.
+/// its children, or for an array of a constructed type an array of that
+/// structure.
 pub fn da_value(da: &DataAttribute) -> Value {
+    da_value_opt(da).unwrap_or(Value::boolean(false))
+}
+
+/// [`da_value`], or `None` for an attribute of a basic type this crate does
+/// not know, which has no value it could encode.
+pub fn da_value_opt(da: &DataAttribute) -> Option<Value> {
     if da.children.is_empty() {
-        return da.value.clone().unwrap_or(Value::boolean(false));
+        return match &da.value {
+            Some(v) => Some(v.clone()),
+            None if da.kind.is_none() || da.kind == Some(Type::None) => None,
+            None => Some(Value::boolean(false)),
+        };
     }
-    Value::Structure(da.children.iter().map(da_value).collect())
+    let mut members = Vec::with_capacity(da.children.len());
+    for c in &da.children {
+        members.push(da_value_opt(c)?);
+    }
+    let elem = Value::Structure(members);
+    if da.kind == Some(Type::Array) {
+        // An array of a constructed type: the children are the element
+        // template, and every element starts from it.
+        return Some(Value::Array(vec![elem; da.count]));
+    }
+    Some(elem)
 }
 
 /// Finds the leaf data attribute an item ID addresses, for a write.
@@ -197,7 +237,7 @@ pub fn resolve_write<'a>(ln: &'a mut LogicalNode, item: &str) -> Option<&'a mut 
     if parts.len() < 4 {
         return None;
     }
-    let fc: Fc = parts[1].parse().ok()?;
+    let fc = parse_fc_lenient(parts[1]);
     let object = ln.object_mut(parts[2])?;
     let mut rest = &parts[3..];
 
@@ -233,14 +273,13 @@ pub fn type_spec_for(ln: &LogicalNode, item: &str) -> Option<TypeSpec> {
     match parts.len() {
         // "LN": a structure with one member per constraint.
         1 => return Some(ln_type_spec(ln)),
-        // "LN$FC": one member per data object.
-        2 => {
-            let fc: Fc = parts[1].parse().ok()?;
-            return Some(fc_type_spec(ln, fc));
-        }
+        // "LN$FC": one member per data object exposing that constraint. An
+        // unknown constraint yields an empty structure rather than an error,
+        // so a newer constraint does not make the node un-introspectable.
+        2 => return Some(fc_type_spec(ln, parse_fc_lenient(parts[1]))),
         _ => {}
     }
-    let fc: Fc = parts[1].parse().ok()?;
+    let fc = parse_fc_lenient(parts[1]);
     let (object, rest) = descend_objects(ln.object(parts[2])?, &parts[3..]);
     if rest.is_empty() {
         return Some(do_type_spec(object, fc));
@@ -264,11 +303,20 @@ fn ln_type_spec(ln: &LogicalNode) -> TypeSpec {
         order
             .into_iter()
             .map(|fc| Component {
-                name: fc.to_string(),
+                name: fc_name_for(ln, fc),
                 spec: fc_type_spec(ln, fc),
             })
             .collect(),
     )
+}
+
+/// The name a node uses for a functional constraint: the verbatim mnemonic
+/// for one this crate does not know.
+fn fc_name_for(ln: &LogicalNode, fc: Fc) -> String {
+    ln.objects
+        .iter()
+        .find(|o| has_fc(o, fc))
+        .map_or_else(|| fc.as_str().to_string(), |o| o.fc_text(fc))
 }
 
 /// The functional-constraint type: a structure with one member per data object
@@ -309,7 +357,7 @@ fn do_type_spec(object: &DataObject, fc: Fc) -> TypeSpec {
 
 fn da_type_spec(da: &DataAttribute) -> TypeSpec {
     if !da.children.is_empty() {
-        return TypeSpec::structure(
+        let ts = TypeSpec::structure(
             da.children
                 .iter()
                 .map(|c| Component {
@@ -318,6 +366,10 @@ fn da_type_spec(da: &DataAttribute) -> TypeSpec {
                 })
                 .collect(),
         );
+        if da.kind == Some(Type::Array) {
+            return TypeSpec::array(da.count, ts);
+        }
+        return ts;
     }
     value_type_spec(da.value.as_ref())
 }
@@ -338,6 +390,9 @@ fn value_type_spec(v: Option<&Value>) -> TypeSpec {
         Type::Unsigned => TypeSpec::sized(Type::Unsigned, 32),
         Type::VisibleString => TypeSpec::sized(Type::VisibleString, 129),
         Type::OctetString => TypeSpec::sized(Type::OctetString, 64),
+        // The elements of an attribute's array share one type; an empty array
+        // still needs an element type to be described.
+        Type::Array => TypeSpec::array(v.len(), value_type_spec(v.index(0))),
         other => TypeSpec::scalar(other),
     }
 }

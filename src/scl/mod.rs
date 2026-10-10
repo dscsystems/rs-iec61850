@@ -9,18 +9,30 @@
 //! capacity, KDC and certificate elements and private extensions are decoded
 //! loosely or ignored.
 //!
-//! Elements are matched by local name, so any SCL namespace revision is
-//! accepted.
+//! Parsing is permissive by design. Elements are matched by local name, so
+//! any SCL namespace revision is accepted, and an unrecognised element, basic
+//! type or functional constraint is recorded as a [`Diagnostic`] rather than
+//! failing the load: one construct from a newer schema or a vendor extension
+//! must not make a whole IED unreadable. [`BuildOptions::strict`] turns
+//! diagnostics into an error, and the resulting `Model::diagnostics` says what
+//! was not understood. [`Scl::edition`] gives the version a document declares.
 
 mod build;
 mod dom;
+mod edition;
 mod parse;
 mod types;
 
-pub use build::{build_model, load_model, BuildOptions};
+pub use build::{build_model, load_model, BuildOptions, WarnFn};
 pub use dom::Node;
-pub use parse::{parse, parse_file};
+pub use edition::{Edition, SCL_NAMESPACE};
+pub use parse::{parse, parse_bytes, parse_file};
 pub use types::*;
+
+/// A non-fatal problem found while parsing or building a model. It is the
+/// type the model carries, so a diagnostic raised while loading an SCL file
+/// can be inspected on the resulting model.
+pub use crate::model::Diagnostic;
 
 /// Errors raised while reading or instantiating an SCL document.
 #[derive(Debug, thiserror::Error)]
@@ -32,6 +44,12 @@ pub enum Error {
     /// The document is well-formed but does not describe what was asked for.
     #[error("scl: {0}")]
     Model(String),
+    /// A strict build raised diagnostics; each is listed.
+    #[error("scl: {msg}")]
+    Strict {
+        diagnostics: Vec<Diagnostic>,
+        msg: String,
+    },
 }
 
 impl Error {

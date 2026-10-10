@@ -6,9 +6,10 @@ use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::sync::{oneshot, watch, Mutex as AsyncMutex};
 
-use crate::asn1::{self, cons, context_primitive, Decoder, Element};
-use crate::osi::{acse, cotp, presentation, session};
+use crate::asn1::{self, cons, context_primitive, prim, Decoder, Element};
+use crate::osi::{self, acse, cotp, presentation, session};
 
+use super::client_ext::FileServer;
 use super::pdu::*;
 use super::report::InformationReport;
 use super::transport::{self, BoxTransport, FramingReader, FramingWriter};
@@ -17,6 +18,13 @@ use super::{Error, ErrorClass, InitiateRequest, Result, ServiceError};
 /// The ACSE identity of an application entity, re-exported at the MMS layer so
 /// callers do not reach into the OSI modules.
 pub type AcseIdentity = acse::Identity;
+
+/// The ACSE application context an association proposes (IEC 61850-8-1).
+///
+/// The default, [`ApplicationContext::Mms`], is what most servers expect;
+/// [`ApplicationContext::Acsi`] is for a server that accepts only the
+/// IEC 61850 one.
+pub type ApplicationContext = acse::ApplicationContext;
 
 /// The lifecycle state of an association.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,6 +69,8 @@ pub struct Options {
     pub called: AcseIdentity,
     /// The ACSE identity to claim.
     pub calling: AcseIdentity,
+    /// The application-context-name the AARQ proposes.
+    pub application_context: ApplicationContext,
     /// When set, wraps the TCP connection per IEC 62351-3. The default
     /// MMS-over-TLS port is 3782.
     #[cfg(feature = "tls")]
@@ -79,6 +89,7 @@ impl std::fmt::Debug for Options {
             .field("connect_timeout", &self.connect_timeout)
             .field("called", &self.called)
             .field("calling", &self.calling)
+            .field("application_context", &self.application_context)
             .finish_non_exhaustive()
     }
 }
@@ -100,20 +111,26 @@ struct Handlers {
 
 /// What a pending confirmed call resolves to: the response's service element
 /// content, or the error that ended it.
-type CallResult = std::result::Result<Vec<u8>, Arc<Error>>;
+type CallResult = std::result::Result<Vec<u8>, Error>;
 
 struct Lifecycle {
     state: State,
     close_err: Option<Arc<Error>>,
 }
 
-struct Shared {
+pub(crate) struct Shared {
     pending: Mutex<HashMap<u32, oneshot::Sender<CallResult>>>,
+    /// Cancel requests awaiting their answer, by the invoke id they cancel.
+    cancels: Mutex<HashMap<u32, oneshot::Sender<Result<()>>>>,
+    /// Serves the file reads of the ObtainFile in progress, `None` when none
+    /// is.
+    pub(crate) files: Mutex<Option<Arc<FileServer>>>,
     handlers: Mutex<Handlers>,
     life: Mutex<Lifecycle>,
     done_tx: watch::Sender<bool>,
     next_id: AtomicU32,
     next_handler: AtomicU64,
+    pub(crate) writer: AsyncMutex<FramingWriter>,
 }
 
 impl Shared {
@@ -121,13 +138,25 @@ impl Shared {
         self.life.lock().unwrap().state
     }
 
+    /// Returns the error a request on a connection that is not up gets.
+    fn closed_error(&self) -> Option<Error> {
+        let life = self.life.lock().unwrap();
+        if life.state == State::Connected {
+            return None;
+        }
+        Some(match &life.close_err {
+            Some(e) => e.duplicate(),
+            None => Error::Closed,
+        })
+    }
+
     /// Records the cause that ended the association and fails every pending
     /// call with it.
     fn fail_all(&self, err: Error) {
         let err = {
             let mut life = self.life.lock().unwrap();
-            // The first cause wins; a Close records its own before the reader
-            // ever sees the transport end.
+            // The first cause wins; a Close or Abort records its own before
+            // the reader ever sees the transport end.
             if life.state == State::Connected {
                 life.close_err = Some(Arc::new(err));
             }
@@ -138,7 +167,11 @@ impl Shared {
         };
         let pending: Vec<_> = self.pending.lock().unwrap().drain().collect();
         for (_, tx) in pending {
-            let _ = tx.send(Err(err.clone()));
+            let _ = tx.send(Err(err.duplicate()));
+        }
+        let cancels: Vec<_> = self.cancels.lock().unwrap().drain().collect();
+        for (_, tx) in cancels {
+            let _ = tx.send(Err(err.duplicate()));
         }
         let _ = self.done_tx.send(true);
     }
@@ -152,6 +185,118 @@ impl Shared {
             None => tracing::warn!(invoke_id = id, "mms: response for unknown invoke id"),
         }
     }
+
+    /// Sends a confirmed request and registers its response slot.
+    async fn start(self: &Arc<Self>, service: Element) -> Result<Outstanding> {
+        let id = {
+            if let Some(e) = self.closed_error() {
+                return Err(e);
+            }
+            self.next_id.fetch_add(1, Ordering::Relaxed)
+        };
+        let (tx, rx) = oneshot::channel();
+        self.pending.lock().unwrap().insert(id, tx);
+
+        // ConfirmedRequestPDU ::= [0] SEQUENCE { invokeID INTEGER, service }
+        let req = cons(
+            TAG_CONFIRMED_REQUEST,
+            [asn1::uint_elem(asn1::TAG_INTEGER, u64::from(id)), service],
+        )
+        .encode();
+
+        tracing::trace!(invoke_id = id, len = req.len(), "mms: tx PDU");
+        let send = self.writer.lock().await.send_mms(&req).await;
+        if let Err(e) = send {
+            self.pending.lock().unwrap().remove(&id);
+            return Err(e);
+        }
+        Ok(Outstanding {
+            shared: Arc::clone(self),
+            id,
+            rx: Some(rx),
+        })
+    }
+}
+
+/// A confirmed request that has been sent and whose response has not been
+/// collected.
+///
+/// [`wait`](Outstanding::wait) collects the response;
+/// [`cancel`](Outstanding::cancel) asks the server to abandon the request.
+/// Dropping it without waiting discards the response when it arrives.
+pub struct Outstanding {
+    shared: Arc<Shared>,
+    id: u32,
+    rx: Option<oneshot::Receiver<CallResult>>,
+}
+
+impl std::fmt::Debug for Outstanding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Outstanding").field("invoke_id", &self.id).finish()
+    }
+}
+
+impl Outstanding {
+    /// Returns the request's MMS invoke identifier.
+    pub fn invoke_id(&self) -> u32 {
+        self.id
+    }
+
+    /// Returns the response of the request: its service element content, or
+    /// the error the server answered with.
+    pub async fn wait(mut self) -> Result<Vec<u8>> {
+        let rx = self.rx.take().expect("waited once");
+        match rx.await {
+            Ok(res) => res,
+            // The sender was dropped without a value, which only happens if
+            // the reader task died without draining; treat it as a close.
+            Err(_) => Err(Error::Closed),
+        }
+    }
+
+    /// Asks the server to abandon the request (MMS Cancel).
+    ///
+    /// It returns `Ok` when the server agreed, in which case
+    /// [`wait`](Outstanding::wait) reports the request's error; a server that
+    /// has already answered, or cannot cancel, refuses with a service error
+    /// of class cancel (10).
+    pub async fn cancel(&self) -> Result<()> {
+        cancel(&self.shared, self.id).await
+    }
+}
+
+impl Drop for Outstanding {
+    fn drop(&mut self) {
+        if self.rx.is_some() {
+            self.shared.pending.lock().unwrap().remove(&self.id);
+        }
+    }
+}
+
+/// Sends a Cancel-RequestPDU for `invoke_id` and waits for its answer.
+async fn cancel(shared: &Arc<Shared>, invoke_id: u32) -> Result<()> {
+    if let Some(e) = shared.closed_error() {
+        return Err(e);
+    }
+    let (tx, rx) = oneshot::channel();
+    {
+        let mut cancels = shared.cancels.lock().unwrap();
+        if cancels.contains_key(&invoke_id) {
+            return Err(Error::protocol(format!(
+                "a cancel of request {invoke_id} is already outstanding"
+            )));
+        }
+        cancels.insert(invoke_id, tx);
+    }
+    let pdu = asn1::uint_elem(TAG_CANCEL_REQUEST, u64::from(invoke_id)).encode();
+    if let Err(e) = shared.writer.lock().await.send_mms(&pdu).await {
+        shared.cancels.lock().unwrap().remove(&invoke_id);
+        return Err(e);
+    }
+    match rx.await {
+        Ok(res) => res,
+        Err(_) => Err(Error::Closed),
+    }
 }
 
 /// An established MMS association.
@@ -160,20 +305,21 @@ impl Shared {
 /// which are matched to responses by invoke ID. Unconfirmed PDUs (information
 /// reports) are delivered to every handler registered with
 /// [`on_information_report`](Conn::on_information_report).
-#[derive(Debug)]
 pub struct Conn {
     shared: Arc<Shared>,
-    writer: AsyncMutex<FramingWriter>,
     done_rx: watch::Receiver<bool>,
     reader_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     negotiated: InitiateRequest,
     responding: AcseIdentity,
+    /// Runs one ObtainFile at a time.
+    pub(crate) obtain_lock: AsyncMutex<()>,
 }
 
-impl std::fmt::Debug for Shared {
+impl std::fmt::Debug for Conn {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Shared")
+        f.debug_struct("Conn")
             .field("state", &self.state())
+            .field("negotiated", &self.negotiated)
             .finish_non_exhaustive()
     }
 }
@@ -181,13 +327,18 @@ impl std::fmt::Debug for Shared {
 impl Conn {
     /// Establishes an MMS association to a `host:port` address.
     pub async fn dial(addr: &str, opts: Options) -> Result<Conn> {
-        let connect = TcpStream::connect(addr);
-        let tcp = match opts.connect_timeout {
-            Some(d) => tokio::time::timeout(d, connect)
+        let timeout = opts.connect_timeout;
+        let fut = Conn::dial_inner(addr, opts);
+        match timeout {
+            Some(d) => tokio::time::timeout(d, fut)
                 .await
-                .map_err(|_| Error::Timeout)??,
-            None => connect.await?,
-        };
+                .map_err(|_| Error::Timeout)?,
+            None => fut.await,
+        }
+    }
+
+    async fn dial_inner(addr: &str, opts: Options) -> Result<Conn> {
+        let tcp = TcpStream::connect(addr).await?;
         // Nagle would coalesce a request with the next one and add latency to
         // every round trip; MMS is strictly request/response.
         let _ = tcp.set_nodelay(true);
@@ -209,8 +360,7 @@ impl Conn {
         #[cfg(not(feature = "tls"))]
         let stream: BoxTransport = Box::new(tcp);
 
-        let handshake = Conn::handshake(stream, opts);
-        match_timeout(handshake).await
+        Conn::handshake(stream, opts).await
     }
 
     /// Establishes an association over an already-connected stream.
@@ -227,29 +377,50 @@ impl Conn {
         let init = opts.initiate.clone().unwrap_or_default();
         // The ACSE AARQ wraps the MMS InitiateRequest; the presentation CP
         // wraps the AARQ; the session CONNECT carries the CP.
-        let aarq = acse::aarq_with_identity(
+        let aarq = acse::aarq_for(
             &encode_initiate_request(&init),
             opts.password.as_deref().unwrap_or(""),
             &opts.called,
             &opts.calling,
+            opts.application_context,
         );
         let cp = presentation::build_cp(
             presentation::DEFAULT_CALLING_PSEL,
             presentation::DEFAULT_CALLED_PSEL,
             &aarq,
         );
-        let cpa_user_data = session::connect_client(&mut ct, &[], &[], &cp).await?;
+        let cpa_user_data = match session::connect_client(&mut ct, &[], &[], &cp).await {
+            Ok(ud) => ud,
+            Err(osi::Error::Refused { reason, user_data }) => {
+                // A refused association: the CPR carries the AARE saying why.
+                if let Ok(aare) = presentation::parse_cpr_user_data(&user_data) {
+                    if let Ok(res) = acse::parse_aare(&aare) {
+                        if !res.accepted {
+                            return Err(Error::Rejected(res.diagnostic));
+                        }
+                    }
+                }
+                return Err(Error::protocol(format!(
+                    "association refused at the session layer (reason {reason})"
+                )));
+            }
+            Err(e) => return Err(e.into()),
+        };
         let aare = presentation::parse_cp_user_data(&cpa_user_data)?;
         let res = acse::parse_aare(&aare)?;
         if !res.accepted {
-            return Err(Error::Rejected(format!("diagnostic {}", res.diagnostic)));
+            return Err(Error::Rejected(res.diagnostic));
         }
         let negotiated = parse_initiate_response(&res.user_data)?;
 
-        let (reader, writer) = transport::split(ct);
+        // We proposed the contexts, so their identifiers are ours.
+        let (reader, writer) =
+            transport::split(ct, presentation::CONTEXT_MMS, presentation::CONTEXT_ACSE);
         let (done_tx, done_rx) = watch::channel(false);
         let shared = Arc::new(Shared {
             pending: Mutex::new(HashMap::new()),
+            cancels: Mutex::new(HashMap::new()),
+            files: Mutex::new(None),
             handlers: Mutex::new(Handlers::default()),
             life: Mutex::new(Lifecycle {
                 state: State::Connected,
@@ -258,17 +429,18 @@ impl Conn {
             done_tx,
             next_id: AtomicU32::new(1),
             next_handler: AtomicU64::new(1),
+            writer: AsyncMutex::new(writer),
         });
 
         let reader_task = tokio::spawn(read_loop(reader, Arc::clone(&shared)));
 
         Ok(Conn {
             shared,
-            writer: AsyncMutex::new(writer),
             done_rx,
             reader_task: Mutex::new(Some(reader_task)),
             negotiated,
             responding: res.responding,
+            obtain_lock: AsyncMutex::new(()),
         })
     }
 
@@ -314,7 +486,7 @@ impl Conn {
     }
 
     /// Resolves when the association ends, whether from [`close`](Conn::close),
-    /// a peer disconnect or a transport error.
+    /// [`abort`](Conn::abort), a peer disconnect or a transport error.
     ///
     /// This is the push counterpart to polling [`state`](Conn::state). By the
     /// time it returns, `state` reports [`State::Closed`] and [`err`](Conn::err)
@@ -381,47 +553,54 @@ impl Conn {
     /// returns the response's service element content.
     ///
     /// This is the escape hatch for services this crate does not wrap: a
-    /// thorough census wants to try `GetCapabilityList`, `Status` and vendor
-    /// services, and a proxy may need to forward whatever a client sends.
+    /// thorough census wants to try `GetCapabilityList` and vendor services,
+    /// and a proxy may need to forward whatever a client sends. A confirmed
+    /// error comes back as [`Error::Service`], a per-item access failure as
+    /// [`Error::Access`].
     pub async fn call(&self, service: Element) -> Result<Vec<u8>> {
         self.call_inner(service).await
     }
 
     pub(crate) async fn call_inner(&self, service: Element) -> Result<Vec<u8>> {
-        let id = {
-            let life = self.shared.life.lock().unwrap();
+        self.start(service).await?.wait().await
+    }
+
+    /// Sends a confirmed request and returns without waiting for its
+    /// response.
+    ///
+    /// [`Outstanding::wait`] collects it; [`Outstanding::cancel`] asks the
+    /// server to abandon it.
+    pub async fn start(&self, service: Element) -> Result<Outstanding> {
+        self.shared.start(service).await
+    }
+
+    /// Asks the server to abandon the outstanding request with the given
+    /// invoke identifier (ISO 9506 Cancel).
+    pub async fn cancel(&self, invoke_id: u32) -> Result<()> {
+        cancel(&self.shared, invoke_id).await
+    }
+
+    /// Ends the association abruptly (ACSE A-ABORT): nothing more is sent or
+    /// answered, and requests still outstanding fail with
+    /// [`Error::Aborted`]. [`close`](Conn::close) releases the association in
+    /// order and is what a client normally uses.
+    pub async fn abort(&self) -> Result<()> {
+        {
+            let mut life = self.shared.life.lock().unwrap();
             if life.state != State::Connected {
-                return Err(match &life.close_err {
-                    Some(e) => Error::protocol(e.to_string()),
-                    None => Error::Closed,
-                });
+                return Ok(());
             }
-            self.shared.next_id.fetch_add(1, Ordering::Relaxed)
+            life.state = State::Closing;
+            life.close_err = Some(Arc::new(Error::Aborted(" by this end".into())));
+        }
+        let res = {
+            let mut w = self.shared.writer.lock().await;
+            let res = w.send_abort().await;
+            let _ = w.shutdown().await;
+            res
         };
-        let (tx, rx) = oneshot::channel();
-        self.shared.pending.lock().unwrap().insert(id, tx);
-
-        // ConfirmedRequestPDU ::= [0] SEQUENCE { invokeID INTEGER, service }
-        let req = cons(
-            TAG_CONFIRMED_REQUEST,
-            [asn1::uint_elem(asn1::TAG_INTEGER, u64::from(id)), service],
-        )
-        .encode();
-
-        tracing::trace!(invoke_id = id, len = req.len(), "mms: tx PDU");
-        let send = self.writer.lock().await.send_mms(&req).await;
-        if let Err(e) = send {
-            self.shared.pending.lock().unwrap().remove(&id);
-            return Err(e);
-        }
-
-        match rx.await {
-            Ok(Ok(pdu)) => Ok(pdu),
-            Ok(Err(e)) => Err(Error::protocol(e.to_string())),
-            // The sender was dropped without a value, which only happens if
-            // the reader task died without draining; treat it as a close.
-            Err(_) => Err(Error::Closed),
-        }
+        self.finish_close().await;
+        res
     }
 
     /// Releases the association (a best-effort MMS conclude) and closes the
@@ -438,12 +617,16 @@ impl Conn {
         }
 
         {
-            let mut w = self.writer.lock().await;
-            let conclude = cons(TAG_CONCLUDE_REQUEST, []).encode();
+            let mut w = self.shared.writer.lock().await;
+            let conclude = prim(TAG_CONCLUDE_REQUEST, Vec::new()).encode();
             let _ = w.send_mms(&conclude).await;
             let _ = w.shutdown().await;
         }
+        self.finish_close().await;
+        Ok(())
+    }
 
+    async fn finish_close(&self) {
         // The reader's fail_all moves the state to Closed and wakes `closed`.
         self.closed().await;
         let handle = self.reader_task.lock().unwrap().take();
@@ -451,7 +634,10 @@ impl Conn {
             let _ = h.await;
         }
         self.shared.life.lock().unwrap().state = State::Closed;
-        Ok(())
+    }
+
+    pub(crate) fn shared(&self) -> &Arc<Shared> {
+        &self.shared
     }
 }
 
@@ -462,11 +648,6 @@ impl Drop for Conn {
             h.abort();
         }
     }
-}
-
-/// Applies the connect timeout, if the handshake future carries one.
-async fn match_timeout(fut: impl std::future::Future<Output = Result<Conn>>) -> Result<Conn> {
-    fut.await
 }
 
 async fn read_loop(mut reader: FramingReader, shared: Arc<Shared>) {
@@ -497,17 +678,53 @@ fn dispatch(pdu: &[u8], shared: &Arc<Shared>) {
         let res = if tag == TAG_CONFIRMED_RESPONSE {
             Ok(body.to_vec())
         } else {
-            Err(Arc::new(Error::Service(decode_service_error(body))))
+            Err(Error::Service(decode_service_error(body)))
         };
         shared.deliver(id, res);
     } else if tag == TAG_REJECT_PDU {
         deliver_reject(content, shared);
     } else if tag == TAG_UNCONFIRMED {
         handle_unconfirmed(content, shared);
-    } else if tag == TAG_CONCLUDE_RESPONSE {
+    } else if tag == TAG_CONCLUDE_RESPONSE || tag == TAG_CONCLUDE_RESPONSE_LEGACY {
         // The peer accepted our conclude; the reader will see EOF next.
+    } else if tag == TAG_CANCEL_RESPONSE || tag == TAG_CANCEL_ERROR {
+        deliver_cancel(tag, content, shared);
+    } else if tag == TAG_CONFIRMED_REQUEST {
+        // A request from the server: the file reads of an ObtainFile this end
+        // asked for. Served off the reader, which has to keep delivering the
+        // responses the ObtainFile is waiting on.
+        let shared = Arc::clone(shared);
+        let content = content.to_vec();
+        tokio::spawn(async move { super::client_ext::serve_request(&shared, &content).await });
     } else {
         tracing::debug!(%tag, "mms: unhandled PDU tag");
+    }
+}
+
+/// Hands a Cancel-ResponsePDU or Cancel-ErrorPDU to the cancel waiting for
+/// it.
+fn deliver_cancel(tag: asn1::Tag, content: &[u8], shared: &Arc<Shared>) {
+    let (id, res) = if tag == TAG_CANCEL_RESPONSE {
+        let Ok(n) = asn1::decode_uint(content) else {
+            return;
+        };
+        (n as u32, Ok(()))
+    } else {
+        // Cancel-ErrorPDU ::= SEQUENCE { originalInvokeID [0], serviceError [1] }
+        let mut dec = Decoder::new(content);
+        let Ok(b) = dec.expect(context_primitive(0)) else {
+            return;
+        };
+        let id = asn1::decode_uint(b).unwrap_or(0) as u32;
+        let mut se = ServiceError::new(ErrorClass(0), 0);
+        if let Some((class, code)) = drill_error_class(dec.rest(), 0) {
+            se.class = ErrorClass(class);
+            se.code = code;
+        }
+        (id, Err(Error::Service(se)))
+    };
+    if let Some(tx) = shared.cancels.lock().unwrap().remove(&id) {
+        let _ = tx.send(res);
     }
 }
 
@@ -539,10 +756,10 @@ fn deliver_reject(content: &[u8], shared: &Arc<Shared>) {
             se.detail = reject_reason_name(tag.number, se.code);
         }
     }
-    shared.deliver(id, Err(Arc::new(Error::Service(se))));
+    shared.deliver(id, Err(Error::Service(se)));
 }
 
-fn decode_service_error(body: &[u8]) -> ServiceError {
+pub(crate) fn decode_service_error(body: &[u8]) -> ServiceError {
     // ConfirmedErrorPDU carries serviceError { errorClass [n] CHOICE }. The
     // nesting varies by MMS module, so drill to the innermost primitive
     // context-specific element: its tag number is the error class and its

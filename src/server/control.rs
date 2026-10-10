@@ -53,6 +53,18 @@ pub struct ControlCtx {
     pub synchro_check: bool,
     /// True for the select phase, false for operate.
     pub select: bool,
+    /// The operate timestamp the client sent. It is the client's statement of
+    /// when it decided to operate, not of when the server received it, so a
+    /// handler that needs the arrival time must take it itself. `None` when
+    /// the client sent none.
+    pub t: Option<std::time::SystemTime>,
+    /// The time quality the client stamped `t` with: whether its clock was
+    /// synchronised, and how accurate it was. An audit trail that records `t`
+    /// needs it to know how far to trust it.
+    pub t_quality: crate::mms::TimeQuality,
+    /// The length of the originator identifier as it arrived, for a handler
+    /// that wants to police it.
+    pub(crate) or_ident_len: usize,
 
     /// The association the command arrived on.
     ///
@@ -68,7 +80,17 @@ pub struct ControlCtx {
     pub(crate) term: Option<Arc<Termination>>,
 }
 
+/// The length of the originator identifier in the operate structure.
+/// IEC 61850-7-2 types it as an OctetString(0..64); a longer one means the
+/// client is not writing the structure the standard defines.
+pub(crate) const MAX_OR_IDENT_LEN: usize = 64;
+
 impl ControlCtx {
+    /// Returns the length of the originator identifier as it arrived.
+    pub fn or_ident_len(&self) -> usize {
+        self.or_ident_len
+    }
+
     /// Takes over the CommandTermination of an operate on an
     /// enhanced-security object.
     ///
@@ -140,6 +162,9 @@ pub fn decode_oper(
         interlock_check: false,
         synchro_check: false,
         select: false,
+        t: None,
+        t_quality: crate::mms::TimeQuality::default(),
+        or_ident_len: 0,
         conn,
         peer,
         term: None,
@@ -157,13 +182,17 @@ pub fn decode_oper(
             }
             if let Some(ident) = origin.index(1) {
                 ctx.or_ident = String::from_utf8_lossy(ident.bytes()).into_owned();
+                ctx.or_ident_len = ident.bytes().len();
             }
         }
     }
     if let Some(n) = v.index(2) {
         ctx.ctl_num = n.as_i64() as u8;
     }
-    // Index 3 is the timestamp, which the server does not need.
+    if let Some(t) = v.index(3) {
+        ctx.t = t.time();
+        ctx.t_quality = t.time_quality();
+    }
     if let Some(t) = v.index(4) {
         ctx.test = t.as_bool();
     }
@@ -341,8 +370,14 @@ pub fn command_termination_negative_report(
 /// It is sent exactly once: by the server as soon as the operate is accepted,
 /// by a handler that deferred it, or with time-limit-over when `operTimeout`
 /// passes first.
+/// Receives the additional cause a termination ends with.
+type CauseFn = Box<dyn Fn(AddCause) + Send + Sync>;
+
 pub(crate) struct Termination {
-    send: Box<dyn Fn(AddCause) + Send + Sync>,
+    send: CauseFn,
+    /// Told of a deferred termination once it is sent, so it is tracked after
+    /// the request that operated has been answered.
+    on_deferred: Mutex<Option<CauseFn>>,
     state: Mutex<TerminationState>,
 }
 
@@ -387,13 +422,19 @@ impl Termination {
                     tracing::debug!(item = %ctl_item, "server: command termination send failed");
                 }
             }),
+            on_deferred: Mutex::new(None),
             state: Mutex::new(TerminationState::default()),
         })
     }
 
+    /// Installs what is told of a deferred termination once it is sent.
+    pub(crate) fn on_deferred(&self, f: impl Fn(AddCause) + Send + Sync + 'static) {
+        *self.on_deferred.lock().unwrap() = Some(Box::new(f));
+    }
+
     /// Sends the termination, unless it has been sent or discarded already.
     pub(crate) fn finish(&self, cause: AddCause) {
-        {
+        let deferred = {
             let mut st = self.state.lock().unwrap();
             if st.done {
                 return;
@@ -402,8 +443,14 @@ impl Termination {
             if let Some(timer) = st.timer.take() {
                 timer.abort();
             }
-        }
+            st.deferred
+        };
         (self.send)(cause);
+        if deferred {
+            if let Some(f) = self.on_deferred.lock().unwrap().as_ref() {
+                f(cause);
+            }
+        }
     }
 
     /// Drops the termination of an operate that was refused: a refused

@@ -5,6 +5,7 @@ use crate::asn1::{
     Decoder, Element, Tag, TAG_SEQUENCE,
 };
 use crate::mms::{TimeQuality, Value};
+use crate::model::SmpMod;
 
 use super::{Error, Result};
 
@@ -12,7 +13,7 @@ use super::{Error, Result};
 pub(crate) const HEADER_LEN: usize = 8;
 
 /// Frames the savPdu after the APDU header.
-fn sav_pdu_tag() -> Tag {
+pub(crate) fn sav_pdu_tag() -> Tag {
     application_constructed(0) // 0x60
 }
 
@@ -35,11 +36,25 @@ pub struct Asdu {
     pub conf_rev: u32,
     /// The refresh time; `None` when the publisher omitted it.
     pub refr_tm: Option<SystemTime>,
+    /// The time quality of `refr_tm`. `None` stamps
+    /// [`TimeQuality::DEFAULT`]; a parsed ASDU carries the quality it arrived
+    /// with, so a merging unit whose clock lost synchronisation is visible to
+    /// the receiver.
+    pub refr_tm_quality: Option<TimeQuality>,
     pub smp_synch: u8,
     /// Zero when absent.
     pub smp_rate: u16,
     /// The raw dataset payload; `phsMeas` for a 9-2LE stream.
     pub sample: Vec<u8>,
+    /// smpMod `[8]`, the Edition 2 field that says whether `smp_rate` counts
+    /// samples per period, per second, or seconds per sample. `None` when
+    /// absent, as in an Edition 1 stream, which a receiver reads as samples
+    /// per period.
+    pub smp_mod: Option<SmpMod>,
+    /// gmIdentity `[9]` (IEC 61850-9-2 Amendment 1): the PTP clock identity of
+    /// the grandmaster the samples are synchronised to, so a receiver can tell
+    /// whether two streams share a time source.
+    pub gm_identity: Option<[u8; 8]>,
 }
 
 /// A sampled-value APDU carrying one or more ASDUs.
@@ -53,7 +68,7 @@ pub struct Pdu {
 }
 
 impl Asdu {
-    fn element(&self) -> Element {
+    pub(crate) fn element(&self) -> Element {
         let mut el = cons(
             TAG_SEQUENCE,
             [prim(context_primitive(0), self.sv_id.as_bytes().to_vec())],
@@ -75,7 +90,7 @@ impl Asdu {
             self.conf_rev.to_be_bytes().to_vec(),
         ));
         if let Some(t) = self.refr_tm {
-            let v = Value::utc_time(t, TimeQuality::accuracy(10));
+            let v = Value::utc_time(t, self.refr_tm_quality.unwrap_or(TimeQuality::DEFAULT));
             el.push(prim(context_primitive(4), v.bytes().to_vec()));
         }
         el.push(prim(context_primitive(5), vec![self.smp_synch]));
@@ -86,6 +101,14 @@ impl Asdu {
             ));
         }
         el.push(prim(context_primitive(7), self.sample.clone()));
+        // smpMod [8] follows the sample. Like smpRate it is OCTET STRING
+        // (SIZE(2)), not a minimal INTEGER.
+        if let Some(m) = self.smp_mod {
+            el.push(prim(context_primitive(8), vec![0, m.code()]));
+        }
+        if let Some(id) = self.gm_identity {
+            el.push(prim(context_primitive(9), id.to_vec()));
+        }
         el
     }
 }
@@ -178,7 +201,10 @@ fn parse_asdu(content: &[u8]) -> Result<Asdu> {
     a.conf_rev = crate::asn1::decode_uint(b).unwrap_or(0) as u32;
 
     if let Some(b) = d.optional(context_primitive(4))? {
-        a.refr_tm = Value::utc_time_raw(b).ok().and_then(|v| v.time());
+        if let Ok(v) = Value::utc_time_raw(b) {
+            a.refr_tm = v.time();
+            a.refr_tm_quality = Some(v.time_quality());
+        }
     }
     if let Some(b) = d.optional(context_primitive(5))? {
         if let Some(last) = b.last() {
@@ -192,6 +218,15 @@ fn parse_asdu(content: &[u8]) -> Result<Asdu> {
         .expect(context_primitive(7))
         .map_err(|e| Error::Codec(format!("sample: {e}")))?;
     a.sample = b.to_vec();
+    if let Some(b) = d.optional(context_primitive(8))? {
+        a.smp_mod = Some(SmpMod::from_code(i64::from(be_u16(b))));
+    }
+    if let Some(b) = d.optional(context_primitive(9))? {
+        let id: [u8; 8] = b.try_into().map_err(|_| {
+            Error::Codec(format!("gmIdentity of {} octets, want 8", b.len()))
+        })?;
+        a.gm_identity = Some(id);
+    }
     Ok(a)
 }
 
@@ -224,6 +259,9 @@ mod tests {
             smp_synch: SMP_SYNCH_GLOBAL,
             smp_rate: 80,
             sample: vec![0xaa; 64],
+            refr_tm_quality: Some(TimeQuality::DEFAULT),
+            smp_mod: None,
+            gm_identity: None,
         }
     }
 
@@ -322,6 +360,7 @@ mod tests {
             smp_synch: SMP_SYNCH_NONE,
             smp_rate: 0,
             sample: vec![0; 64],
+            ..Default::default()
         };
         let p = Pdu {
             app_id: 0x4000,

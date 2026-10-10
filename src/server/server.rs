@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use tokio::net::{TcpListener, TcpStream};
@@ -11,8 +11,12 @@ use crate::model::{AddCause, Fc, Model, ObjectReference};
 use super::access;
 use super::control::ControlCtx;
 use super::file::FileStore;
+use super::journal::LogManager;
 use super::reporting::ReportManager;
 use super::select::Selections;
+use super::svcb::{SvControlEvent, SvControlHandler, SvcbRegistry};
+use super::tracking::Tracker;
+use super::tx::{ChangeSet, Clock};
 use super::{ConnId, Error, Result, Tx};
 
 /// The associations a server is holding, by id.
@@ -112,6 +116,21 @@ pub struct Options {
     /// The functional constraints clients may write; `None` is SP, SV and SE.
     /// See [`Options::with_writable_fcs`].
     pub writable_fcs: Option<Vec<Fc>>,
+    /// Serves the file store read-only: no SetFile, DeleteFile or
+    /// fileRename.
+    pub file_store_read_only: bool,
+    /// Decides on every association before it is accepted; see
+    /// [`Options::with_authenticator`].
+    pub authenticator: Option<mms::Authenticator>,
+    /// Lets clients delete log entries (MMS InitializeJournal), and reports
+    /// the logs as deletable.
+    pub deletable_logs: bool,
+    /// How many entries each log retains before the oldest are discarded;
+    /// zero keeps [`DEFAULT_LOG_CAPACITY`](super::DEFAULT_LOG_CAPACITY).
+    pub log_capacity: usize,
+    /// The initial quality of the server's clock; see
+    /// [`Server::set_time_quality`].
+    pub time_quality: Option<mms::TimeQuality>,
     /// Enables TLS per IEC 62351-3.
     #[cfg(feature = "tls")]
     pub tls: Option<Arc<tokio_rustls::rustls::ServerConfig>>,
@@ -179,6 +198,65 @@ impl Options {
         self
     }
 
+    /// Serves the file store read-only.
+    #[must_use]
+    pub fn with_read_only_file_store(mut self, root: impl Into<std::path::PathBuf>) -> Options {
+        self.file_store = Some(root.into());
+        self.file_store_read_only = true;
+        self
+    }
+
+    /// Makes the server decide on every association before accepting it: `f`
+    /// is given the client's ACSE password, identities, address and TLS
+    /// certificates. An error refuses the association with an ACSE rejection
+    /// the client is told of: authentication-required for
+    /// [`mms::Error::AuthenticationRequired`], authentication-failure
+    /// otherwise.
+    #[must_use]
+    pub fn with_authenticator(
+        mut self,
+        f: impl Fn(&mms::AssociationRequest) -> mms::Result<()> + Send + Sync + 'static,
+    ) -> Options {
+        self.authenticator = Some(Arc::new(f));
+        self
+    }
+
+    /// Accepts only associations presenting `password` as their ACSE
+    /// authentication value; one without is told authentication is required.
+    /// It is [`with_authenticator`](Options::with_authenticator) with a
+    /// constant-time comparison.
+    #[must_use]
+    pub fn with_password(self, password: impl Into<String>) -> Options {
+        let want = password.into().into_bytes();
+        self.with_authenticator(move |r| match &r.password {
+            None => Err(mms::Error::AuthenticationRequired),
+            Some(p) if p.is_empty() => Err(mms::Error::AuthenticationRequired),
+            Some(p) if constant_time_eq(p.as_bytes(), &want) => Ok(()),
+            Some(_) => Err(mms::Error::protocol("wrong password")),
+        })
+    }
+
+    /// Lets clients delete log entries.
+    #[must_use]
+    pub fn with_deletable_logs(mut self) -> Options {
+        self.deletable_logs = true;
+        self
+    }
+
+    /// Sets how many entries each log retains.
+    #[must_use]
+    pub fn with_log_capacity(mut self, n: usize) -> Options {
+        self.log_capacity = n;
+        self
+    }
+
+    /// Sets the initial quality of the server's clock.
+    #[must_use]
+    pub fn with_time_quality(mut self, q: mms::TimeQuality) -> Options {
+        self.time_quality = Some(q);
+        self
+    }
+
     #[cfg(feature = "tls")]
     #[must_use]
     pub fn with_tls(mut self, cfg: Arc<tokio_rustls::rustls::ServerConfig>) -> Options {
@@ -188,9 +266,30 @@ impl Options {
 }
 
 /// The shared state behind a [`Server`].
+/// Compares two byte strings in time independent of where they differ.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    let mut diff = a.len() ^ b.len();
+    for (i, x) in a.iter().enumerate() {
+        diff |= usize::from(x ^ b.get(i).copied().unwrap_or(0));
+    }
+    diff == 0
+}
+
 pub(crate) struct Inner {
     pub model: RwLock<Model>,
     pub reports: ReportManager,
+    pub logs: LogManager,
+    pub tracker: Tracker,
+    pub svcbs: SvcbRegistry,
+    pub sv_handler: Mutex<Option<SvControlHandler>>,
+    pub sv_queue: Mutex<Vec<SvControlEvent>>,
+    /// Serialises sampled-value control block event delivery.
+    pub sv_deliver: Mutex<()>,
+    pub clock: Arc<Clock>,
+    /// What the Status service answers: logical << 8 | physical.
+    pub status: AtomicU32,
+    pub authenticator: Option<mms::Authenticator>,
+    pub deletable_logs: bool,
     pub conns: Mutex<ConnMap>,
     pub selections: Mutex<Selections>,
     pub controls: RwLock<HashMap<ObjectReference, ControlHandler>>,
@@ -235,6 +334,9 @@ impl Inner {
     /// must not appear and an implemented one must not be missing.
     fn initiate(&self) -> mms::InitiateRequest {
         use mms::service;
+        // The servicesSupported bitmap lists exactly the services the handler
+        // implements: clients gate features on it, so an unimplemented service
+        // must not appear and an implemented one must not be missing.
         let mut services = vec![
             service::GET_NAME_LIST,
             service::IDENTIFY,
@@ -246,15 +348,26 @@ impl Inner {
             service::DELETE_NAMED_VARIABLE_LIST,
             service::INFORMATION_REPORT,
             service::CONCLUDE,
+            service::STATUS,
+            service::CANCEL,
         ];
-        if self.files.is_some() {
+        // Journals are listed and read only when the model has logs.
+        if self.logs.has_logs() {
+            services.extend([service::READ_JOURNAL, service::REPORT_JOURNAL_STATUS]);
+            if self.deletable_logs {
+                services.push(service::INITIALIZE_JOURNAL);
+            }
+        }
+        if let Some(files) = &self.files {
             services.extend([
                 service::FILE_OPEN,
                 service::FILE_READ,
                 service::FILE_CLOSE,
-                service::FILE_DELETE,
                 service::FILE_DIRECTORY,
             ]);
+            if files.is_writable() {
+                services.extend([service::FILE_DELETE, service::OBTAIN_FILE, service::FILE_RENAME]);
+            }
         }
         mms::InitiateRequest {
             services: mms::ServiceSupport::with(&services),
@@ -285,6 +398,51 @@ impl Inner {
             h(&ev);
         }
     }
+
+    /// Reports the changes of an update, a write or a tracked service to the
+    /// report and log control blocks. Called with the model write lock held.
+    pub(crate) fn report_changes(&self, model: &mut Model, changes: &ChangeSet) {
+        if changes.is_empty() {
+            return;
+        }
+        {
+            let conns = self.conns.lock().unwrap();
+            self.reports.on_update(model, &conns, changes);
+        }
+        self.logs.on_update(model, &self.reports, changes);
+    }
+
+    /// The logical and physical status the Status service reports.
+    pub(crate) fn status(&self) -> (i64, i64) {
+        let v = self.status.load(Ordering::Relaxed);
+        (i64::from(v >> 8), i64::from(v & 0xff))
+    }
+
+    /// Queues sampled-value control block changes for
+    /// [`flush_sv`](Inner::flush_sv), in the order they were made.
+    pub(crate) fn queue_sv(&self, evs: Vec<SvControlEvent>) {
+        if !evs.is_empty() {
+            self.sv_queue.lock().unwrap().extend(evs);
+        }
+    }
+
+    /// Delivers the queued changes to the sampled-value handler, one call at a
+    /// time. It must be called without the model lock.
+    pub(crate) fn flush_sv(&self) {
+        let _one = self.sv_deliver.lock().unwrap();
+        loop {
+            let q = std::mem::take(&mut *self.sv_queue.lock().unwrap());
+            if q.is_empty() {
+                return;
+            }
+            let h = self.sv_handler.lock().unwrap().clone();
+            if let Some(h) = h {
+                for ev in &q {
+                    h(ev);
+                }
+            }
+        }
+    }
 }
 
 /// Serves one IED data model over MMS.
@@ -304,26 +462,55 @@ impl Server {
         if identity.model.is_empty() {
             identity.model = model.name.clone();
         }
+        let clock = Arc::new(Clock::default());
+        if let Some(q) = opts.time_quality {
+            clock.set(q);
+        }
         // Setting groups are materialised before the report engine, so an
         // SGCB appears in the model the blocks are built from.
-        let setting_groups = if opts.setting_groups > 0 {
-            super::settinggroup::materialise_sgcbs(&mut model, opts.setting_groups)
-        } else {
-            std::collections::BTreeMap::new()
-        };
+        let setting_groups = super::settinggroup::materialise_sgcbs_with(
+            &mut model,
+            opts.setting_groups,
+            Arc::clone(&clock),
+        );
+        // Publish the GOOSE, sampled-value and log control blocks the model
+        // carries, so a client browsing control blocks finds them.
+        super::cb::materialise_control_blocks(&mut model);
         let reports = ReportManager::new(&mut model, opts.report_buffer_size);
+        // Logs come after the report engine, whose dataset resolution and
+        // EntryID source they share.
+        let logs = LogManager::new(&model, opts.log_capacity);
+        let svcbs = SvcbRegistry::build(&model);
+        let tracker = Tracker::build(&model);
+        let files = opts.file_store.map(|root| {
+            if opts.file_store_read_only {
+                FileStore::read_only(root)
+            } else {
+                FileStore::new(root)
+            }
+        });
 
         let server = Server {
             inner: Arc::new(Inner {
                 model: RwLock::new(model),
                 reports,
+                logs,
+                tracker,
+                svcbs,
+                sv_handler: Mutex::new(None),
+                sv_queue: Mutex::new(Vec::new()),
+                sv_deliver: Mutex::new(()),
+                clock,
+                status: AtomicU32::new(0),
+                authenticator: opts.authenticator,
+                deletable_logs: opts.deletable_logs,
                 conns: Mutex::new(HashMap::new()),
                 selections: Mutex::new(Selections::default()),
                 controls: RwLock::new(HashMap::new()),
                 write_handler: RwLock::new(None),
                 conn_handler: Mutex::new(None),
                 identity,
-                files: opts.file_store.map(FileStore::new),
+                files,
                 setting_groups,
                 writable: writable_fcs(
                     opts.writable_fcs
@@ -341,7 +528,50 @@ impl Server {
             .inner
             .reports
             .set_owner(Arc::downgrade(&server.inner));
+        {
+            let model = server.inner.model.read().unwrap();
+            server.inner.logs.start(Arc::downgrade(&server.inner), &model);
+        }
         server
+    }
+
+    /// States the quality of the server's clock: whether leap seconds are
+    /// known, whether the clock has failed or lost synchronisation, and how
+    /// many bits of the fraction are accurate.
+    ///
+    /// Every time the server stamps from then on carries it
+    /// ([`Tx::set_timestamp_now`], [`Tx::now`], a setting group's `LActTm`, a
+    /// tracking object's `t`), so a device whose time source is lost can say
+    /// so rather than serve times that look synchronised. It is safe to call
+    /// while serving. Until it is called the server uses
+    /// [`mms::TimeQuality::DEFAULT`].
+    pub fn set_time_quality(&self, q: mms::TimeQuality) {
+        self.inner.clock.set(q);
+    }
+
+    /// Returns the quality the server stamps its times with.
+    pub fn time_quality(&self) -> mms::TimeQuality {
+        self.inner.clock.quality()
+    }
+
+    /// Sets what the Status service reports: the logical and physical status
+    /// of the device ([`mms::logical`] and [`mms::physical`] values; state
+    /// changes allowed and operational until it is called). Safe while
+    /// serving.
+    pub fn set_status(&self, logical: i64, physical: i64) {
+        let v = ((logical as u32 & 0xffffff) << 8) | (physical as u32 & 0xff);
+        self.inner.status.store(v, Ordering::Relaxed);
+    }
+
+    /// Registers a handler called after a client changes `SvEna` or `Resv` of
+    /// a sampled-value control block, and when a USVCB is released because
+    /// its association ended.
+    ///
+    /// It runs outside the model lock, one call at a time and in the order the
+    /// changes were made; it must not block. Registering a second handler
+    /// replaces the first.
+    pub fn on_sv_control(&self, h: impl Fn(&SvControlEvent) + Send + Sync + 'static) {
+        *self.inner.sv_handler.lock().unwrap() = Some(Arc::new(h));
     }
 
     /// Registers a handler consulted before applying a client write.
@@ -415,7 +645,7 @@ impl Server {
     /// This is what the in-memory tests use, and the entry point for callers
     /// that bring their own transport.
     pub async fn serve_stream(&self, stream: BoxTransport, peer: Option<SocketAddr>) {
-        self.serve_transport(stream, peer).await;
+        self.serve_transport(stream, peer, Vec::new()).await;
     }
 
     async fn serve_conn(&self, stream: TcpStream, peer: SocketAddr) {
@@ -423,26 +653,41 @@ impl Server {
         let _ = stream.set_nodelay(true);
 
         #[cfg(feature = "tls")]
-        let transport: BoxTransport = match &self.inner.tls {
+        let (transport, certs): (BoxTransport, Vec<Vec<u8>>) = match &self.inner.tls {
             Some(cfg) => {
                 let acceptor = tokio_rustls::TlsAcceptor::from(Arc::clone(cfg));
                 match acceptor.accept(stream).await {
-                    Ok(s) => Box::new(s),
+                    Ok(s) => {
+                        // The chain the TLS configuration verified, for the
+                        // authenticator.
+                        let certs = s
+                            .get_ref()
+                            .1
+                            .peer_certificates()
+                            .map(|c| c.iter().map(|c| c.as_ref().to_vec()).collect())
+                            .unwrap_or_default();
+                        (Box::new(s), certs)
+                    }
                     Err(e) => {
                         tracing::warn!(%peer, error = %e, "server: TLS handshake failed");
                         return;
                     }
                 }
             }
-            None => Box::new(stream),
+            None => (Box::new(stream), Vec::new()),
         };
         #[cfg(not(feature = "tls"))]
-        let transport: BoxTransport = Box::new(stream);
+        let (transport, certs): (BoxTransport, Vec<Vec<u8>>) = (Box::new(stream), Vec::new());
 
-        self.serve_transport(transport, Some(peer)).await;
+        self.serve_transport(transport, Some(peer), certs).await;
     }
 
-    async fn serve_transport(&self, stream: BoxTransport, peer: Option<SocketAddr>) {
+    async fn serve_transport(
+        &self,
+        stream: BoxTransport,
+        peer: Option<SocketAddr>,
+        peer_certificates: Vec<Vec<u8>>,
+    ) {
         let inner = &self.inner;
 
         // The slot is taken before the handshake, so a flood of half-open
@@ -461,6 +706,8 @@ impl Server {
 
         let accept = mms::AcceptOptions {
             initiate: Some(inner.initiate()),
+            authenticate: inner.authenticator.clone(),
+            peer_certificates,
             ..Default::default()
         };
         let sc = match mms::accept_conn_opts(stream, peer, &accept).await {
@@ -486,23 +733,24 @@ impl Server {
             conn: Some(id),
         });
 
-        let handler = super::handler::Handler {
-            inner: Arc::clone(inner),
-            conn: id,
-            changes: Default::default(),
-        };
+        let handler = super::handler::Handler::new(Arc::clone(inner), id, peer);
         if let Err(e) = sc.serve(&handler).await {
             tracing::debug!(?peer, %id, error = %e, "server: association ended");
         }
 
         // Everything the association held goes with it: its reservations, its
         // report subscriptions and its slot.
-        {
+        let sv_events = {
             let mut model = inner.model.write().unwrap();
-            let mut conns = inner.conns.lock().unwrap();
-            conns.remove(&id);
-            inner.reports.disable_conn(&mut model, &conns, id);
-        }
+            {
+                let mut conns = inner.conns.lock().unwrap();
+                conns.remove(&id);
+                inner.reports.disable_conn(&mut model, &conns, id);
+            }
+            inner.svcbs.release_conn(&mut model, id)
+        };
+        inner.queue_sv(sv_events);
+        inner.flush_sv();
         let open = inner.release_slot();
         inner.selections.lock().unwrap().release_conn(id);
         let _ = sc.close().await;
@@ -512,6 +760,20 @@ impl Server {
             open,
             conn: Some(id),
         });
+    }
+
+    /// Ends the association `conn` abruptly (ACSE A-ABORT), as for a client
+    /// the application no longer trusts. It returns false when no such
+    /// association is open. Its reservations go as when it ends any other way.
+    pub async fn abort(&self, conn: ConnId) -> bool {
+        let sc = self.inner.conns.lock().unwrap().get(&conn).cloned();
+        match sc {
+            Some(sc) => {
+                let _ = sc.abort().await;
+                true
+            }
+            None => false,
+        }
     }
 
     /// Returns how many client connections the server is holding, counting
@@ -528,6 +790,7 @@ impl Server {
     /// Closes every open association and stops the report engine.
     pub async fn close(&self) -> Result<()> {
         self.inner.reports.shutdown();
+        self.inner.logs.close();
         let conns: Vec<Arc<mms::ServerConn>> =
             self.inner.conns.lock().unwrap().values().cloned().collect();
         for sc in conns {
@@ -550,12 +813,11 @@ impl Server {
         let inner = &self.inner;
         let mut model = inner.model.write().unwrap();
         let (out, changed) = {
-            let mut tx = Tx::new(&mut model);
+            let mut tx = Tx::with_clock(&mut model, Arc::clone(&inner.clock));
             let out = f(&mut tx);
             (out, std::mem::take(&mut tx.changed))
         };
-        let conns = inner.conns.lock().unwrap();
-        inner.reports.on_update(&mut model, &conns, &changed);
+        inner.report_changes(&mut model, &changed);
         out
     }
 
@@ -624,6 +886,7 @@ mod tests {
         let m = Model {
             name: "ied1".into(),
             devices: vec![],
+            ..Default::default()
         };
         let s = Server::new(m, Options::new());
         assert_eq!(s.identity().model, "ied1", "the model name fills in");

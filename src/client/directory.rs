@@ -234,9 +234,7 @@ impl Client {
                 if parts.len() < 3 || parts[0].is_empty() || parts[2].is_empty() {
                     continue;
                 }
-                let Ok(fc) = parts[1].parse::<Fc>() else {
-                    continue;
-                };
+                let fc = crate::model::parse_fc_lenient(parts[1]);
                 let (ln, name) = (parts[0], parts[2]);
                 for class in classes {
                     // The classes are disjoint, so the first match is the only
@@ -324,9 +322,7 @@ impl Client {
             if parts.len() < 3 || parts[0] != ln_name {
                 continue;
             }
-            let Ok(efc) = parts[1].parse::<Fc>() else {
-                continue;
-            };
+            let efc = crate::model::parse_fc_lenient(parts[1]);
             if fc != Fc::All && fc != Fc::None && efc != fc {
                 continue;
             }
@@ -356,9 +352,7 @@ fn objects_of_class(names: &[String], ln: &str, class: AcsiClass) -> Vec<String>
         if parts.len() < 3 || parts[0] != ln {
             continue;
         }
-        let Ok(fc) = parts[1].parse::<Fc>() else {
-            continue;
-        };
+        let fc = crate::model::parse_fc_lenient(parts[1]);
         let name = parts[2];
         if name.is_empty() || !class.holds(fc, name) || out.iter().any(|e| e == name) {
             continue;
@@ -510,9 +504,7 @@ mod tests {
             if parts.len() < 3 {
                 continue;
             }
-            let Ok(fc) = parts[1].parse::<Fc>() else {
-                continue;
-            };
+            let fc = crate::model::parse_fc_lenient(parts[1]);
             let matches: Vec<AcsiClass> = AcsiClass::ALL
                 .into_iter()
                 .filter(|c| {

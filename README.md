@@ -2,10 +2,14 @@
 
 A pure-Rust implementation of the IEC 61850 protocol family:
 
-- **MMS client and server** (IEC 61850-8-1 over TPKT/COTP/Session/Presentation/ACSE)
+- **MMS client and server** (IEC 61850-8-1 over TPKT/COTP/Session/Presentation/ACSE),
+  Edition 2.1: logs, service tracking, GOOSE/SV/log control blocks, file
+  services, authentication
 - **GOOSE** publisher and subscriber (raw Ethernet, Linux AF_PACKET)
-- **Sampled Values** (IEC 61850-9-2 / 9-2LE) publisher and subscriber
-- **SCL** (ICD/CID/SCD) parsing and runtime model instantiation
+- **Sampled Values** (IEC 61850-9-2 / 9-2LE, Amendment 1) publisher and subscriber
+- **R-GOOSE and R-SV** over UDP (IEC 61850-90-5), signed or encrypted
+- **IEC 62351-3** TLS profile for MMS, and **IEC 62351-9** GDOI key distribution
+- **SCL** (ICD/CID/SCD, Edition 1 to 2.1) parsing and runtime model instantiation
 
 No C bindings, no `unsafe` outside the AF_PACKET socket calls, async on tokio.
 Source-available under a non-commercial licence; see [LICENSE](LICENSE).
@@ -62,7 +66,11 @@ server.listen_and_serve("0.0.0.0:102").await?;
 | `scl` | SCL parsing and model instantiation |
 | `model` | The IEC 61850 object model, functional constraints, `Quality`/`Timestamp`, the 7-3 common data classes |
 | `mms` | Low-level MMS (ISO 9506) values, codecs, and the client and server connections |
+| `rsession` | R-GOOSE/R-SV session protocol (IEC 61850-90-5) over UDP, an `ethernet::Interface` |
+| `iec62351` | The IEC 62351-3 TLS profile for MMS (feature `tls`) |
+| `gdoi` | IEC 62351-9 group key distribution: key server and members (feature `gdoi`) |
 | `ethernet` | Raw layer-2 access, AF_PACKET and an in-memory `pipe()` |
+| `x509` | The few certificate fields the security layers read themselves |
 | `asn1` | The minimal BER runtime every codec is built on |
 
 ## Documentation
@@ -99,36 +107,44 @@ form. `?` lists the keys; the mouse works for tabs, rows and the wheel.
 
 ## Interoperability
 
-`interop/run.sh` runs this crate's client and server against an independent
-implementation in both directions, plus the reference against itself as a
-control:
+Three harnesses run this crate against independent implementations, both ways.
 
-```sh
-GO_IEC61850=/path/to/go-iec61850 interop/run.sh
+**libiec61850** (`interop/libiec.sh`, 18 tests): this crate's client against
+libiec61850's basic I/O, control, logging and file servers; libiec61850's
+`client_example1`, log client, `mms_utility` and a driver of its client
+(authentication, Status, SetFile, fileRename, DeleteFile, abort, sampled-value
+control blocks) against this crate's server; R-GOOSE and R-SV both ways in each
+key mode libiec61850 implements; MMS over TLS both ways; its 9-2LE sampled-value
+control block and stream; and its service tracking server compared with this
+one attribute by attribute. All pass.
+
+**go-iec61850, MMS** (`interop/run.sh`): the clients and servers against each
+other, with the reference against itself as a control run. A failure the
+reference also has against its own server is reported as `KNOWN`:
+
 ```
-
-The control run is what makes the result readable: a failure the reference
-also has against its own server is reported as `KNOWN` and does not fail the
-harness, because it is a property of the reference rather than a defect here.
-
-Current status against `go-iec61850`:
-
-```
-PASS   rust client -> rust server   27 passed, 0 failed, 2 skipped
-PASS   rust client -> go server     27 passed, 0 failed, 2 skipped
+PASS   rust client -> rust server   26 passed, 0 failed, 3 skipped
+PASS   rust client -> go server     26 passed, 0 failed, 3 skipped
 KNOWN  go client   -> rust server   (File directory)
 KNOWN  go client   -> go server     (File directory)
 ```
 
 The `File directory` failure is the reference client reading the first
 directory listing entry without checking whether it is a directory; it fails
-identically against its own server. This crate's server marks directories with
-a trailing `/`, which the reference server omits, and answers an attempt to
-open one with `object-access-unsupported` rather than `object-non-existent`, so
-a client can tell the two mistakes apart.
+identically against its own server.
 
-A peer that is not present is skipped, so the harness stays useful without a Go
-toolchain.
+**go-iec61850, security** (`interop/go-security.sh`, 8 tests): R-GOOSE and
+R-SV in every key mode both ways, GDOI registrations with pre-shared keys and
+certificates in both directions, and MMS over TLS both ways. All pass.
+
+```sh
+GO_IEC61850=/path/to/go-iec61850 interop/run.sh
+GO_IEC61850=/path/to/go-iec61850 interop/go-security.sh
+GO_IEC61850=/path/to/go-iec61850 interop/libiec.sh   # builds libiec61850 with its harness
+```
+
+A peer that is not present is skipped, so the harnesses stay useful without a
+Go or C toolchain.
 
 ## Status
 
@@ -136,8 +152,12 @@ Implemented: MMS client/server, browse, read/write, datasets (configured and
 dynamic), reporting (URCB and buffered BRCB with EntryID resync, general
 interrogation, integrity and data-change), control (all four models:
 direct/SBO, normal/enhanced), setting groups, file services (directory and
-streamed read), log queries, GOOSE and SV publish/subscribe, SCL parsing, and
-TLS transport behind the `tls` feature.
+streamed read, SetFile, rename, delete), logs (log control blocks, journals,
+queries, status and clearing), service tracking (LTRK), GOOSE, GSSE and
+sampled-value control blocks, ACSE authentication, MMS Status, Cancel and
+abort, GOOSE and SV publish/subscribe over Ethernet or UDP (R-GOOSE/R-SV),
+SCL parsing, the IEC 62351-3 TLS profile (feature `tls`) and GDOI key
+distribution (feature `gdoi`).
 
 The API may change before 1.0.
 
@@ -154,9 +174,11 @@ library API for that.
 
 ```sh
 cargo test                          # unit, codec and in-process end-to-end tests
-cargo test --features tui           # and the terminal UI
-cargo clippy --all-targets --features tui
-interop/run.sh                      # against an independent implementation
+cargo test --all-features           # and TLS, GDOI and the terminal UI
+cargo clippy --all-targets --all-features
+interop/run.sh                      # against independent implementations
+interop/go-security.sh
+interop/libiec.sh
 ```
 
 The suite covers the codecs by round trip, the protocol layers against

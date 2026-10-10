@@ -1,6 +1,7 @@
 //! Dispatches MMS confirmed requests against the model.
 
-use std::sync::{Arc, Mutex, Weak};
+use std::net::{IpAddr, SocketAddr};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::asn1::{
@@ -8,17 +9,20 @@ use crate::asn1::{
     Element, TAG_GRAPHIC_STRING, TAG_SEQUENCE, TAG_VISIBLE_STRING,
 };
 use crate::mms::{self, data_element, DataAccessError, Value};
-use crate::model::{self, AddCause, CtlModel, Fcda, ObjectReference};
+use crate::model::{self, AddCause, CtlModel, Fcda, ServiceErrorCode, ServiceType};
 
 use super::control::{self, Phase};
-use super::select::SELECT_TIMEOUT;
 use super::rcb;
 use super::reporting;
+use super::select::SELECT_TIMEOUT;
 use super::server::Inner;
+use super::svcb::SvControlEvent;
+use super::tracking::{service_error_of, termination_error};
 use super::tx::{self, ChangeSet};
 use super::{access, ConnId};
 
 /// MMS confirmed service CHOICE tag numbers.
+pub(crate) const SVC_STATUS: u32 = 0;
 const SVC_GET_NAME_LIST: u32 = 1;
 const SVC_IDENTIFY: u32 = 2;
 const SVC_READ: u32 = 4;
@@ -27,10 +31,15 @@ const SVC_GET_VARIABLE_ACCESS: u32 = 6;
 const SVC_DEFINE_NAMED_VAR_LIST: u32 = 11;
 const SVC_GET_NAMED_VAR_LIST_ATTR: u32 = 12;
 const SVC_DELETE_NAMED_VAR_LIST: u32 = 13;
-const SVC_FILE_OPEN: u32 = 72;
-const SVC_FILE_READ: u32 = 73;
-const SVC_FILE_CLOSE: u32 = 74;
-const SVC_FILE_DELETE: u32 = 76;
+pub(crate) const SVC_OBTAIN_FILE: u32 = 46;
+const SVC_READ_JOURNAL: u32 = 65;
+pub(crate) const SVC_INITIALIZE_JOURNAL: u32 = 67;
+pub(crate) const SVC_REPORT_JOURNAL_STATUS: u32 = 68;
+pub(crate) const SVC_FILE_OPEN: u32 = 72;
+pub(crate) const SVC_FILE_READ: u32 = 73;
+pub(crate) const SVC_FILE_CLOSE: u32 = 74;
+pub(crate) const SVC_FILE_RENAME: u32 = 75;
+pub(crate) const SVC_FILE_DELETE: u32 = 76;
 const SVC_FILE_DIRECTORY: u32 = 77;
 
 /// The octets a paged response spends around its entries: the confirmed
@@ -43,7 +52,10 @@ const PAGE_ENVELOPE: usize = 32;
 ///
 /// A page always carries at least one element, or a client could never make
 /// progress.
-fn fill_page(elements: impl IntoIterator<Item = Element>, max_pdu: usize) -> (Vec<Element>, bool) {
+pub(crate) fn fill_page(
+    elements: impl IntoIterator<Item = Element>,
+    max_pdu: usize,
+) -> (Vec<Element>, bool) {
     let budget = max_pdu.saturating_sub(PAGE_ENVELOPE);
     let (mut page, mut used) = (Vec::new(), 0);
     for el in elements {
@@ -56,13 +68,26 @@ fn fill_page(elements: impl IntoIterator<Item = Element>, max_pdu: usize) -> (Ve
     (page, false)
 }
 
+/// A select by reading SBO, tracked once the read is answered.
+#[derive(Debug, Clone)]
+struct PendingSelect {
+    reference: model::ObjectReference,
+    err: ServiceErrorCode,
+}
+
 /// Serves one association's requests against the shared server state.
 pub struct Handler {
     pub inner: Arc<Inner>,
     pub conn: ConnId,
+    /// The client's transport address, which report control block
+    /// reservations are checked against.
+    pub peer: Option<SocketAddr>,
     /// What the write request in progress changed in the process image,
     /// reported once its writes are all applied.
     pub(crate) changes: Mutex<ChangeSet>,
+    /// The tracking a read request owes (a select by reading SBO), applied
+    /// once its read lock is released.
+    read_tracking: Mutex<Vec<PendingSelect>>,
 }
 
 impl std::fmt::Debug for Handler {
@@ -72,6 +97,12 @@ impl std::fmt::Debug for Handler {
 }
 
 impl mms::Handler for Handler {
+    fn is_deferred(&self, req: &mms::Request) -> bool {
+        // SetFile reads the file from the client while the association goes
+        // on serving, so it is answered later.
+        req.service == SVC_OBTAIN_FILE
+    }
+
     async fn handle(
         &self,
         req: mms::Request,
@@ -91,8 +122,16 @@ impl mms::Handler for Handler {
             SVC_GET_NAMED_VAR_LIST_ATTR => self.get_nvl_attrs(&req.content),
             SVC_DEFINE_NAMED_VAR_LIST => self.define_nvl(&req.content),
             SVC_DELETE_NAMED_VAR_LIST => self.delete_nvl(&req.content),
-            SVC_FILE_OPEN | SVC_FILE_READ | SVC_FILE_CLOSE | SVC_FILE_DELETE
-            | SVC_FILE_DIRECTORY => self.file_service(req.service, &req.content, conn.max_pdu),
+            SVC_STATUS => Ok(self.server_status()),
+            SVC_READ_JOURNAL => self.read_journal(&req.content, conn.max_pdu),
+            SVC_REPORT_JOURNAL_STATUS => self.report_journal_status(&req.content),
+            SVC_INITIALIZE_JOURNAL => self.initialize_journal(&req.content),
+            SVC_FILE_DELETE => self.file_delete(&req.content),
+            SVC_FILE_RENAME => self.file_rename(&req.content),
+            SVC_OBTAIN_FILE => self.obtain_file(&req.content, conn).await,
+            SVC_FILE_OPEN | SVC_FILE_READ | SVC_FILE_CLOSE | SVC_FILE_DIRECTORY => {
+                self.file_service(req.service, &req.content, conn.max_pdu)
+            }
             _ => Err(mms::Error::Service(mms::ServiceError {
                 class: mms::ErrorClass(1),
                 code: 1, // unrecognized-service
@@ -104,6 +143,23 @@ impl mms::Handler for Handler {
 }
 
 impl Handler {
+    pub(crate) fn new(inner: Arc<Inner>, conn: ConnId, peer: Option<SocketAddr>) -> Handler {
+        Handler {
+            inner,
+            conn,
+            peer,
+            changes: Mutex::default(),
+            read_tracking: Mutex::default(),
+        }
+    }
+
+    fn peer_ip(&self) -> Option<IpAddr> {
+        self.peer.map(|p| match p.ip() {
+            IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4),
+            ip => ip,
+        })
+    }
+
     fn identity(&self) -> Element {
         let id = &self.inner.identity;
         cons(
@@ -140,7 +196,10 @@ impl Handler {
             None => String::new(),
         };
 
-        let mut names = {
+        let mut names = if class == 8 {
+            // journal (log)
+            self.inner.logs.names(&domain)
+        } else {
             let model = self.inner.model.read().unwrap();
             enumerate(&model, class, &domain)
         };
@@ -165,6 +224,12 @@ impl Handler {
     }
 
     fn read(&self, content: &[u8]) -> mms::Result<Element> {
+        let res = self.read_inner(content);
+        self.flush_read_tracking();
+        res
+    }
+
+    fn read_inner(&self, content: &[u8]) -> mms::Result<Element> {
         let mut dec = Decoder::new(content);
         // An optional specificationWithResult [0] BOOLEAN precedes the access
         // specification; some clients set it when reading datasets.
@@ -206,6 +271,31 @@ impl Handler {
         ))
     }
 
+    /// Applies the tracking a read request queued, under the write lock, and
+    /// reports what it changed.
+    fn flush_read_tracking(&self) {
+        let pending = std::mem::take(&mut *self.read_tracking.lock().unwrap());
+        if pending.is_empty() {
+            return;
+        }
+        let mut model = self.inner.model.write().unwrap();
+        let mut cs = ChangeSet::new();
+        for p in pending {
+            self.inner.tracker.track_control(
+                &mut model,
+                &mut cs,
+                &p.reference,
+                ServiceType::SELECT,
+                p.err,
+                None,
+                None,
+                AddCause::NONE,
+                self.inner.clock.now(),
+            );
+        }
+        self.inner.report_changes(&mut model, &cs);
+    }
+
     fn read_one(&self, domain: &str, item: &str) -> Element {
         // Reading an SBO attribute performs the select of a normal-security
         // control: the reservation is taken here, and the object reference
@@ -221,23 +311,38 @@ impl Handler {
             };
             // Only an SBO-with-normal-security object is selected by reading
             // SBO; an empty name tells the client the select failed.
-            if declared.is_some_and(|cm| cm != CtlModel::SboNormal) {
-                return data_element(&Value::visible_string(""))
-                    .unwrap_or_else(|| access_failure(DataAccessError::ObjectNonExistent));
-            }
-            let timeout = if sbo_timeout.is_zero() {
-                SELECT_TIMEOUT
+            let name = if declared.is_some_and(|cm| cm != CtlModel::SboNormal) {
+                String::new()
             } else {
-                sbo_timeout
+                let timeout = if sbo_timeout.is_zero() {
+                    SELECT_TIMEOUT
+                } else {
+                    sbo_timeout
+                };
+                let taken = self.inner.selections.lock().unwrap().reserve(
+                    &reference,
+                    self.conn,
+                    None,
+                    timeout,
+                    Instant::now(),
+                );
+                if taken {
+                    reference.to_string()
+                } else {
+                    String::new()
+                }
             };
-            let taken = self.inner.selections.lock().unwrap().reserve(
-                &reference,
-                self.conn,
-                None,
-                timeout,
-                Instant::now(),
-            );
-            let name = if taken { reference.to_string() } else { String::new() };
+            let err = if !name.is_empty() {
+                ServiceErrorCode::NO_ERROR
+            } else if declared.is_some_and(|cm| cm != CtlModel::SboNormal) {
+                ServiceErrorCode::ACCESS_VIOLATION
+            } else {
+                ServiceErrorCode::INSTANCE_IN_USE
+            };
+            self.read_tracking
+                .lock()
+                .unwrap()
+                .push(PendingSelect { reference, err });
             return data_element(&Value::visible_string(name))
                 .unwrap_or_else(|| access_failure(DataAccessError::ObjectNonExistent));
         }
@@ -249,10 +354,10 @@ impl Handler {
         let Some(ln) = item.split('$').next().and_then(|n| ld.node(n)) else {
             return access_failure(DataAccessError::ObjectNonExistent);
         };
-        match access::resolve_read(ln, item) {
-            Some(v) => data_element(&v)
-                .unwrap_or_else(|| access_failure(DataAccessError::ObjectNonExistent)),
-            None => access_failure(DataAccessError::ObjectNonExistent),
+        match access::resolve_read_err(ln, item) {
+            Ok(v) => data_element(&v)
+                .unwrap_or_else(|| access_failure(DataAccessError::TypeInconsistent)),
+            Err(code) => access_failure(code),
         }
     }
 
@@ -276,13 +381,19 @@ impl Handler {
             values.push(mms::decode_data(&mut dd)?);
         }
 
+        let mut sv_events = Vec::new();
         let mut results: Vec<Element> = Vec::with_capacity(values.len());
         for (i, v) in values.iter().enumerate() {
             let Some(Some((domain, item))) = targets.get(i).cloned() else {
                 results.push(write_failure(DataAccessError::ObjectNonExistent));
                 continue;
             };
-            match self.write_one(&domain, &item, v) {
+            let res = if control::split_control(&item).is_some() {
+                self.control_write(&domain, &item, v)
+            } else {
+                self.write_one(&domain, &item, v, &mut sv_events)
+            };
+            match res {
                 Ok(()) => results.push(prim(context_primitive(1), Vec::new())), // success [1] NULL
                 Err(code) => results.push(write_failure(code)),
             }
@@ -294,27 +405,102 @@ impl Handler {
         let changes = std::mem::take(&mut *self.changes.lock().unwrap());
         if !changes.is_empty() {
             let mut model = self.inner.model.write().unwrap();
-            let conns = self.inner.conns.lock().unwrap();
-            self.inner.reports.on_update(&mut model, &conns, &changes);
+            self.inner.report_changes(&mut model, &changes);
         }
+        // Sampled-value control block changes are delivered outside the model
+        // lock.
+        self.inner.queue_sv(sv_events);
+        self.inner.flush_sv();
         Ok(cons(context_constructed(SVC_WRITE), results))
     }
 
-    /// Applies one write, including the control, report and setting-group side
-    /// effects it may carry.
+    /// Applies one write, including the report, log, sampled-value and
+    /// setting-group control block side effects it may carry, and tracks a
+    /// control block write.
     fn write_one(
         &self,
         domain: &str,
         item: &str,
         v: &Value,
+        sv_events: &mut Vec<SvControlEvent>,
     ) -> std::result::Result<(), DataAccessError> {
-        // Control writes are not ordinary attribute writes: they run a state
-        // machine and never land in the model directly.
-        if control::split_control(item).is_some() {
-            return self.control_write(domain, item, v);
-        }
+        let inner = &self.inner;
+        let ip = self.peer_ip();
+        let mut model = inner.model.write().unwrap();
+        let rcb_attr = rcb::rcb_key(domain, item).map(|(_, attr)| attr);
+        let sg_attr = super::settinggroup::is_sgcb_write(item)
+            .filter(|_| inner.setting_groups.contains_key(domain));
+        let lcb = inner.logs.lcb_key(domain, item);
+        let svcb = inner.svcbs.key(domain, item);
+        let control_block = rcb_attr.is_some() || sg_attr.is_some() || lcb.is_some() || svcb.is_some();
 
-        let mut model = self.inner.model.write().unwrap();
+        // Control blocks are validated by their own rules before anything is
+        // stored: a refused write must leave the block as it was.
+        let mut res = if let Some(attr) = &rcb_attr {
+            inner
+                .reports
+                .check_rcb_write(&model, domain, item, attr, v, self.conn, ip)
+        } else if let Some(attr) = sg_attr {
+            inner.setting_groups[domain].check_write(attr, v)
+        } else if let Some((key, attr)) = &lcb {
+            inner.logs.check_lcb_write(&model, key, attr, v)
+        } else if let Some((key, attr)) = &svcb {
+            inner.svcbs.check_write(&model, key, attr, v, self.conn)
+        } else {
+            Ok(())
+        };
+        let sv_old = svcb
+            .as_ref()
+            .filter(|_| res.is_ok())
+            .map(|(key, attr)| inner.svcbs.before(&model, key, attr));
+        if res.is_ok() {
+            res = self.store(&mut model, domain, item, v, control_block);
+        }
+        if res.is_ok() {
+            if let Some(attr) = &rcb_attr {
+                // RptEna, GI, PurgeBuf, EntryID, DatSet, Resv, ResvTms.
+                let conns = inner.conns.lock().unwrap();
+                inner
+                    .reports
+                    .on_rcb_write(&mut model, &conns, domain, item, attr, v, self.conn, ip);
+            } else if let Some(attr) = sg_attr {
+                // ActSG, EditSG, CnfEdit.
+                if let Some(mgr) = inner.setting_groups.get(domain) {
+                    mgr.on_sgcb_write(&mut model, attr, v);
+                }
+            } else if let Some((key, attr)) = &lcb {
+                // LogEna.
+                inner.logs.on_lcb_write(&model, key, attr);
+            } else if let (Some((key, attr)), Some(old)) = (&svcb, sv_old) {
+                // SvEna, Resv.
+                sv_events.extend(inner.svcbs.on_write(&model, key, attr, old, self.conn));
+            }
+        }
+        // A GoCB is served read-only, so the write policy refuses it, but the
+        // refusal is still a SetGoCBValues to track.
+        let gocb = item.split('$').nth(1) == Some("GO");
+        if control_block || gocb {
+            let now = inner.clock.now();
+            let mut changes = self.changes.lock().unwrap();
+            inner
+                .tracker
+                .track_cb_write(&mut model, &mut changes, domain, item, v, res, now);
+        }
+        res
+    }
+
+    /// Stores a write in the model, after the write policy, the type check
+    /// and the write hook admit it. `control_block` is set for a control
+    /// block attribute, which its own rules have already admitted and the
+    /// functional-constraint write policy does not govern.
+    fn store(
+        &self,
+        model: &mut model::Model,
+        domain: &str,
+        item: &str,
+        v: &Value,
+        control_block: bool,
+    ) -> std::result::Result<(), DataAccessError> {
         let Some(ld) = model.device_mut(domain) else {
             return Err(DataAccessError::ObjectNonExistent);
         };
@@ -324,77 +510,29 @@ impl Handler {
         let Some(da) = access::resolve_write(ln, item) else {
             return Err(DataAccessError::ObjectAccessUnsupported);
         };
-
-        // Report and setting group control block attributes have their own
-        // rules; everything else is governed by the functional-constraint
-        // write policy.
-        let sgcb = super::settinggroup::is_sgcb_write(item)
-            .filter(|_| self.inner.setting_groups.contains_key(domain));
-        let control_block = rcb::rcb_key(domain, item).is_some() || sgcb.is_some();
         if !control_block {
             self.write_permitted(domain, da.fc)?;
         }
         if !value_fits(da, v) {
             return Err(DataAccessError::TypeInconsistent);
         }
-        // A control block's own rules run before anything is stored: a refused
-        // write must leave the block as it was.
-        if let Some(attr) = sgcb {
-            self.inner.setting_groups[domain].check_write(attr, v)?;
-        }
-        let rcb_attr = rcb::rcb_key(domain, item).map(|(_, attr)| attr);
-
         // The access hook sees the attribute and the proposed value, and its
         // refusal is what the client is told.
         let hook = self.inner.write_handler.read().unwrap().clone();
         if let Some(h) = hook {
             h(da, v)?;
         }
-        let (fc, trg) = (da.fc, da.trg_ops);
-        // A report control block's rules need the model as a whole, so the
-        // attribute is looked up again once they have run.
-        if let Some(attr) = &rcb_attr {
-            self.inner
-                .reports
-                .check_rcb_write(&model, domain, item, attr, v, self.conn)?;
-        }
-        let da = model
-            .device_mut(domain)
-            .and_then(|ld| item.split('$').next().and_then(|n| ld.node_mut(n)))
-            .and_then(|ln| access::resolve_write(ln, item))
-            .ok_or(DataAccessError::ObjectAccessUnsupported)?;
         let old = da.value.replace(v.clone());
         if !control_block {
             let (reference, _) = model::from_mms(domain, item);
             tx::record(
                 &mut self.changes.lock().unwrap(),
                 reference,
-                fc,
-                trg,
+                da.fc,
+                da.trg_ops,
                 old.as_ref(),
                 v,
             );
-        }
-
-        // Report control block side effects: reservation, enabling, general
-        // interrogation, resync, purge and a dataset change.
-        if let Some(attr) = rcb_attr {
-            let conns = self.inner.conns.lock().unwrap();
-            self.inner.reports.on_rcb_write(
-                &mut model,
-                &conns,
-                domain,
-                item,
-                &attr,
-                v,
-                self.conn,
-            );
-        }
-        // Setting group control block side effects.
-        if let Some(attr) = super::settinggroup::is_sgcb_write(item) {
-            if let Some(mgr) = self.inner.setting_groups.get(domain) {
-                mgr.on_sgcb_write(&mut model, attr, v);
-            }
         }
         Ok(())
     }
@@ -423,6 +561,36 @@ impl Handler {
         Ok(())
     }
 
+    /// Tracks a control service, recording the change with the request's.
+    // A tracked control has this many independent facts.
+    #[allow(clippy::too_many_arguments)]
+    fn track_control(
+        &self,
+        reference: &model::ObjectReference,
+        svc: ServiceType,
+        err: ServiceErrorCode,
+        ctx: &control::ControlCtx,
+        oper: &Value,
+        cause: AddCause,
+    ) {
+        if self.inner.tracker.is_empty() {
+            return;
+        }
+        let mut model = self.inner.model.write().unwrap();
+        let mut changes = self.changes.lock().unwrap();
+        self.inner.tracker.track_control(
+            &mut model,
+            &mut changes,
+            reference,
+            svc,
+            err,
+            Some(ctx),
+            Some(oper),
+            cause,
+            self.inner.clock.now(),
+        );
+    }
+
     /// Handles a write to a control attribute.
     ///
     /// A refused command is answered negatively and, ahead of that answer,
@@ -448,6 +616,11 @@ impl Handler {
         if !item.ends_with(&format!("${phase_name}")) || v.type_of() != mms::Type::Structure {
             return Err(DataAccessError::TypeInconsistent);
         }
+        let svc = match phase {
+            Phase::Sbow => ServiceType::SELECT_WITH_VALUE,
+            Phase::Cancel => ServiceType::CANCEL,
+            _ => ServiceType::OPERATE,
+        };
         let reference = control::control_ref(domain, &base);
         let ctl_item = format!("{base}${phase_name}");
         let sc = self.inner.conns.lock().unwrap().get(&self.conn).cloned();
@@ -461,6 +634,14 @@ impl Handler {
                     tracing::debug!(item = %ctl_item, "server: LastApplError send failed");
                 }
             }
+            self.track_control(
+                &reference,
+                svc,
+                service_error_of(Err(DataAccessError::ObjectAccessDenied)),
+                ctx,
+                v,
+                cause,
+            );
             Err(DataAccessError::ObjectAccessDenied)
         };
         let now = Instant::now();
@@ -481,7 +662,20 @@ impl Handler {
             Some(cm) if phase == Phase::Sbow && cm != CtlModel::SboEnhanced => {
                 return refuse(&ctx, AddCause::NOT_SUPPORTED)
             }
+            // Enhanced security is the test mechanism: the client confirms it
+            // saw the operate and the server concludes it with a
+            // CommandTermination. A test-flagged operate on such an object
+            // bypasses the confirmation, so IEC 61850-7-2 clause 13.3.1.5.4
+            // requires it to be refused.
+            Some(cm) if ctx.test && cm.is_enhanced() => {
+                return refuse(&ctx, AddCause::TEST_NOT_ALLOWED)
+            }
             _ => {}
+        }
+        // orIdent is an OctetString(0..64); a longer one is a client that is
+        // not implementing the structure.
+        if ctx.or_ident_len() > control::MAX_OR_IDENT_LEN {
+            return refuse(&ctx, AddCause::INCONSISTENT_PARAMETERS);
         }
 
         if phase == Phase::Cancel {
@@ -495,6 +689,7 @@ impl Handler {
                 return refuse(&ctx, cause);
             }
             self.inner.selections.lock().unwrap().clear(&reference);
+            self.track_control(&reference, svc, ServiceErrorCode::NO_ERROR, &ctx, v, AddCause::NONE);
             return Ok(());
         }
 
@@ -516,13 +711,32 @@ impl Handler {
         // which the handler may take over (defer_termination).
         if phase == Phase::Oper && declared.is_some_and(|cm| cm.is_enhanced()) {
             if let Some(sc) = &sc {
-                ctx.term = Some(control::Termination::new(
-                    Arc::clone(sc),
-                    domain,
-                    &ctl_item,
-                    &ctx,
-                    v,
-                ));
+                let term = control::Termination::new(Arc::clone(sc), domain, &ctl_item, &ctx, v);
+                // A deferred termination is tracked when it is sent, after
+                // the request that operated has been answered.
+                let (weak, reference, tctx, oper) =
+                    (Arc::downgrade(&self.inner), reference.clone(), ctx.clone(), v.clone());
+                term.on_deferred(move |cause| {
+                    let Some(inner) = weak.upgrade() else { return };
+                    let (reference, tctx, oper) = (reference.clone(), tctx.clone(), oper.clone());
+                    std::thread::spawn(move || {
+                        let mut model = inner.model.write().unwrap();
+                        let mut cs = ChangeSet::new();
+                        inner.tracker.track_control(
+                            &mut model,
+                            &mut cs,
+                            &reference,
+                            ServiceType::COMMAND_TERMINATION,
+                            termination_error(cause),
+                            Some(&tctx),
+                            Some(&oper),
+                            cause,
+                            inner.clock.now(),
+                        );
+                        inner.report_changes(&mut model, &cs);
+                    });
+                });
+                ctx.term = Some(term);
             }
         }
 
@@ -557,6 +771,7 @@ impl Handler {
             if !taken {
                 return refuse(&ctx, AddCause::OBJECT_ALREADY_SELECTED);
             }
+            self.track_control(&reference, svc, ServiceErrorCode::NO_ERROR, &ctx, v, AddCause::NONE);
             return Ok(());
         }
 
@@ -571,6 +786,7 @@ impl Handler {
             );
         }
         self.inner.selections.lock().unwrap().clear(&reference);
+        self.track_control(&reference, svc, ServiceErrorCode::NO_ERROR, &ctx, v, AddCause::NONE);
 
         if let Some(term) = &ctx.term {
             if term.is_deferred() {
@@ -578,6 +794,14 @@ impl Handler {
             } else {
                 // Sent now, it is held until the operate's response is out.
                 term.finish(AddCause::NONE);
+                self.track_control(
+                    &reference,
+                    ServiceType::COMMAND_TERMINATION,
+                    ServiceErrorCode::NO_ERROR,
+                    &ctx,
+                    v,
+                    AddCause::NONE,
+                );
             }
         }
         Ok(())
@@ -613,13 +837,13 @@ impl Handler {
 
     fn get_nvl_attrs(&self, content: &[u8]) -> mms::Result<Element> {
         let (domain, list) = parse_object_name(content)?;
-        let members = {
+        let (members, deletable) = {
             let model = self.inner.model.read().unwrap();
-            reporting::dataset_members(&model, &domain, &list)
+            let Some(ds) = lookup_dataset(&model, &domain, &list) else {
+                return Err(DataAccessError::ObjectNonExistent.into());
+            };
+            (reporting::dataset_members(&model, &domain, &list), ds.deletable)
         };
-        if members.is_empty() && !self.dataset_exists(&domain, &list) {
-            return Err(DataAccessError::ObjectNonExistent.into());
-        }
         let var_list = cons(
             context_constructed(1),
             members.iter().map(|m| {
@@ -634,20 +858,8 @@ impl Handler {
         );
         Ok(cons(
             context_constructed(SVC_GET_NAMED_VAR_LIST_ATTR),
-            [bool_elem(context_primitive(0), false), var_list],
+            [bool_elem(context_primitive(0), deletable), var_list],
         ))
-    }
-
-    fn dataset_exists(&self, domain: &str, list: &str) -> bool {
-        let Some((ln_name, ds_name)) = list.split_once('$') else {
-            return false;
-        };
-        let model = self.inner.model.read().unwrap();
-        model
-            .device(domain)
-            .and_then(|ld| ld.node(ln_name))
-            .and_then(|ln| ln.data_set(ds_name))
-            .is_some()
     }
 
     /// Creates a dynamic named variable list from the request's members.
@@ -672,7 +884,7 @@ impl Handler {
             let spec = Decoder::new(entry).expect(context_constructed(0))?;
             let (md, mi) = parse_object_name(spec)?;
             let (reference, fc) = model::from_mms(&md, &mi);
-            entries.push(Fcda { reference, fc });
+            entries.push(Fcda::new(reference, fc));
         }
 
         let mut m = self.inner.model.write().unwrap();
@@ -686,6 +898,7 @@ impl Handler {
         ln.data_sets.push(model::DataSet {
             name: ds_name.to_string(),
             entries,
+            deletable: true,
         });
         // DefineNamedVariableList-Response ::= NULL.
         Ok(prim(
@@ -708,7 +921,7 @@ impl Handler {
                     break;
                 };
                 matched += 1;
-                if delete_dataset(&mut m, &domain, &list) {
+                if self.delete_dataset(&mut m, &domain, &list) {
                     deleted += 1;
                 }
             }
@@ -722,6 +935,45 @@ impl Handler {
         ))
     }
 
+    /// Deletes a data set, unless it is a configured one or a control block
+    /// refers to it (IEC 61850-7-2).
+    fn delete_dataset(&self, model: &mut model::Model, domain: &str, list: &str) -> bool {
+        let Some((ln_name, ds_name)) = list.split_once('$') else {
+            return false;
+        };
+        match lookup_dataset(model, domain, list) {
+            Some(ds) if ds.deletable => {}
+            _ => return false,
+        }
+        if self.data_set_in_use(model, domain, ln_name, ds_name) {
+            return false;
+        }
+        let Some(ln) = model.device_mut(domain).and_then(|ld| ld.node_mut(ln_name)) else {
+            return false;
+        };
+        ln.data_sets.retain(|ds| ds.name != ds_name);
+        true
+    }
+
+    /// Reports whether a control block names the data set `domain/ln$ds`: a
+    /// report or log control block by its current DatSet, a GOOSE or sampled
+    /// value control block by its configured one.
+    fn data_set_in_use(&self, model: &model::Model, domain: &str, ln: &str, ds: &str) -> bool {
+        let reference = format!("{domain}/{ln}${ds}");
+        if self.inner.reports.uses_data_set(model, &reference)
+            || self.inner.logs.uses_data_set(model, &reference)
+        {
+            return true;
+        }
+        model
+            .device(domain)
+            .and_then(|ld| ld.node(ln))
+            .is_some_and(|n| {
+                n.gse_controls.iter().any(|g| g.data_set == ds)
+                    || n.sv_controls.iter().any(|s| s.data_set == ds)
+            })
+    }
+
     fn file_service(&self, service: u32, content: &[u8], max_pdu: usize) -> mms::Result<Element> {
         let Some(files) = &self.inner.files else {
             return Err(DataAccessError::ObjectAccessUnsupported.into());
@@ -730,10 +982,7 @@ impl Handler {
             SVC_FILE_OPEN => {
                 let mut dec = Decoder::new(content);
                 let name_seq = dec.expect(context_constructed(0))?;
-                let name = Decoder::new(name_seq)
-                    .expect(TAG_GRAPHIC_STRING)
-                    .map(|n| String::from_utf8_lossy(n).into_owned())
-                    .unwrap_or_default();
+                let name = mms::parse_file_name(name_seq).unwrap_or_default();
                 let (id, size, modified) = files.open(&name).map_err(|e| {
                     // Tell a directory apart from a missing file: a client
                     // that picked a directory out of a listing needs to know
@@ -788,32 +1037,14 @@ impl Handler {
                 files.close(id);
                 Ok(prim(context_primitive(SVC_FILE_CLOSE), Vec::new()))
             }
-            SVC_FILE_DELETE => {
-                let mut dec = Decoder::new(content);
-                let name_seq = dec.expect(context_constructed(0))?;
-                let name = Decoder::new(name_seq)
-                    .expect(TAG_GRAPHIC_STRING)
-                    .map(|n| String::from_utf8_lossy(n).into_owned())
-                    .unwrap_or_default();
-                files
-                    .delete(&name)
-                    .map_err(|_| DataAccessError::ObjectNonExistent)?;
-                Ok(prim(context_primitive(SVC_FILE_DELETE), Vec::new()))
-            }
             SVC_FILE_DIRECTORY => {
                 let mut dec = Decoder::new(content);
                 let dir = match dec.optional(context_constructed(0))? {
-                    Some(c) => Decoder::new(c)
-                        .expect(TAG_GRAPHIC_STRING)
-                        .map(|n| String::from_utf8_lossy(n).into_owned())
-                        .unwrap_or_default(),
+                    Some(c) => mms::parse_file_name(c).unwrap_or_default(),
                     None => String::new(),
                 };
                 let after = match dec.optional(context_constructed(1))? {
-                    Some(c) => Decoder::new(c)
-                        .expect(TAG_GRAPHIC_STRING)
-                        .map(|n| String::from_utf8_lossy(n).into_owned())
-                        .unwrap_or_default(),
+                    Some(c) => mms::parse_file_name(c).unwrap_or_default(),
                     None => String::new(),
                 };
                 let mut entries = files
@@ -862,6 +1093,12 @@ impl Handler {
     }
 }
 
+/// Finds a data set by its MMS name `LN$DS` in a domain.
+fn lookup_dataset<'a>(m: &'a model::Model, domain: &str, list: &str) -> Option<&'a model::DataSet> {
+    let (ln_name, ds_name) = list.split_once('$')?;
+    m.device(domain)?.node(ln_name)?.data_set(ds_name)
+}
+
 /// Enumerates the names of one MMS object class.
 fn enumerate(model: &model::Model, class: i64, domain: &str) -> Vec<String> {
     match class {
@@ -888,21 +1125,6 @@ fn enumerate(model: &model::Model, class: i64, domain: &str) -> Vec<String> {
             .unwrap_or_default(),
         _ => Vec::new(),
     }
-}
-
-fn delete_dataset(model: &mut model::Model, domain: &str, list: &str) -> bool {
-    let Some((ln_name, ds_name)) = list.split_once('$') else {
-        return false;
-    };
-    let Some(ln) = model
-        .device_mut(domain)
-        .and_then(|ld| ld.node_mut(ln_name))
-    else {
-        return false;
-    };
-    let before = ln.data_sets.len();
-    ln.data_sets.retain(|ds| ds.name != ds_name);
-    ln.data_sets.len() != before
 }
 
 /// Extracts a domain and item from a `ListOfVariable` entry.
@@ -1001,73 +1223,4 @@ fn int_range(btype: &str) -> Option<(i64, i64)> {
         "INT32U" => (0, i64::from(u32::MAX)),
         _ => return None,
     })
-}
-
-/// Keeps the control model import used, since it is only referenced through a
-/// method call above.
-const _: fn(CtlModel) -> bool = CtlModel::has_select;
-/// Ditto for the weak reference the report engine takes.
-const _: fn(&Arc<Inner>) -> Weak<Inner> = Arc::downgrade;
-const _: fn(&ObjectReference) -> &str = ObjectReference::as_str;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn leaf(btype: &str, v: Value) -> model::DataAttribute {
-        model::DataAttribute {
-            name: "setVal".into(),
-            fc: model::Fc::Sp,
-            kind: Some(v.type_of()),
-            btype: btype.into(),
-            value: Some(v),
-            ..Default::default()
-        }
-    }
-
-    /// A sized integer is refused outside its range, and a value of another
-    /// type or width never fits.
-    #[test]
-    fn a_value_fits_only_its_type_width_and_range() {
-        let u8_attr = leaf("INT8U", Value::uint8(0));
-        assert!(!value_fits(&u8_attr, &Value::uint32(300)), "300 into INT8U");
-        assert!(value_fits(&u8_attr, &Value::uint32(200)), "200 into INT8U");
-
-        let i16_attr = leaf("INT16", Value::int16(0));
-        assert!(!value_fits(&i16_attr, &Value::int32(-40_000)));
-        assert!(value_fits(&i16_attr, &Value::int32(-32_768)));
-
-        let f = leaf("FLOAT32", Value::float32(0.0));
-        assert!(!value_fits(&f, &Value::visible_string("1.0")), "another type");
-
-        let q = leaf("Quality", Value::bit_string(13));
-        assert!(!value_fits(&q, &Value::bit_string(8)), "another width");
-        assert!(value_fits(&q, &Value::bit_string(13)));
-    }
-
-    #[test]
-    fn object_names_decode_in_both_scopes() {
-        let el = domain_specific_name("ied1LD0", "GGIO1$MX$AnIn1").encode();
-        assert_eq!(
-            parse_object_name(&el).unwrap(),
-            ("ied1LD0".to_string(), "GGIO1$MX$AnIn1".to_string())
-        );
-
-        let el = prim(context_primitive(0), b"SomeGlobal".to_vec()).encode();
-        assert_eq!(
-            parse_object_name(&el).unwrap(),
-            (String::new(), "SomeGlobal".to_string())
-        );
-
-        let el = prim(context_primitive(7), vec![]).encode();
-        assert!(parse_object_name(&el).is_err());
-    }
-
-    #[test]
-    fn access_failures_encode_as_the_failure_alternative() {
-        let el = access_failure(DataAccessError::ObjectNonExistent).encode();
-        // [0] primitive, carrying the code.
-        assert_eq!(el[0], 0x80);
-        assert_eq!(el[2], 10);
-    }
 }

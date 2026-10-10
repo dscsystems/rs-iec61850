@@ -2,8 +2,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
-use crate::ethernet::{Frame, Interface, VlanTag, ETHER_TYPE_GOOSE};
-use crate::mms::Value;
+use crate::ethernet::{Frame, Interface, VlanTag, ETHER_TYPE_GOOSE, MAX_PAYLOAD};
+use crate::mms::{TimeQuality, Value};
 
 use super::{Error, Message, Result};
 
@@ -34,11 +34,23 @@ pub struct PublisherConfig {
     pub vlan: Option<VlanTag>,
     pub go_cb_ref: String,
     pub dat_set: String,
+    /// The goID the message carries. Empty defaults to `go_cb_ref`, so the
+    /// field on the wire always identifies the stream.
     pub go_id: String,
     pub conf_rev: u32,
     /// The interval schedule after a state change; the last entry repeats
-    /// indefinitely. Empty means [`DEFAULT_RETRANS`].
+    /// indefinitely. Empty means [`DEFAULT_RETRANS`]. A control block's
+    /// MinTime and MaxTime build it: see [`retrans_from_scl`](super::retrans_from_scl).
     pub retrans: Vec<Duration>,
+    /// The initial `test` and `ndsCom` fields, which tell a receiver that the
+    /// publisher is in test or needs commissioning. A receiver is expected to
+    /// act on them, so they are only set deliberately;
+    /// [`Publisher::set_test`] and [`Publisher::set_nds_com`] change them.
+    pub test: bool,
+    pub nds_com: bool,
+    /// The quality of the message timestamp. `None` carries the crate
+    /// default: leap seconds known and accuracy 10.
+    pub time_quality: Option<TimeQuality>,
 }
 
 impl Default for PublisherConfig {
@@ -54,6 +66,9 @@ impl Default for PublisherConfig {
             go_id: String::new(),
             conf_rev: 0,
             retrans: Vec::new(),
+            test: false,
+            nds_com: false,
+            time_quality: None,
         }
     }
 }
@@ -71,6 +86,11 @@ struct Shared {
 #[derive(Debug, Default)]
 struct PubState {
     st_num: u32,
+    sq_num: u32,
+    test: bool,
+    nds_com: bool,
+    /// The time of the state being advertised, which a refresh repeats.
+    t: Option<SystemTime>,
     /// Bumped on every publish, so a retransmission task can tell it has been
     /// superseded without a channel per publish.
     generation: u64,
@@ -78,9 +98,13 @@ struct PubState {
 
 /// Sends GOOSE messages with the standard retransmission state machine.
 ///
-/// Each [`publish`](Publisher::publish) increments `stNum` and restarts the
-/// schedule; a background task retransmits with increasing `sqNum` until the
-/// next publish or close. Safe for concurrent use.
+/// [`publish`](Publisher::publish) announces a state change: it increments
+/// `stNum`, resets `sqNum` and restarts the schedule.
+/// [`refresh`](Publisher::refresh) repeats the current state: it leaves
+/// `stNum` alone and only restarts the schedule, which is what
+/// IEC 61850-8-1 requires a publisher to do when nothing has changed. A
+/// background task retransmits with increasing `sqNum` until the next
+/// publish, refresh or close. Safe for concurrent use.
 #[derive(Debug)]
 pub struct Publisher {
     shared: Arc<Shared>,
@@ -92,7 +116,7 @@ impl Publisher {
     ///
     /// The interface is shared, not owned: closing the publisher stops
     /// retransmission but leaves the interface open.
-    pub fn new(iface: Arc<dyn Interface>, cfg: PublisherConfig) -> Result<Publisher> {
+    pub fn new(iface: Arc<dyn Interface>, mut cfg: PublisherConfig) -> Result<Publisher> {
         if cfg.go_cb_ref.is_empty() {
             return Err(Error::Config("go_cb_ref is required".into()));
         }
@@ -106,53 +130,133 @@ impl Publisher {
                 "retransmission interval {bad:?} is not positive"
             )));
         }
+        if cfg.go_id.is_empty() {
+            cfg.go_id = cfg.go_cb_ref.clone();
+        }
+        let state = PubState {
+            test: cfg.test,
+            nds_com: cfg.nds_com,
+            ..Default::default()
+        };
         Ok(Publisher {
             shared: Arc::new(Shared {
                 iface,
                 cfg,
                 retrans,
-                state: Mutex::new(PubState::default()),
+                state: Mutex::new(state),
                 closed: AtomicBool::new(false),
             }),
             task: Mutex::new(None),
         })
     }
 
+    /// Sets the `test` field. It takes effect with the next publish or
+    /// refresh: the retransmissions of a state repeat the message that
+    /// announced it, so a receiver never sees the field change under an
+    /// unchanged `stNum` and `sqNum` sequence. Call
+    /// [`refresh`](Publisher::refresh) to put it on the wire without a state
+    /// change.
+    pub fn set_test(&self, test: bool) {
+        self.shared.state.lock().unwrap().test = test;
+    }
+
+    /// Sets the `ndsCom` field, which tells a receiver the control block needs
+    /// commissioning (IEC 61850-7-2: for instance, its data set is missing or
+    /// does not fit a frame). Like [`set_test`](Publisher::set_test), it takes
+    /// effect with the next publish or refresh.
+    pub fn set_nds_com(&self, nds_com: bool) {
+        self.shared.state.lock().unwrap().nds_com = nds_com;
+    }
+
     /// Announces a state change: `stNum` increments, `sqNum` resets to zero,
     /// the message is sent immediately and retransmission restarts.
+    ///
+    /// `stNum` starts at 1 and never returns to 0. IEC 61850-8-1 reserves 0
+    /// for "no state change yet", so on wrap the counter goes to 1.
+    ///
+    /// A message that does not fit one Ethernet frame is refused with
+    /// [`Error::FrameTooLarge`] before anything changes: the state being
+    /// advertised and its retransmission carry on.
     pub fn publish(&self, values: Vec<Value>) -> Result<()> {
+        self.publish_state(values, true)
+    }
+
+    /// Repeats the current state without announcing a change: `stNum` stays
+    /// where it is, `sqNum` resets and the retransmission schedule restarts.
+    /// It keeps the timestamp of the change it repeats, so a receiver can tell
+    /// how old the state is. Use it to re-advertise a value that has not
+    /// changed, or to put a new `test` or `ndsCom` on the wire.
+    ///
+    /// A refresh before any publish has nothing to repeat, so it behaves as
+    /// one.
+    pub fn refresh(&self, values: Vec<Value>) -> Result<()> {
+        self.publish_state(values, false)
+    }
+
+    fn publish_state(&self, values: Vec<Value>, state_change: bool) -> Result<()> {
         if self.shared.closed.load(Ordering::SeqCst) {
             return Err(Error::Closed);
         }
-        let (st_num, generation) = {
-            let mut st = self.shared.state.lock().unwrap();
-            st.st_num = st.st_num.wrapping_add(1);
-            st.generation += 1;
-            (st.st_num, st.generation)
+        // The task slot is held throughout, so two publishes cannot interleave
+        // their sends and task replacements.
+        let mut task = self.task.lock().unwrap();
+        let mut st = self.shared.state.lock().unwrap();
+        let st_num = match (state_change, st.st_num) {
+            (true, n) => n.wrapping_add(1).max(1),
+            (false, 0) => 1,
+            (false, n) => n,
         };
-
+        let t = match (state_change, st.t) {
+            (false, Some(t)) => t,
+            _ => SystemTime::now(),
+        };
+        let cfg = &self.shared.cfg;
         let msg = Message {
-            go_cb_ref: self.shared.cfg.go_cb_ref.clone(),
-            dat_set: self.shared.cfg.dat_set.clone(),
-            go_id: self.shared.cfg.go_id.clone(),
+            go_cb_ref: cfg.go_cb_ref.clone(),
+            dat_set: cfg.dat_set.clone(),
+            go_id: cfg.go_id.clone(),
             time_allowed_to_live: self.shared.tatl(0),
-            t: Some(SystemTime::now()),
+            t: Some(t),
             st_num,
             sq_num: 0,
-            conf_rev: self.shared.cfg.conf_rev,
+            conf_rev: cfg.conf_rev,
+            test: st.test,
+            nds_com: st.nds_com,
             num_dat_set_entries: values.len() as u32,
             values,
-            app_id: self.shared.cfg.app_id,
+            app_id: cfg.app_id,
+            time_quality: cfg.time_quality,
             ..Default::default()
         };
+        // The retransmissions of this state differ only in sqNum and
+        // timeAllowedToLive, and grow as those gain octets. Sizing the message
+        // with both at their widest means no retransmission can outgrow the
+        // frame the first one fit in.
+        let widest = Message {
+            sq_num: u32::MAX,
+            time_allowed_to_live: u32::MAX,
+            ..msg.clone()
+        };
+        let n = widest.marshal().len();
+        if n > MAX_PAYLOAD {
+            return Err(Error::FrameTooLarge(format!(
+                "{n} octets for {} data set members, limit {MAX_PAYLOAD}",
+                msg.values.len()
+            )));
+        }
+        st.st_num = st_num;
+        st.sq_num = 0;
+        st.t = Some(t);
+        st.generation += 1;
+        let generation = st.generation;
+        drop(st);
         self.shared.send(&msg)?;
 
         // Replace the retransmission task. The old one notices the newer
         // generation and stops, so a stale frame can never follow the new
         // state onto the wire.
         let handle = tokio::spawn(retransmit(Arc::clone(&self.shared), msg, generation));
-        let old = self.task.lock().unwrap().replace(handle);
-        if let Some(h) = old {
+        if let Some(h) = task.replace(handle) {
             h.abort();
         }
         Ok(())
@@ -161,6 +265,12 @@ impl Publisher {
     /// Returns the current state number, which counts state changes.
     pub fn st_num(&self) -> u32 {
         self.shared.state.lock().unwrap().st_num
+    }
+
+    /// Returns the `stNum` and `sqNum` the publisher is advertising.
+    pub fn state(&self) -> (u32, u32) {
+        let st = self.shared.state.lock().unwrap();
+        (st.st_num, st.sq_num)
     }
 
     /// Stops retransmission. It does not close the underlying interface.
@@ -212,13 +322,19 @@ async fn retransmit(shared: Arc<Shared>, mut msg: Message, generation: u64) {
         if shared.closed.load(Ordering::SeqCst) {
             return;
         }
-        // A newer publish has taken over; stop rather than interleave.
-        if shared.state.lock().unwrap().generation != generation {
+        // sqNum rolls over to 1, not 0: 0 marks the first transmission of a
+        // state (IEC 61850-8-1), so a receiver would read a wrapped 0 as a
+        // state change that did not happen.
+        msg.sq_num = msg.sq_num.wrapping_add(1).max(1);
+        msg.time_allowed_to_live = shared.tatl(i + 1);
+        // Send under the state lock and re-check the generation, so a stale
+        // retransmission can never follow the next publish on the wire, and a
+        // superseded task cannot overwrite the counters of its successor.
+        let mut st = shared.state.lock().unwrap();
+        if st.generation != generation {
             return;
         }
-
-        msg.sq_num = msg.sq_num.wrapping_add(1);
-        msg.time_allowed_to_live = shared.tatl(i + 1);
+        st.sq_num = msg.sq_num;
         if shared.send(&msg).is_err() {
             return;
         }
@@ -401,3 +517,7 @@ mod tests {
         pub_.close();
     }
 }
+
+#[cfg(test)]
+#[path = "ed21_tests.rs"]
+mod ed21_tests;

@@ -18,6 +18,8 @@ const SI_GIVE_TOKENS: u8 = 0x01;
 const SI_DATA_TRANSFER: u8 = 0x01;
 const SI_CONNECT: u8 = 0x0d;
 const SI_ACCEPT: u8 = 0x0e;
+const SI_REFUSE: u8 = 0x0c;
+const SI_ABORT: u8 = 0x19;
 
 /// Parameter and parameter-group identifiers.
 const PGI_CONNECT_ACCEPT: u8 = 0x05;
@@ -27,6 +29,12 @@ const PI_SESSION_USER_REQ: u8 = 0x14;
 const PI_CALLING_SSEL: u8 = 0x33;
 const PI_CALLED_SSEL: u8 = 0x34;
 const PGI_USER_DATA: u8 = 0xc1;
+const PI_TRANSPORT_DISC: u8 = 0x11;
+const PI_REASON_CODE: u8 = 0x32;
+
+/// The REFUSE reason code of a rejection by the called session user, whose
+/// following octets carry its user data (the presentation CPR).
+pub const REASON_USER_DATA: u8 = 2;
 
 /// Sends a CONNECT SPDU carrying `user_data` (the presentation CP PDU) and
 /// returns the user data from the peer's ACCEPT SPDU.
@@ -42,6 +50,19 @@ where
     let spdu = build_connect(SI_CONNECT, calling_ssel, called_ssel, user_data);
     t.send_tsdu(&spdu).await?;
     let resp = t.recv_tsdu().await?;
+    if resp.first() == Some(&SI_REFUSE) {
+        let params = spdu_params(&resp)?;
+        return Err(match find_param(params, PI_REASON_CODE) {
+            Some(rc) if !rc.is_empty() => Error::Refused {
+                reason: rc[0],
+                user_data: rc[1..].to_vec(),
+            },
+            _ => Error::Refused {
+                reason: 0,
+                user_data: Vec::new(),
+            },
+        });
+    }
     let parsed = parse_connect_like(&resp)?;
     if parsed.si != SI_ACCEPT {
         return Err(Error::Session(format!(
@@ -96,6 +117,41 @@ where
 
 /// Sends a data-phase message: the GIVE-TOKENS and DATA-TRANSFER SPDUs
 /// followed by `user_data` (the presentation user-data PDU).
+/// Sends a REFUSE SPDU, the session user's rejection of a CONNECT, carrying
+/// `user_data` (the presentation CPR) after reason code 2. The transport
+/// connection is to be released after it.
+pub async fn refuse<T>(t: &mut T, user_data: &[u8]) -> Result<()>
+where
+    T: SendTsdu,
+{
+    let mut params = Vec::new();
+    write_pi(&mut params, PI_TRANSPORT_DISC, &[0x01]); // release the transport
+    let mut rc = vec![REASON_USER_DATA];
+    rc.extend_from_slice(user_data);
+    write_pi(&mut params, PI_REASON_CODE, &rc);
+    t.send_tsdu(&spdu(SI_REFUSE, &params)).await
+}
+
+/// Sends an ABORT SPDU carrying `user_data` (the presentation ARU). The
+/// transport disconnect parameter says the transport is released, by the
+/// user, for no stated reason, as libiec61850 sends it.
+pub async fn abort<T>(t: &mut T, user_data: &[u8]) -> Result<()>
+where
+    T: SendTsdu,
+{
+    let mut params = Vec::new();
+    write_pi(&mut params, PI_TRANSPORT_DISC, &[0x0b]);
+    write_pi(&mut params, PGI_USER_DATA, user_data);
+    t.send_tsdu(&spdu(SI_ABORT, &params)).await
+}
+
+fn spdu(si: u8, params: &[u8]) -> Vec<u8> {
+    let mut out = vec![si];
+    append_len(&mut out, params.len());
+    out.extend_from_slice(params);
+    out
+}
+
 pub async fn send_data<T>(t: &mut T, user_data: &[u8]) -> Result<()>
 where
     T: SendTsdu,
@@ -114,6 +170,13 @@ where
     T: RecvTsdu,
 {
     let tsdu = t.recv_tsdu().await?;
+    if tsdu.first() == Some(&SI_ABORT) {
+        let user_data = spdu_params(&tsdu)
+            .ok()
+            .and_then(|p| find_user_data(p).ok().flatten())
+            .unwrap_or_default();
+        return Err(Error::Aborted { user_data });
+    }
     Ok(strip_data_prefix(&tsdu)?.to_vec())
 }
 
@@ -159,19 +222,39 @@ fn build_connect(si: u8, calling_ssel: &[u8], called_ssel: &[u8], user_data: &[u
 
     // The user data parameter group carries the presentation PDU.
     write_pi(&mut params, PGI_USER_DATA, user_data);
+    spdu(si, &params)
+}
 
-    let mut out = Vec::with_capacity(4 + params.len());
-    out.push(si);
-    // MMS CONNECTs stay well under 255 octets, but guard the long form anyway.
-    if params.len() < 255 {
-        out.push(params.len() as u8);
+/// Appends a session length indicator: one octet up to 254, else 0xff and two
+/// octets (ISO 8327-1 8.2.5).
+fn append_len(b: &mut Vec<u8>, n: usize) {
+    if n < 255 {
+        b.push(n as u8);
     } else {
-        out.push(0xff);
-        out.push((params.len() >> 8) as u8);
-        out.push(params.len() as u8);
+        b.extend_from_slice(&[0xff, (n >> 8) as u8, n as u8]);
     }
-    out.extend_from_slice(&params);
-    out
+}
+
+/// Reads a length indicator at `b[0]`, returning the length and the octets
+/// the indicator took.
+fn read_len(b: &[u8]) -> Option<(usize, usize)> {
+    match b {
+        [0xff, hi, lo, ..] => Some(((usize::from(*hi) << 8) | usize::from(*lo), 3)),
+        [0xff, ..] | [] => None,
+        [n, ..] => Some((usize::from(*n), 1)),
+    }
+}
+
+/// Returns the parameter field of an SPDU.
+fn spdu_params(spdu: &[u8]) -> Result<&[u8]> {
+    if spdu.len() < 2 {
+        return Err(Error::Session("short SPDU".into()));
+    }
+    let (li, n) = read_len(&spdu[1..]).ok_or_else(|| Error::Session("short long-form LI".into()))?;
+    if 1 + n + li > spdu.len() {
+        return Err(Error::Session(format!("SPDU LI {li} exceeds buffer")));
+    }
+    Ok(&spdu[1 + n..1 + n + li])
 }
 
 struct ConnectLike {
@@ -183,25 +266,10 @@ struct ConnectLike {
 /// Parses a CONNECT/ACCEPT SPDU and returns its SI and the user-data
 /// parameter contents.
 fn parse_connect_like(spdu: &[u8]) -> Result<ConnectLike> {
-    if spdu.len() < 2 {
-        return Err(Error::Session("short SPDU".into()));
-    }
-    let si = spdu[0];
-    let (li, off) = if spdu[1] == 0xff {
-        if spdu.len() < 4 {
-            return Err(Error::Session("short long-form LI".into()));
-        }
-        ((usize::from(spdu[2]) << 8) | usize::from(spdu[3]), 4)
-    } else {
-        (usize::from(spdu[1]), 2)
-    };
-    if off + li > spdu.len() {
-        return Err(Error::Session(format!("SPDU LI {li} exceeds buffer")));
-    }
-    let params = &spdu[off..off + li];
+    let params = spdu_params(spdu)?;
     let user_data = find_user_data(params)?.unwrap_or_default();
     Ok(ConnectLike {
-        si,
+        si: spdu[0],
         params: params.to_vec(),
         user_data,
     })
@@ -210,14 +278,14 @@ fn parse_connect_like(spdu: &[u8]) -> Result<ConnectLike> {
 /// Returns the value of a session parameter, or `None` when absent.
 fn find_param(mut params: &[u8], code: u8) -> Option<Vec<u8>> {
     while params.len() >= 2 {
-        let plen = usize::from(params[1]);
-        if 2 + plen > params.len() {
+        let (plen, n) = read_len(&params[1..])?;
+        if 1 + n + plen > params.len() {
             return None;
         }
         if params[0] == code {
-            return Some(params[2..2 + plen].to_vec());
+            return Some(params[1 + n..1 + n + plen].to_vec());
         }
-        params = &params[2 + plen..];
+        params = &params[1 + n + plen..];
     }
     None
 }
@@ -226,23 +294,24 @@ fn find_param(mut params: &[u8], code: u8) -> Option<Vec<u8>> {
 fn find_user_data(mut params: &[u8]) -> Result<Option<Vec<u8>>> {
     while params.len() >= 2 {
         let code = params[0];
-        let plen = usize::from(params[1]);
-        if 2 + plen > params.len() {
+        let (plen, n) = read_len(&params[1..])
+            .ok_or_else(|| Error::Session("short parameter length".into()))?;
+        if 1 + n + plen > params.len() {
             return Err(Error::Session(format!(
                 "parameter length {plen} overflows"
             )));
         }
         if code == PGI_USER_DATA {
-            return Ok(Some(params[2..2 + plen].to_vec()));
+            return Ok(Some(params[1 + n..1 + n + plen].to_vec()));
         }
-        params = &params[2 + plen..];
+        params = &params[1 + n + plen..];
     }
     Ok(None)
 }
 
 fn write_pi(b: &mut Vec<u8>, code: u8, val: &[u8]) {
     b.push(code);
-    b.push(val.len() as u8);
+    append_len(b, val.len());
     b.extend_from_slice(val);
 }
 
@@ -295,6 +364,52 @@ mod tests {
         assert!(strip_data_prefix(&[0x01, 0x40, 0x00]).is_err());
         assert!(parse_connect_like(&[0x0d, 0x7f]).is_err());
         assert!(parse_connect_like(&[0x0d]).is_err());
+    }
+
+    /// User data longer than 254 octets takes the long length form, in the
+    /// parameter as in the SPDU, and parses back.
+    #[test]
+    fn long_user_data_uses_the_long_length_form() {
+        let ud = vec![0x5a; 600];
+        let spdu = build_connect(SI_CONNECT, &[0, 1], &[], &ud);
+        let parsed = parse_connect_like(&spdu).unwrap();
+        assert_eq!(parsed.user_data, ud);
+    }
+
+    /// A refused CONNECT surfaces the CPR the peer sent, and an ABORT in the
+    /// data phase surfaces the ARU.
+    #[tokio::test]
+    async fn refuse_and_abort_carry_their_user_data() {
+        let (cli, srv) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(async move {
+            let mut t = cotp::Conn::accept(srv).await.unwrap();
+            accept_server(&mut t).await.unwrap();
+            refuse(&mut t, b"cpr-pdu").await.unwrap();
+        });
+        let mut t = cotp::Conn::connect(cli, cotp::Options::default()).await.unwrap();
+        match connect_client(&mut t, &[], &[], b"cp").await {
+            Err(Error::Refused { reason, user_data }) => {
+                assert_eq!(reason, REASON_USER_DATA);
+                assert_eq!(user_data, b"cpr-pdu");
+            }
+            other => panic!("{other:?}"),
+        }
+        server.await.unwrap();
+
+        let (cli, srv) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(async move {
+            let mut t = cotp::Conn::accept(srv).await.unwrap();
+            accept_server(&mut t).await.unwrap();
+            reply(&mut t, &[], b"cpa").await.unwrap();
+            abort(&mut t, b"aru-pdu").await.unwrap();
+        });
+        let mut t = cotp::Conn::connect(cli, cotp::Options::default()).await.unwrap();
+        connect_client(&mut t, &[], &[], b"cp").await.unwrap();
+        match receive_data(&mut t).await {
+            Err(Error::Aborted { user_data }) => assert_eq!(user_data, b"aru-pdu"),
+            other => panic!("{other:?}"),
+        }
+        server.await.unwrap();
     }
 
     #[tokio::test]

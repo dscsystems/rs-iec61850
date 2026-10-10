@@ -46,11 +46,21 @@ pub enum Fc {
     Us,
     /// A wildcard for lookups; never appears on the wire.
     All,
+    /// Service response, the constraint of the service tracking classes
+    /// (`CST`, `BTS`, `CTS`...) that IEC 61850-7-2 Edition 2 added.
+    Sr,
+    /// A constraint whose mnemonic this crate does not know: one added by a
+    /// later edition, or a vendor extension.
+    ///
+    /// It is carried rather than rejected so the object stays visible and
+    /// browsable. [`parse_fc_lenient`] produces it; the verbatim mnemonic is
+    /// kept alongside it (`DataAttribute::fc_name`, `Fcda::fc_name`).
+    Unknown,
 }
 
 impl Fc {
     /// Every constraint that can appear in a model, in declaration order.
-    pub const ALL_VALUES: [Fc; 19] = [
+    pub const ALL_VALUES: [Fc; 20] = [
         Fc::St,
         Fc::Mx,
         Fc::Co,
@@ -70,6 +80,7 @@ impl Fc {
         Fc::Gs,
         Fc::Ms,
         Fc::Us,
+        Fc::Sr,
     ];
 
     /// Returns the two-letter mnemonic, or the empty string for
@@ -97,6 +108,8 @@ impl Fc {
             Fc::Ms => "MS",
             Fc::Us => "US",
             Fc::All => "*",
+            Fc::Sr => "SR",
+            Fc::Unknown => "??",
         }
     }
 
@@ -151,6 +164,33 @@ pub fn parse_fc(s: &str) -> Result<Fc, ParseFcError> {
     s.parse()
 }
 
+/// Parses a functional-constraint mnemonic, yielding [`Fc::Unknown`] rather
+/// than an error for one this crate does not know, and [`Fc::None`] for an
+/// empty one.
+pub fn parse_fc_lenient(s: &str) -> Fc {
+    let u = s.trim();
+    if u.is_empty() {
+        return Fc::None;
+    }
+    u.parse().unwrap_or(Fc::Unknown)
+}
+
+/// Renders the mnemonic to use in an MMS item ID or type specification.
+///
+/// `raw` is the mnemonic as it appeared in the source document, used for
+/// [`Fc::Unknown`], whose variant has no spelling of its own.
+pub fn fc_text(fc: Fc, raw: &str) -> String {
+    if fc != Fc::Unknown {
+        return fc.as_str().to_string();
+    }
+    let u = raw.trim().to_ascii_uppercase();
+    if u.is_empty() {
+        fc.as_str().to_string()
+    } else {
+        u
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -160,6 +200,7 @@ mod tests {
         for fc in Fc::ALL_VALUES {
             let s = fc.as_str();
             assert_eq!(s.len(), 2, "{fc} should be a two-letter mnemonic");
+            assert_eq!(parse_fc_lenient(s), fc);
             assert_eq!(parse_fc(s).unwrap(), fc);
             // Parsing is case-insensitive and tolerates surrounding space.
             assert_eq!(parse_fc(&s.to_lowercase()).unwrap(), fc);
@@ -175,6 +216,20 @@ mod tests {
         assert!(parse_fc("").is_err());
         assert!(parse_fc("XX").is_err());
         assert!(parse_fc("STATUS").is_err());
+    }
+
+    /// An unknown constraint is carried, with its verbatim mnemonic, rather
+    /// than rejected: the object under it stays visible.
+    #[test]
+    fn an_unknown_constraint_is_carried_leniently() {
+        assert_eq!(parse_fc_lenient("ZZ"), Fc::Unknown);
+        assert_eq!(parse_fc_lenient(" "), Fc::None);
+        assert_eq!(parse_fc_lenient("sr"), Fc::Sr);
+        assert_eq!(Fc::Sr.to_string(), "SR");
+        assert!(parse_fc("ZZ").is_err());
+        assert_eq!(fc_text(Fc::Unknown, " zz "), "ZZ");
+        assert_eq!(fc_text(Fc::Unknown, ""), "??");
+        assert_eq!(fc_text(Fc::Mx, "ignored"), "MX");
     }
 
     #[test]

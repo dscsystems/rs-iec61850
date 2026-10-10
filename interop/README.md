@@ -96,3 +96,54 @@ still alive:
 ```sh
 pkill -f 'target/debug/ied-server'
 ```
+
+## libiec61850 (`libiec.sh`)
+
+`tests/interop_libiec.rs` runs this crate against libiec61850, the C
+implementation most IEDs and test tools build on. Every test is gated on an
+environment variable naming the C program it drives, so `cargo test` without
+them skips the lot; `libiec.sh` supplies them. The C side (libiec61850 1.6,
+plain, with mbedtls 3.6 for R-GOOSE/R-SV and TLS, and with MMS fileRename
+compiled in, plus the `mms_peer` and `rsession_peer` drivers) is built by the
+go-iec61850 harness, whose cache this reuses:
+
+```sh
+GO_IEC61850=/path/to/go-iec61850 interop/libiec.sh
+```
+
+| Test | Direction | What it checks |
+|---|---|---|
+| `client_against_libiec_basic_io` | client → C server | Identify, name lists, read, type specs, model retrieval, data sets, reporting with GI |
+| `client_controls_against_libiec` | client → C server | direct- and SBO-enhanced operate with CommandTermination, LastApplError on a refused operate, CommandTermination− |
+| `client_logs_against_libiec` | client → C server | log and LCB browsing, ReadJournal by time and after an entry, the LCB's nine components |
+| `client_files_against_libiec`, `client_rename_against_libiec` | client → C server | Status, SetFile (obtainFile), GetFile, DeleteFile and its refusal, fileRename, abort |
+| `libiec_client_example1` | C client → server | association, read, data set, reports |
+| `libiec_log_client` | C client → server | log listing, enabling the LCB, journal query with values and reason codes |
+| `libiec_mms_utility_ed2_classes` | C client → server | the Edition 2/2.1 classes of `ed21_diverse.cid` in the directory and read |
+| `libiec_mms_peer_services` | C client → server | password authentication and refusal, Status, SetFile, fileRename, directory, DeleteFile, release, abort |
+| `libiec_mms_peer_svcb` | C client → server | ClientSVControlBlock: MSVCB/USVCB, reservation, exclusivity, release on departure |
+| `rsession_interop::*` | both ways | R-GOOSE and R-SV, unsecured, HMAC-SHA256-128/256 and AES-128/256-GCM |
+| `tls_interop::*` | both ways | MMS over TLS under the IEC 62351-3 profile, port 3782 |
+| `port102_svcb_against_libiec_9_2le` | client → C server | the 9-2LE example's block read, reserved, enabled, and its stream received |
+| `port102_ltrk_against_libiec` | both servers | the same services against libiec61850's service tracking server and this one: LTRK values and tracking reports compared |
+
+The two `port102_*` tests need port 102 and a raw socket; the script runs them
+in an unprivileged user and network namespace (`unshare -rn`), on its loopback.
+
+libiec61850's own HMAC-SHA256-256 SPDUs carry a length octet of 16 before a
+32-octet MAC, which no receiver can parse, so that mode is tested towards it
+only. Its example TLS certificates are X.509 v1; the profile accepts those when
+a configured root issued them, as libiec61850 and Go do.
+
+## go-iec61850 security layers (`go-security.sh`)
+
+`tests/interop_go.rs` checks R-GOOSE/R-SV in every key mode both ways, GDOI
+registrations (pre-shared key and certificates) of each implementation's member
+with the other's key server, and MMS over TLS both ways. The Go side is
+`interop/go/peer`, a small program over go-iec61850 whose R-GOOSE/R-SV modes
+share the command line of libiec61850's `rsession_peer`, so the same Rust
+driver runs against both.
+
+```sh
+GO_IEC61850=/path/to/go-iec61850 interop/go-security.sh
+```

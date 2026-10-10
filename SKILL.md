@@ -1,6 +1,6 @@
 ---
 name: rs-iec61850
-description: Build IEC 61850 applications with the rs-iec61850 crate - MMS client and server, GOOSE and Sampled Values publish/subscribe, SCL loading. Use when writing, reviewing or debugging Rust that talks to an IED, simulates one, subscribes to reports, operates controls, or handles process-bus traffic.
+description: Build IEC 61850 applications with the rs-iec61850 crate - MMS client and server, GOOSE and Sampled Values publish/subscribe (Ethernet or R-GOOSE/R-SV over UDP), SCL loading, IEC 62351 TLS and GDOI key distribution. Use when writing, reviewing or debugging Rust that talks to an IED, simulates one, subscribes to reports, operates controls, or handles process-bus traffic.
 ---
 
 # Building applications with rs-iec61850
@@ -31,7 +31,8 @@ use iec61850::client::Client;
 
 - Rust 1.82 or newer, edition 2021.
 - Features: `tls` (IEC 62351-3 over rustls, default MMS-over-TLS port 3782),
-  `tui` (builds the `iedx` terminal client). Neither is on by default.
+  `gdoi` (IEC 62351-9 key distribution, implies `tls`), `tui` (builds the
+  `iedx` terminal client). None is on by default.
 - MMS works on Linux, Windows and macOS. GOOSE and SV raw sockets are Linux
   only (AF_PACKET, needs `CAP_NET_RAW`); use `ethernet::pipe()` elsewhere.
 - The licence is source-available and non-commercial. Do not add it to a
@@ -204,9 +205,65 @@ frame or a restarted publisher becomes visible; a clean stream reports none.
 `subscribe_supervised` also reports a publisher that falls silent, as soon as
 its `timeAllowedToLive` passes.
 
+`publish` is a state change; `refresh` re-advertises the current state without
+one. Build a publisher from the model's control block rather than by hand, so
+its addressing and MinTime/MaxTime schedule are the configured ones:
+
+```rust
+let publisher = goose::Publisher::from_model(eth.clone(), ld, lln0, gcb, src_mac)?;
+```
+
 Sampled Values has a generic path (`sv::Subscriber::subscribe`, raw `Asdu`) and
-a 9-2LE fast path (`subscribe_le`, `LePublisher`). In the LE subscriber the
-sample buffer is reused between calls, so copy anything you keep.
+a 9-2LE fast path (`subscribe_le`, `LePublisher`, `LePublisher::from_model`).
+In the LE subscriber the sample buffer is reused between calls, so copy
+anything you keep.
+
+### Over UDP: R-GOOSE and R-SV
+
+An `rsession::Session` is an `ethernet::Interface`: hand it to the same
+publishers and subscribers.
+
+```rust
+let keys = Arc::new(rsession::KeyStore::with_keys([rsession::Key {
+    id: 1,
+    material: key_material,
+    sec: rsession::SecAlgorithm::AES_128_GCM,
+    ..Default::default()
+}])?);
+let session: Arc<dyn ethernet::Interface> = Arc::new(rsession::Session::open(rsession::Config {
+    remote: "239.192.0.1:102".into(),
+    keys: Some(keys),
+    ..Default::default()
+})?);
+let publisher = goose::Publisher::new(session, goose::PublisherConfig {
+    go_cb_ref: "IED1LD0/LLN0$GO$gcb01".into(),
+    ..Default::default()
+})?;
+```
+
+A receiving session (`listen` or `groups`) refuses unsecured SPDUs, unknown
+keys, bad MACs and replays; `stats()` counts them and `on_reject` hears of each.
+
+## Security
+
+TLS under the IEC 62351-3 profile (feature `tls`): both ends present
+certificates, verified to configured roots, with CRLs and key-strength checks.
+
+```rust
+let cfg = iec62351::client_config(iec62351::Options {
+    certificates: vec![cert],
+    key: Some(key),
+    roots: vec![root],
+    server_name: "ied1".into(),
+    ..Default::default()
+})?;
+let client = Client::dial_with("ied1:3782", Options::new().with_tls(cfg)).await?;
+```
+
+`iec62351::server_config` is the server side, for `server::Options::with_tls`.
+Group keys for R-GOOSE/R-SV come from a GDOI key server (feature `gdoi`):
+`gdoi::Member` keeps an `rsession::KeyStore` current, `gdoi::Server` serves the
+groups.
 
 ## Traps that cause real bugs
 
@@ -245,7 +302,23 @@ sample buffer is reused between calls, so copy anything you keep.
   directories with a trailing `/`; some servers omit it, and some report names
   relative to the directory asked for rather than openable as given.
 - **GOOSE and SV need `CAP_NET_RAW`** and are Linux only. `ethernet::open`
-  returns `Error::Unsupported` elsewhere.
+  returns `Error::Unsupported` elsewhere. R-GOOSE/R-SV over `rsession` need
+  neither.
+- **`publish` is a state change, `refresh` is not.** Re-advertising an
+  unchanged value with `publish` moves `stNum`, and every subscriber counts a
+  change that did not happen.
+- **A receiving R-GOOSE session refuses unsecured traffic by default.** A test
+  against an unsecured publisher needs `allow_unsecured: true`; production
+  should not.
+- **A USVCB is reserved before it is enabled**, and the server releases and
+  disables it when the reserving association ends. Keep the association open
+  for as long as the stream is wanted.
+- **The TLS profile names the server by `server_name`, not by the address
+  dialled.** IED certificates usually have no subject alternative name; the
+  common name is then what is checked.
+- **A GDOI member re-registers rather than taking pushed rekeys.** A key server
+  must distribute a new TEK with an `activation_delay` longer than the members'
+  `refresh`, or some members will not hold it when it comes into use.
 
 ## Testing an application
 

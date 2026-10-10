@@ -29,10 +29,15 @@ struct OpenFile {
     pos: usize,
 }
 
-/// The server's filestore.
+/// The server's filestore: a directory on disk.
+///
+/// A writable store also serves SetFile (MMS obtainFile), DeleteFile and MMS
+/// fileRename. Names are resolved within the directory: no name, symbolic
+/// link included, reaches outside it.
 #[derive(Debug)]
 pub struct FileStore {
     root: PathBuf,
+    writable: bool,
     state: Mutex<FileStoreState>,
 }
 
@@ -43,14 +48,30 @@ struct FileStoreState {
 }
 
 impl FileStore {
+    /// Returns a writable store of the files under `root`.
     pub fn new(root: impl Into<PathBuf>) -> FileStore {
         FileStore {
             root: root.into(),
+            writable: true,
             state: Mutex::new(FileStoreState {
                 next: 1,
                 open: HashMap::new(),
             }),
         }
+    }
+
+    /// Returns a store of the files under `root` that clients can read but
+    /// not change.
+    pub fn read_only(root: impl Into<PathBuf>) -> FileStore {
+        FileStore {
+            writable: false,
+            ..FileStore::new(root)
+        }
+    }
+
+    /// Reports whether clients may change the store.
+    pub fn is_writable(&self) -> bool {
+        self.writable
     }
 
     /// Resolves a client-supplied name against the filestore root.
@@ -59,6 +80,8 @@ impl FileStore {
     /// `../../etc/passwd` must not read outside the filestore, and MMS file
     /// names are opaque strings a client chooses freely.
     pub fn resolve(&self, name: &str) -> Option<PathBuf> {
+        // Backslash separators become slashes, as some clients send them.
+        let name = name.replace('\\', "/");
         let requested = Path::new(name.trim_start_matches('/'));
         let mut out = self.root.clone();
         for c in requested.components() {
@@ -69,7 +92,64 @@ impl FileStore {
                 Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
             }
         }
-        Some(out)
+        // A symbolic link inside the store must not lead out of it: the
+        // deepest part of the path that exists has to resolve under the root.
+        // A store whose root does not exist has nothing to escape through.
+        let Ok(root) = std::fs::canonicalize(&self.root) else {
+            return Some(out);
+        };
+        let mut probe = out.as_path();
+        loop {
+            if let Ok(real) = std::fs::canonicalize(probe) {
+                return real.starts_with(&root).then_some(out);
+            }
+            probe = probe.parent()?;
+        }
+    }
+
+    /// Resolves a name that must address a file, not the store itself.
+    fn resolve_file(&self, name: &str) -> std::io::Result<PathBuf> {
+        let path = self.resolve(name).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "file name escapes the filestore",
+            )
+        })?;
+        if path == self.root {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "the name addresses the filestore itself",
+            ));
+        }
+        Ok(path)
+    }
+
+    /// Reports whether a file or directory of that name exists.
+    pub fn exists(&self, name: &str) -> bool {
+        self.resolve(name)
+            .is_some_and(|p| std::fs::symlink_metadata(p).is_ok())
+    }
+
+    /// Creates a new file for writing, failing if it exists.
+    pub fn create_new(&self, name: &str) -> std::io::Result<std::fs::File> {
+        let path = self.resolve_file(name)?;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+    }
+
+    /// Renames a file. An existing file is never replaced, as a plain rename
+    /// would on POSIX: the file is linked under its new name, which fails if
+    /// that name is taken, and then the old name is removed.
+    pub fn rename(&self, old: &str, new: &str) -> std::io::Result<()> {
+        let from = self.resolve_file(old)?;
+        let to = self.resolve_file(new)?;
+        if std::fs::symlink_metadata(&to).is_ok() {
+            return Err(std::io::ErrorKind::AlreadyExists.into());
+        }
+        std::fs::hard_link(&from, &to)?;
+        std::fs::remove_file(&from)
     }
 
     /// Opens a file for reading, returning its state machine id, size and
@@ -160,12 +240,7 @@ impl FileStore {
 
     /// Deletes a file from the filestore.
     pub fn delete(&self, name: &str) -> std::io::Result<()> {
-        let path = self.resolve(name).ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "file name escapes the filestore",
-            )
-        })?;
+        let path = self.resolve_file(name)?;
         std::fs::remove_file(path)
     }
 
@@ -222,6 +297,39 @@ mod tests {
             store.resolve("./a.txt").unwrap(),
             Path::new("/var/comtrade/a.txt")
         );
+    }
+
+    /// A symbolic link inside the store must not lead a client out of it.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_out_of_the_store_is_refused() {
+        let (store, dir) = temp_store();
+        let outside = std::env::temp_dir().join(format!("iec61850-outside-{}", std::process::id()));
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret"), b"x").unwrap();
+        let _ = std::os::unix::fs::symlink(&outside, dir.join("escape"));
+        assert!(store.resolve("escape/secret").is_none());
+        assert!(store.open("escape/secret").is_err());
+        assert!(store.resolve("a.txt").is_some());
+        let _ = std::fs::remove_dir_all(&outside);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Rename never replaces an existing file, and create never overwrites.
+    #[test]
+    fn rename_and_create_never_overwrite() {
+        let (store, dir) = temp_store();
+        assert!(store.create_new("a.txt").is_err());
+        store.create_new("b.txt").unwrap();
+        let e = store.rename("a.txt", "b.txt").unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::AlreadyExists);
+        store.rename("a.txt", "c.txt").unwrap();
+        assert!(!store.exists("a.txt") && store.exists("c.txt"));
+        let e = store.rename("missing", "d.txt").unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::NotFound);
+        assert!(FileStore::read_only(&dir).create_new("x").is_ok(), "the store does not police itself");
+        assert!(!FileStore::read_only(&dir).is_writable());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

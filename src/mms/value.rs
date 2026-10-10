@@ -62,6 +62,12 @@ impl TimeQuality {
     pub const CLOCK_NOT_SYNCHRONIZED: TimeQuality = TimeQuality(0x20);
     /// Declares no fraction accuracy.
     pub const ACCURACY_UNSPECIFIED: TimeQuality = TimeQuality(0x1f);
+    /// The quality this crate stamps a time with when the caller states none:
+    /// leap seconds known, clock synchronised, 10 bits of fraction accuracy
+    /// (about a millisecond). A device whose clock can lose synchronisation
+    /// should say so through the time-quality settings of the server, client,
+    /// GOOSE and SV publishers rather than rely on it.
+    pub const DEFAULT: TimeQuality = TimeQuality(0x80 | 10);
 
     /// Returns a quality declaring `n` bits of fraction accuracy, clamped to
     /// the 0..=24 the encoding allows.
@@ -212,9 +218,9 @@ impl Value {
         ])
     }
 
-    /// Returns the current time with 10 bits of declared accuracy.
+    /// Returns the current time with [`TimeQuality::DEFAULT`].
     pub fn utc_time_now() -> Value {
-        Value::utc_time(SystemTime::now(), TimeQuality::accuracy(10))
+        Value::utc_time(SystemTime::now(), TimeQuality::DEFAULT)
     }
 
     /// Wraps 8 raw `UtcTime` octets.
@@ -240,6 +246,18 @@ impl Value {
             (days >> 8) as u8,
             days as u8,
         ])
+    }
+
+    /// Wraps the 4- or 6-octet encoding of a `TimeOfDay`, as it appears in a
+    /// service request rather than in `Data`.
+    pub fn binary_time_raw(b: &[u8]) -> super::Result<Value> {
+        if b.len() != 4 && b.len() != 6 {
+            return Err(super::Error::protocol(format!(
+                "TimeOfDay of {} octets, want 4 or 6",
+                b.len()
+            )));
+        }
+        Ok(Value::BinaryTime(b.to_vec()))
     }
 
     /// Wraps a `DataAccessError` code as a value, as it appears inside read

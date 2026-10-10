@@ -168,11 +168,18 @@ impl AddCause {
     /// that reserved the object, a differing `ctlNum` above all.
     pub const INCONSISTENT_PARAMETERS: AddCause = AddCause(26);
     pub const LOCKED_BY_OTHER_CLIENT: AddCause = AddCause(27);
+    /// The diagnosis for an operate that sets `Test` on an object whose
+    /// control model is enhanced security. There the test flag would skip the
+    /// CommandTermination the client relies on to confirm the command, so
+    /// IEC 61850-7-2 requires the server to refuse rather than execute it.
+    pub const TEST_NOT_ALLOWED: AddCause = AddCause(28);
+    /// The diagnosis for a command refused because the object is under test.
+    pub const BLOCKED_BY_TEST: AddCause = AddCause(29);
 
     /// Not an IEC 61850 value: this crate's "no error", returned by a control
     /// handler to accept a command.
     ///
-    /// Every value a peer can send is 0..=27, so 255 cannot collide with one.
+    /// Every value a peer can send is 0..=29, so 255 cannot collide with one.
     pub const NONE: AddCause = AddCause(255);
 
     /// Reports whether the cause means the command was accepted.
@@ -183,7 +190,7 @@ impl AddCause {
 
 impl std::fmt::Display for AddCause {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        const NAMES: [&str; 28] = [
+        const NAMES: [&str; 30] = [
             "unknown",
             "not-supported",
             "blocked-by-switching-hierarchy",
@@ -212,6 +219,8 @@ impl std::fmt::Display for AddCause {
             "none-reported",
             "inconsistent-parameters",
             "locked-by-other-client",
+            "test-not-allowed",
+            "blocked-by-test",
         ];
         if self.0 == 255 {
             return f.write_str("none");

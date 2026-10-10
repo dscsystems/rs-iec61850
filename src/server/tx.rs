@@ -1,4 +1,6 @@
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use crate::mms::{TimeQuality, Value};
@@ -31,6 +33,34 @@ pub(crate) fn record(
     changes.entry((reference, fc)).or_insert(TrgOps(0)).0 |= r;
 }
 
+/// The quality of the server's clock, stamped on every time the server
+/// produces.
+///
+/// It holds the quality plus one, so that zero means "not set" and every
+/// quality octet, 0 included, can be stored.
+#[derive(Debug, Default)]
+pub(crate) struct Clock(AtomicU32);
+
+impl Clock {
+    pub(crate) fn set(&self, q: TimeQuality) {
+        self.0.store(u32::from(q.0) + 1, Ordering::Relaxed);
+    }
+
+    /// The quality the server stamps its times with: what was set, else
+    /// [`TimeQuality::DEFAULT`].
+    pub(crate) fn quality(&self) -> TimeQuality {
+        match self.0.load(Ordering::Relaxed) {
+            0 => TimeQuality::DEFAULT,
+            v => TimeQuality((v - 1) as u8),
+        }
+    }
+
+    /// The current time as a `UtcTime` carrying the server's clock quality.
+    pub(crate) fn now(&self) -> Value {
+        Value::utc_time(SystemTime::now(), self.quality())
+    }
+}
+
 /// An in-progress atomic model update.
 ///
 /// Its methods mutate leaf data attribute values; they take effect together
@@ -40,14 +70,28 @@ pub(crate) fn record(
 pub struct Tx<'a> {
     pub(crate) model: &'a mut Model,
     pub(crate) changed: ChangeSet,
+    pub(crate) clock: Arc<Clock>,
 }
 
 impl<'a> Tx<'a> {
+    #[cfg(test)]
     pub(crate) fn new(model: &'a mut Model) -> Tx<'a> {
+        Tx::with_clock(model, Arc::new(Clock::default()))
+    }
+
+    pub(crate) fn with_clock(model: &'a mut Model, clock: Arc<Clock>) -> Tx<'a> {
         Tx {
             model,
             changed: ChangeSet::new(),
+            clock,
         }
+    }
+
+    /// Returns the current time as a `UtcTime` value carrying the server's
+    /// clock quality ([`Server::set_time_quality`](super::Server::set_time_quality)),
+    /// for a caller that sets a timestamp through [`set`](Tx::set).
+    pub fn now(&self) -> Value {
+        self.clock.now()
     }
 
     /// Returns the current value of the leaf attribute at `reference`.
@@ -126,31 +170,27 @@ impl<'a> Tx<'a> {
         self.set(reference, fc, q.value())
     }
 
-    /// Sets a `UtcTime` attribute to the current time.
+    /// Sets a `UtcTime` attribute to the current time, stamped with the
+    /// server's clock quality.
     pub fn set_timestamp_now(
         &mut self,
         reference: impl Into<ObjectReference>,
         fc: Fc,
     ) -> bool {
-        self.set(
-            reference,
-            fc,
-            Value::utc_time(SystemTime::now(), TimeQuality::accuracy(10)),
-        )
+        let now = self.clock.now();
+        self.set(reference, fc, now)
     }
 
-    /// Sets a `UtcTime` attribute to an explicit time.
+    /// Sets a `UtcTime` attribute to an explicit time, stamped with the
+    /// server's clock quality.
     pub fn set_timestamp(
         &mut self,
         reference: impl Into<ObjectReference>,
         fc: Fc,
         t: SystemTime,
     ) -> bool {
-        self.set(
-            reference,
-            fc,
-            Value::utc_time(t, TimeQuality::accuracy(10)),
-        )
+        let q = self.clock.quality();
+        self.set(reference, fc, Value::utc_time(t, q))
     }
 
     /// Returns the references this transaction has written so far.

@@ -33,10 +33,12 @@
 
 mod message;
 mod publisher;
+mod scl;
 mod subscriber;
 
 pub use message::{parse, Message};
 pub use publisher::{Publisher, PublisherConfig, DEFAULT_RETRANS};
+pub use scl::retrans_from_scl;
 pub use subscriber::{Anomalies, Filter, SequenceTracker, Subscriber, Subscription};
 
 /// Errors raised by the GOOSE layer.
@@ -50,6 +52,11 @@ pub enum Error {
     Ethernet(#[from] crate::ethernet::Error),
     #[error("goose: the publisher is closed")]
     Closed,
+    /// The encoded message does not fit one Ethernet frame. GOOSE has no
+    /// fragmentation, so such a message could only be truncated or dropped on
+    /// the way; the data set is too large for the control block.
+    #[error("goose: message exceeds the Ethernet MTU: {0}")]
+    FrameTooLarge(String),
 }
 
 impl From<crate::asn1::Error> for Error {

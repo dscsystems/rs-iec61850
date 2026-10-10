@@ -6,27 +6,38 @@
 //! [`crate::client`] and [`crate::server`]. Direct use of this module is for
 //! tooling and for services the ACSI layer does not wrap.
 
+mod altaccess;
+mod client_ext;
 mod conn;
 mod errors;
 mod pdu;
 mod report;
 mod server_conn;
+mod server_ext;
 mod services;
 mod transport;
 mod typespec;
 mod value;
 mod value_codec;
 
-pub use conn::{AcseIdentity, Conn, HandlerId, Options, State};
+pub use altaccess::{
+    access_path, alternate_access_element, parse_alternate_access, AccessStep, ListMember,
+};
+pub use client_ext::{
+    encode_status_response, logical, parse_file_name, parse_file_rename, physical,
+    JournalStatus, ObtainSource, ServerStatus,
+};
+pub use conn::{AcseIdentity, ApplicationContext, Conn, HandlerId, Options, Outstanding, State};
 pub use errors::{DataAccessError, Error, ErrorClass, Result, ServiceError};
 pub use pdu::{
     encode_initiate_request, encode_initiate_response, parse_initiate_request,
-    parse_initiate_response, service, InitiateRequest, ServiceSupport,
+    parse_initiate_response, service, InitiateRequest, ServiceSupport, MMS_MAX,
 };
 pub use report::InformationReport;
 pub use server_conn::{
     accept_conn, accept_conn_opts, AcceptOptions, Handler, Request, ServerConn,
 };
+pub use server_ext::{AssociationRequest, Authenticator};
 pub use services::{
     FileEntry, JournalEntry, JournalVariable, ObjectClass, VarRef,
 };

@@ -998,8 +998,10 @@ async fn the_initiate_answer_states_the_servers_own_capabilities() {
         (service::GET_VARIABLE_ACCESS_ATTRIBUTES, "getVariableAccessAttributes", true),
         (service::DEFINE_NAMED_VARIABLE_LIST, "defineNamedVariableList", true),
         (service::INFORMATION_REPORT, "informationReport", true),
-        (service::STATUS, "status", false),
-        (service::CANCEL, "cancel", false),
+        // Implemented, so advertised.
+        (service::STATUS, "status", true),
+        (service::CANCEL, "cancel", true),
+        // The reference model has no logs.
         (service::READ_JOURNAL, "readJournal", false),
         (service::FILE_OPEN, "fileOpen", false), // no file store configured
     ] {

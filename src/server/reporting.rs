@@ -9,6 +9,8 @@
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::net::IpAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{OnceLock, Weak};
 use std::time::{Duration, SystemTime};
 
@@ -108,6 +110,17 @@ pub struct ReportManager {
     /// The runtime the timer tasks run on, remembered so that an update from a
     /// thread outside it can still open a buffer-time window.
     runtime: OnceLock<tokio::runtime::Handle>,
+    /// The server-wide EntryID source. IEC 61850-7-2 requires an EntryID to
+    /// identify a report uniquely within the server, so the counter is per
+    /// server and not per control block: two buffered blocks must never hand
+    /// out the same identifier, or a client resyncing on EntryID cannot tell
+    /// which block an entry came from. Logs draw from it too.
+    entry_counter: AtomicU64,
+    /// Keeps the top four octets of a freshly started server's EntryIDs away
+    /// from those of a restarted one, so a client that persisted an EntryID
+    /// across a restart does not mistake a new entry for an old one: the
+    /// start time in whole seconds.
+    entry_seed: u64,
 }
 
 impl ReportManager {
@@ -117,7 +130,25 @@ impl ReportManager {
             registry: rcb::materialise_rcbs(model, buf_default),
             owner: OnceLock::new(),
             runtime: OnceLock::new(),
+            entry_counter: AtomicU64::new(0),
+            entry_seed: crate::time_util::unix_parts(SystemTime::now()).0 as u64 & 0xffff_ffff,
         }
+    }
+
+    /// Returns a fresh server-wide EntryID: the start-time seed in the high 32
+    /// bits and the counter in the low 32, so identifiers are unique across a
+    /// restart as well as within a run.
+    pub(crate) fn next_entry_id(&self) -> Vec<u8> {
+        let n = self.entry_counter.fetch_add(1, Ordering::Relaxed) + 1;
+        rcb::make_entry_id(self.entry_seed << 32 | (n & 0xffff_ffff))
+    }
+
+    /// Reports whether a report control block names the data set `reference`
+    /// (`LD/LN$DS`) as its DatSet.
+    pub(crate) fn uses_data_set(&self, model: &Model, reference: &str) -> bool {
+        self.registry
+            .values()
+            .any(|rs| attr_text(model, rs, "DatSet") == reference)
     }
 
     /// Ties the engine to its server, once it exists.
@@ -148,6 +179,9 @@ impl ReportManager {
 
     /// Decides whether a client may write `attr` of a report control block,
     /// before anything is stored.
+    // The engine needs the model, the address of the block, what was written
+    // and who wrote it.
+    #[allow(clippy::too_many_arguments)]
     pub fn check_rcb_write(
         &self,
         model: &Model,
@@ -156,14 +190,16 @@ impl ReportManager {
         attr: &str,
         v: &Value,
         conn: ConnId,
+        ip: Option<IpAddr>,
     ) -> Result<(), DataAccessError> {
         let Some(rs) = rcb::rcb_key(domain, item).and_then(|(key, _)| self.registry.get(&key))
         else {
             return Err(DataAccessError::ObjectNonExistent);
         };
         let st = rs.state.lock().unwrap();
-        // A block another client holds is not this one's to change.
-        if st.owner.is_some_and(|o| o != conn) {
+        // A block another client holds, or is held for, is not this one's to
+        // change.
+        if !st.allowed(conn, ip) {
             return Err(DataAccessError::TemporarilyUnavailable);
         }
         match attr {
@@ -180,7 +216,14 @@ impl ReportManager {
             }
             // Interrogation is a service of an enabled block.
             "GI" if v.as_bool() && !st.enabled => Err(DataAccessError::TemporarilyUnavailable),
+            // A reservation the configuration made is not the client's to give
+            // up.
+            "Resv" if !v.as_bool() && st.resv_cfg => Err(DataAccessError::ObjectAccessDenied),
             "Resv" if !v.as_bool() && st.enabled => Err(DataAccessError::TemporarilyUnavailable),
+            // -1 means reserved by configuration, which only the configuration
+            // can say; a configured block's ResvTms is fixed.
+            "ResvTms" if st.resv_cfg => Err(DataAccessError::ObjectAccessDenied),
+            "ResvTms" if v.as_i64() < 0 => Err(DataAccessError::ObjectValueInvalid),
             a if RCB_SETTINGS.contains(&a) => {
                 if st.enabled {
                     return Err(DataAccessError::TemporarilyUnavailable);
@@ -224,6 +267,7 @@ impl ReportManager {
         attr: &str,
         v: &Value,
         conn: ConnId,
+        ip: Option<IpAddr>,
     ) {
         if let Ok(h) = tokio::runtime::Handle::try_current() {
             let _ = self.runtime.set(h);
@@ -234,20 +278,25 @@ impl ReportManager {
         };
         let mut st = rs.state.lock().unwrap();
         if attr == "Resv" {
-            st.owner = v.as_bool().then_some(conn);
-            sync_resv(model, rs, &st);
+            if v.as_bool() {
+                take(model, rs, &mut st, conn, ip);
+            } else {
+                self.release(model, rs, &mut st);
+            }
             return;
         }
         // Writing a block reserves it for the writer (IEC 61850-7-2 implicit
         // reservation), so a second client cannot reconfigure or take it.
         if st.owner.is_none() {
-            st.owner = Some(conn);
-            sync_resv(model, rs, &st);
+            take(model, rs, &mut st, conn, ip);
         }
         match attr {
+            // ResvTms 0 gives up a reservation that outlives the association;
+            // the client still holds the block while it is connected.
+            "ResvTms" if v.as_i64() == 0 => st.stop_resv_timer(),
             "RptEna" => {
                 if v.as_bool() {
-                    self.enable(model, conns, rs, &mut st, conn);
+                    self.enable(model, conns, rs, &mut st, conn, ip);
                 } else {
                     self.disable(model, conns, rs, &mut st);
                 }
@@ -284,11 +333,13 @@ impl ReportManager {
         rs: &RcbState,
         st: &mut RcbRuntime,
         conn: ConnId,
+        ip: Option<IpAddr>,
     ) {
         st.enabled = true;
         st.conn = Some(conn);
-        st.owner = Some(conn);
-        sync_resv(model, rs, st);
+        if st.owner != Some(conn) {
+            take(model, rs, st, conn, ip);
+        }
         set_sq_num(model, rs, st, 0);
         st.stop_integrity();
 
@@ -334,8 +385,44 @@ impl ReportManager {
         // A buffered block keeps buffering for whoever enables it next; the
         // reservation of an unbuffered block lasts until released.
         if rs.buffered {
-            st.owner = None;
+            self.release(model, rs, st);
         }
+    }
+
+    /// Ends the holder's claim on the block, as its association ends or it
+    /// disables a BRCB. A reservation by configuration stays. A BRCB with a
+    /// ResvTms stays reserved for the same client address for that many
+    /// seconds, so a client that lost its connection can come back to its
+    /// buffer (IEC 61850-7-2); otherwise the block is free.
+    fn release(&self, model: &mut Model, rs: &RcbState, st: &mut RcbRuntime) {
+        let prev_ip = st.owner_ip.take();
+        let had_owner = st.owner.take().is_some();
+        if st.resv_cfg {
+            sync_resv(model, rs, st);
+            return;
+        }
+        st.stop_resv_timer();
+        st.resv_ip = None;
+        let tms = attr_value(model, rs, "ResvTms").map_or(0, |v| v.as_i64());
+        if rs.buffered && tms > 0 && had_owner {
+            if let (Some(ip), Some(owner)) = (prev_ip, self.owner.get().cloned()) {
+                st.resv_ip = Some(ip);
+                let generation = st.resv_gen;
+                let key = RcbState::key(&rs.domain, &rs.item);
+                st.resv_timer = self.spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(tms as u64)).await;
+                    with_block(&owner, &key, |_, model, _, rs| {
+                        let mut st = rs.state.lock().unwrap();
+                        if st.resv_gen == generation && st.owner.is_none() {
+                            st.resv_timer = None;
+                            st.resv_ip = None;
+                            sync_resv(model, rs, &st);
+                        }
+                    });
+                });
+            }
+        }
+        sync_resv(model, rs, st);
     }
 
     /// Releases every block a closing connection had enabled or reserved.
@@ -346,8 +433,7 @@ impl ReportManager {
                 self.disable(model, conns, rs, &mut st);
             }
             if st.owner == Some(conn) {
-                st.owner = None;
-                sync_resv(model, rs, &st);
+                self.release(model, rs, &mut st);
             }
         }
     }
@@ -359,6 +445,7 @@ impl ReportManager {
             st.enabled = false;
             st.conn = None;
             st.stop_integrity();
+            st.stop_resv_timer();
             if let Some(t) = st.pending_timer.take() {
                 t.abort();
             }
@@ -505,8 +592,7 @@ impl ReportManager {
             }
             return;
         }
-        st.entry_counter += 1;
-        e.id = rcb::make_entry_id(st.entry_counter);
+        e.id = self.next_entry_id();
         set_attr(model, rs, "EntryID", Value::octet_string(e.id.clone()));
         set_attr(model, rs, "TimeofEntry", Value::binary_time(e.time));
         st.buffer.push(e);
@@ -577,10 +663,29 @@ fn set_sq_num(model: &mut Model, rs: &RcbState, st: &mut RcbRuntime, n: u32) {
     }
 }
 
-/// Reflects the reservation into an unbuffered block's Resv.
+/// Makes `conn` the holder of the block. A reservation that was waiting for
+/// this client's return has served its purpose.
+fn take(model: &mut Model, rs: &RcbState, st: &mut RcbRuntime, conn: ConnId, ip: Option<IpAddr>) {
+    st.owner = Some(conn);
+    st.owner_ip = ip;
+    st.stop_resv_timer();
+    if !st.resv_cfg {
+        st.resv_ip = None;
+    }
+    sync_resv(model, rs, st);
+}
+
+/// Reflects the reservation into an unbuffered block's Resv, and the holder
+/// into a buffered block's Owner. Owner is how a client learns that a buffered
+/// block is taken: a BRCB has no Resv, so the connection that holds it would
+/// otherwise be invisible (IEC 61850-7-2).
 fn sync_resv(model: &mut Model, rs: &RcbState, st: &RcbRuntime) {
-    if !rs.buffered {
-        set_attr(model, rs, "Resv", Value::boolean(st.owner.is_some()));
+    let held = st.owner.is_some() || st.resv_ip.is_some();
+    if rs.buffered {
+        let ip = if st.owner.is_some() { st.owner_ip } else { st.resv_ip };
+        set_attr(model, rs, "Owner", Value::octet_string(rcb::ip_octets(ip)));
+    } else {
+        set_attr(model, rs, "Resv", Value::boolean(held));
     }
 }
 
@@ -768,7 +873,7 @@ fn trg_ops(model: &Model, rs: &RcbState) -> TrgOps {
 
 /// Resolves a DatSet value (`LD/LN$DataSet`) to its members, or `None` when
 /// the dataset does not exist.
-fn resolve_data_set(model: &Model, reference: &str) -> Option<Vec<DsMember>> {
+pub(crate) fn resolve_data_set(model: &Model, reference: &str) -> Option<Vec<DsMember>> {
     let (domain, list) = reference.split_once('/')?;
     let (ln_name, ds_name) = list.split_once('$')?;
     model.device(domain)?.node(ln_name)?.data_set(ds_name)?;
@@ -776,7 +881,7 @@ fn resolve_data_set(model: &Model, reference: &str) -> Option<Vec<DsMember>> {
 }
 
 /// Resolves a dataset member item to its current value.
-fn item_value(model: &Model, domain: &str, item: &str) -> Option<Value> {
+pub(crate) fn item_value(model: &Model, domain: &str, item: &str) -> Option<Value> {
     let ld = model.device(domain)?;
     let ln_name = item.split('$').next()?;
     let ln = ld.node(ln_name)?;
@@ -860,6 +965,55 @@ async fn buffer_time_window(owner: Weak<Inner>, key: String, generation: u64, bu
 mod tests {
     use super::*;
     use crate::model::{Fc, ObjectReference};
+
+    fn entry_ids() -> ReportManager {
+        ReportManager::new(&mut Model::default(), 0)
+    }
+
+    /// An EntryID identifies a report uniquely within the server, not within
+    /// one control block (IEC 61850-7-2).
+    #[test]
+    fn entry_ids_are_unique_per_server() {
+        let rm = entry_ids();
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..1000 {
+            let id = rm.next_entry_id();
+            assert_eq!(id.len(), 8);
+            assert!(seen.insert(id), "an EntryID was handed out twice");
+        }
+    }
+
+    /// Buffered blocks emit under their own locks, so two of them can take an
+    /// EntryID at the same moment. Each must still get its own.
+    #[test]
+    fn concurrent_blocks_get_distinct_entry_ids() {
+        let rm = std::sync::Arc::new(entry_ids());
+        let workers: Vec<_> = (0..8)
+            .map(|_| {
+                let rm = rm.clone();
+                std::thread::spawn(move || (0..500).map(|_| rm.next_entry_id()).collect::<Vec<_>>())
+            })
+            .collect();
+        let mut seen = std::collections::HashSet::new();
+        for w in workers {
+            for id in w.join().unwrap() {
+                assert!(seen.insert(id), "an EntryID was handed out twice");
+            }
+        }
+    }
+
+    /// The high half of an EntryID comes from the start time, so a restarted
+    /// server's first EntryIDs do not collide with the last run's.
+    #[test]
+    fn entry_ids_survive_a_restart() {
+        let before = entry_ids();
+        let mut restarted = entry_ids();
+        restarted.entry_seed = before.entry_seed + 1;
+        let old: std::collections::HashSet<_> = (0..50).map(|_| before.next_entry_id()).collect();
+        for _ in 0..50 {
+            assert!(!old.contains(&restarted.next_entry_id()));
+        }
+    }
 
     fn changes(entries: &[(&str, Fc, TrgOps)]) -> ChangeSet {
         entries
