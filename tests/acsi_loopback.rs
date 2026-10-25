@@ -642,6 +642,57 @@ async fn a_direct_control_operates_and_updates_the_status_value() {
     assert!(c.read(format!("{object}.stVal"), Fc::St).await.unwrap().as_bool());
 }
 
+/// A double-point object is operated with a boolean but reports a `Dbpos`:
+/// the accepted operate must keep `stVal` a 2-bit string.
+#[tokio::test]
+async fn a_double_point_operate_sets_the_position_not_a_boolean() {
+    use iec61850::model::{new_logical_node, Dbpos, LnOptions};
+    let ld = "IEDCTRL";
+    let model = iec61850::model::Model {
+        name: "IED".into(),
+        devices: vec![iec61850::model::LogicalDevice {
+            name: ld.into(),
+            inst: "CTRL".into(),
+            nodes: vec![
+                new_logical_node("", "LLN0", "", &LnOptions::new()),
+                new_logical_node(
+                    "Q0",
+                    "XCBR",
+                    "1",
+                    &LnOptions::new().with_object_options("Pos", |o| {
+                        o.with_control_model(CtlModel::DirectNormal)
+                    }),
+                ),
+            ],
+        }],
+        ..Default::default()
+    };
+    let srv = Server::new(model, server::Options::new());
+    let (client_side, server_side) = tokio::io::duplex(256 * 1024);
+    let serving = srv.clone();
+    tokio::spawn(async move {
+        serving
+            .serve_stream(Box::new(server_side) as BoxTransport, None)
+            .await;
+    });
+    let c = Client::from_stream(
+        Box::new(client_side) as BoxTransport,
+        iec61850::client::Options::new(),
+    )
+    .await
+    .expect("the client associates");
+    let object = format!("{ld}/Q0XCBR1.Pos");
+    let co = c.control_for(object.clone()).await.unwrap();
+    for (on, want) in [(true, Dbpos::On), (false, Dbpos::Off)] {
+        co.operate(Value::boolean(on), &Default::default())
+            .await
+            .expect("the operate is accepted");
+        let st = c.read(format!("{object}.stVal"), Fc::St).await.unwrap();
+        assert_eq!(st.bit_len(), 2, "stVal stays a Dbpos: {st:?}");
+        assert_eq!(Dbpos::from_value(&st), want);
+    }
+}
+
 /// The control handler is where interlocking lives; its refusal has to reach
 /// the client as the additional cause it named.
 #[tokio::test]
