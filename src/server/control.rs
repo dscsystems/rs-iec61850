@@ -9,7 +9,7 @@ use crate::asn1::{
     cons, context_constructed, context_primitive, prim, Element, TAG_SEQUENCE, TAG_VISIBLE_STRING,
 };
 use crate::mms::{data_element, ServerConn, Type, Value};
-use crate::model::{AddCause, CtlModel, Fc, Model, ObjectReference, OrCat};
+use crate::model::{AddCause, CtlModel, DataAttribute, Dbpos, Fc, Model, ObjectReference, OrCat};
 
 use super::ConnId;
 
@@ -224,8 +224,13 @@ pub fn cf_millis(model: &Model, reference: &ObjectReference, name: &str) -> Dura
 }
 
 /// Reflects an accepted operate into the process image: the controllable
-/// object's `stVal` becomes the control value, and the new status reports
+/// object's `stVal` takes the control value, and the new status reports
 /// like any process change.
+///
+/// A double-point object (DPC) is operated with a boolean but reports a
+/// `Dbpos`, so `true` becomes on and `false` off. A control value of any
+/// other type than the status (a BSC tap command against a `ValWithTrans`,
+/// for instance) leaves `stVal` to the application.
 pub(crate) fn apply_control(
     model: &mut Model,
     reference: &ObjectReference,
@@ -234,11 +239,30 @@ pub(crate) fn apply_control(
 ) {
     let st_ref = reference.child("stVal");
     if let Some(da) = model.attribute_mut(&st_ref, Fc::St) {
-        if da.children.is_empty() && *ctl_val != Value::None {
-            let old = da.value.replace(ctl_val.clone());
-            let trg = da.trg_ops;
-            super::tx::record(changes, st_ref, Fc::St, trg, old.as_ref(), ctl_val);
+        if !da.children.is_empty() {
+            return;
         }
+        if let Some(status) = status_value(da, ctl_val) {
+            let old = da.value.replace(status.clone());
+            let trg = da.trg_ops;
+            super::tx::record(changes, st_ref, Fc::St, trg, old.as_ref(), &status);
+        }
+    }
+}
+
+/// The `stVal` an accepted control value stands for, if it maps onto one.
+fn status_value(da: &DataAttribute, ctl_val: &Value) -> Option<Value> {
+    let dbpos = da.btype.eq_ignore_ascii_case("Dbpos")
+        || (da.kind == Some(Type::BitString)
+            && da.value.as_ref().is_some_and(|v| v.bit_len() == 2));
+    let kind = ctl_val.type_of();
+    let same_type =
+        da.kind.is_none_or(|k| k == kind) && da.value.as_ref().is_none_or(|v| v.type_of() == kind);
+    match ctl_val {
+        Value::None => None,
+        Value::Boolean(on) if dbpos => Some(if *on { Dbpos::On } else { Dbpos::Off }.value()),
+        v if same_type => Some(v.clone()),
+        _ => None,
     }
 }
 
@@ -493,6 +517,55 @@ fn oper_item(reference: &ObjectReference) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn leaf(kind: Type, btype: &str, value: Value) -> DataAttribute {
+        DataAttribute {
+            name: "stVal".into(),
+            fc: Fc::St,
+            kind: Some(kind),
+            btype: btype.into(),
+            value: Some(value),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_boolean_control_maps_onto_a_double_point_status() {
+        let dpc = leaf(Type::BitString, "Dbpos", Dbpos::Off.value());
+        assert_eq!(
+            status_value(&dpc, &Value::boolean(true)),
+            Some(Dbpos::On.value())
+        );
+        assert_eq!(
+            status_value(&dpc, &Value::boolean(false)),
+            Some(Dbpos::Off.value())
+        );
+        // Recognised by its width when the model carries no bType.
+        let untyped = leaf(Type::BitString, "", Dbpos::Intermediate.value());
+        assert_eq!(
+            status_value(&untyped, &Value::boolean(true)),
+            Some(Dbpos::On.value())
+        );
+    }
+
+    #[test]
+    fn a_control_value_of_the_status_type_is_copied() {
+        let spc = leaf(Type::Boolean, "BOOLEAN", Value::boolean(false));
+        assert_eq!(
+            status_value(&spc, &Value::boolean(true)),
+            Some(Value::boolean(true))
+        );
+        let inc = leaf(Type::Integer, "INT32", Value::int32(1));
+        assert_eq!(status_value(&inc, &Value::int32(5)), Some(Value::int32(5)));
+    }
+
+    #[test]
+    fn a_control_value_of_another_type_leaves_the_status_alone() {
+        // A tap command (2-bit string) against an integer status.
+        let inc = leaf(Type::Integer, "INT32", Value::int32(1));
+        assert_eq!(status_value(&inc, &Value::bit_string(2)), None);
+        assert_eq!(status_value(&inc, &Value::None), None);
+    }
 
     #[test]
     fn control_attributes_are_recognised_by_their_phase() {
