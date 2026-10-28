@@ -66,6 +66,8 @@ tokio = { version = "1", features = ["full"] }
 rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "pem", "crypto"] }
 time = "0.3"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# The JSON Lines of the mms-interop adapters and their fixtures.
+serde_json = "1"
 
 [features]
 default = []
