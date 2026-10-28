@@ -1109,6 +1109,27 @@ mod tests {
         c.close().await.unwrap();
     }
 
+    /// A request the server never answers fails after the request timeout
+    /// instead of waiting for good, and the association stays usable.
+    #[tokio::test]
+    async fn an_unanswered_request_times_out() {
+        let addr = serve_one(
+            SlowHandler { started: Arc::new(tokio::sync::Notify::new()) },
+            AcceptOptions::default(),
+        )
+        .await;
+        let opts = super::super::Options {
+            request_timeout: Some(std::time::Duration::from_millis(200)),
+            ..Default::default()
+        };
+        let c = super::super::Conn::dial(&addr.to_string(), opts).await.unwrap();
+        let err = c.status(false).await.unwrap_err();
+        assert!(matches!(err, Error::Timeout), "{err}");
+        let err = c.identify().await.unwrap_err();
+        assert!(err.as_service_error().is_some_and(|se| se.rejected), "{err}");
+        c.close().await.unwrap();
+    }
+
     /// ObtainFile: the server reads the file back from the client while the
     /// client's request is outstanding.
     #[tokio::test]

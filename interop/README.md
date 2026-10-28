@@ -147,3 +147,60 @@ driver runs against both.
 ```sh
 GO_IEC61850=/path/to/go-iec61850 interop/go-security.sh
 ```
+
+## mms-interop adapter images (`mms-interop.sh`)
+
+`tests/interop_mms_interop.rs` runs this crate against the Docker adapter
+images of [otfabric/mms-interop](https://github.com/otfabric/mms-interop):
+libiec61850, iec61850bean, dscsystems/go-iec61850 and csp0924/iec61850-rust,
+each packaged as one program per role, reading one shared fixture and
+reporting in JSON Lines. The fixture is vendored in `testdata/mms-interop/`.
+The tests are skipped unless `MMS_INTEROP_STACKS` names the stacks to run, and
+the script sets it to `all`:
+
+```sh
+interop/mms-interop.sh                                  # every stack
+MMS_INTEROP_STACKS=dscsystems interop/mms-interop.sh    # one stack
+LIBIEC61850_IMAGE=mms-interop-libiec61850:local interop/mms-interop.sh
+```
+
+The images default to the digests mms-interop v0.4.0 published, and the
+variables that override them are the ones the Go suites use. Containers run
+on the host network, so no ports are mapped. Each test removes its containers
+by name; the script also clears any left behind by an interrupted run.
+
+| Test (per stack) | Direction | What it checks |
+|---|---|---|
+| `client_ied_services` | client → `ied-server` | Identify, server/LD directory, every value of `values.json`, a setting write read back, the dataset's values and directory |
+| `client_reports` | client → `ied-server` | `urcb01` and `brcb01`: RptID, enable, a GI report with both members, disable |
+| `client_controls` | client → `ied-server` | SPCSO1 direct, SPCSO2 SBO, SPCSO3 SBO-enhanced, and `stVal` follows each |
+| `client_mms_services` | MMS client → `mms-server` | Identify, Status, domain and variable name lists, every fixture type read, scalar writes read back, a structure's type description (not iec61850bean, which has no MMS server) |
+| `server_ied_client` | `ied-client` → server | the adapter's fixed browse, read, write and dataset sequence |
+| `server_controller` | `ied-controller` → server | each control model, then `stVal` read back by the adapter and on the server |
+| `server_reporter` | `ied-reporter` → server | `urcb01` read and enabled, a data-change report received, disabled |
+
+The client adapters were written against go-iec61850, which names a logical
+device by its `inst` alone and gives a report control block exactly its
+configured name. The server direction therefore serves the fixture with the
+IED name blanked, so the device is `InteropLD`, and with the report blocks
+marked `indexed="false"`, so the block is `urcb01` and not the `urcb0101` that
+IEC 61850-6 gives an indexed block (libiec61850's own server uses the latter).
+
+Two of the adapters' steps fail against this server on purpose: the
+`ied-client` writes `LLN0.Mod.stVal` and the `ied-reporter` writes
+`GGIO1.SPS1.stVal`, both under ST. IEC 61850-7-2 makes status read-only, so
+the server refuses both, as iec61850-rust's does. The test asserts that
+refusal, and for the reporter it changes the value on the process side, as a
+device would.
+
+Limitations of the peers are listed in `known()` in the test, with the
+reason for each. A step that hits one is logged as `known:` and skipped
+rather than failed:
+
+| Stack | Limitation |
+|---|---|
+| libiec61850, iec61850bean | the server does not apply `DPS1.stVal` and `TotVAh.actVal` from `values.json` (mms-interop lists this too); the value's type is still checked |
+| iec61850bean | the server cannot decode an Identify request and does not answer it |
+| iec61850bean | the server reads a dataset only when `specificationWithResult` is set; the test reads it that way instead |
+| iec61850bean | the server refuses SelectWithValue on SBOw (mms-interop lists this too) |
+| iec61850bean, iec61850-rust | the server accepts RptEna and GI on `brcb01` and never sends a report |

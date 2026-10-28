@@ -2,6 +2,7 @@
 //! server helpers, and the R-GOOSE/R-SV peer driver.
 #![allow(dead_code, unused_imports)]
 
+pub mod adapter;
 pub mod rsession;
 
 pub use std::path::{Path, PathBuf};
@@ -65,7 +66,12 @@ pub fn copy_dir(src: &Path, dst: &Path) {
 pub async fn dial(addr: &str) -> Client {
     let mut last = None;
     for _ in 0..50 {
-        match Client::dial_with(addr, ClientOptions::new().with_timeout(Duration::from_secs(3))).await {
+        match Client::dial_with(
+            addr,
+            ClientOptions::new().with_timeout(Duration::from_secs(3)).with_request_timeout(Duration::from_secs(5)),
+        )
+        .await
+        {
             Ok(c) => return c,
             Err(e) => last = Some(e),
         }

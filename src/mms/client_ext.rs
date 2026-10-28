@@ -342,7 +342,9 @@ impl Conn {
                 file_name(context_constructed(2), destination_file),
             ],
         );
-        let res = self.call_inner(req).await;
+        // The server reads the whole file before it answers, so the request
+        // timeout, sized for one exchange, does not apply.
+        let res = self.call_unbounded(req).await;
         *self.shared().files.lock().unwrap() = None;
         res.map(|_| ())
     }

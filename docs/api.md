@@ -111,11 +111,18 @@ let client = Client::dial("192.168.10.5:102").await?;
 let client = Client::dial_with(
     "192.168.10.5:102",
     Options::new()
-        .with_timeout(Duration::from_secs(5))
+        .with_timeout(Duration::from_secs(5))          // the handshake
+        .with_request_timeout(Duration::from_secs(5))  // each request
         .with_password("secret"),        // ACSE authentication
 )
 .await?;
 ```
+
+Every request waits at most `mms::DEFAULT_REQUEST_TIMEOUT` (10 s) for its
+response and then fails with `mms::Error::Timeout`, so a server that drops a
+request it cannot decode does not hang the caller.
+`Options::without_request_timeout` waits indefinitely. ObtainFile (`set_file`)
+is not bounded, since it lasts as long as the server takes to read the file.
 
 With the `tls` feature, `Options::with_tls` enables IEC 62351-3; the default
 MMS-over-TLS port is 3782.

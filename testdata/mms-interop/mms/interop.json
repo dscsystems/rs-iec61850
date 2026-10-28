@@ -1,0 +1,154 @@
+{
+  "revision": "mms-v2",
+  "identity": {
+    "vendor": "OTFabric",
+    "model": "libiec61850-mms-server",
+    "revision": "1.0"
+  },
+  "status": {
+    "logical": 1,
+    "physical": 1,
+    "comment": "VMD status reported by the Status service: logical 1 = no-state-changes-allowed, physical 1 = partially-operational"
+  },
+  "domains": {
+    "interop": {
+      "variables": {
+        "boolean": {
+          "type": "boolean",
+          "value": true,
+          "writable": true
+        },
+        "integer": {
+          "type": "integer",
+          "size": 32,
+          "value": -123,
+          "writable": true
+        },
+        "unsigned": {
+          "type": "unsigned",
+          "size": 32,
+          "value": 456,
+          "writable": true
+        },
+        "float32": {
+          "type": "float32",
+          "value": 21.5,
+          "writable": true
+        },
+        "visible-string": {
+          "type": "visible-string",
+          "size": 64,
+          "value": "interop",
+          "writable": true
+        },
+        "octet-string": {
+          "type": "octet-string",
+          "value": "deadbeef",
+          "comment": "hex-encoded bytes"
+        },
+        "bit-string": {
+          "type": "bit-string",
+          "value": "10110",
+          "comment": "MSB-first binary digits; leading zeros preserved; length = len(value)"
+        },
+        "utc-time": {
+          "type": "utc-time",
+          "value": "2024-01-01T00:00:00.000Z",
+          "comment": "RFC 3339 / ISO 8601 UTC timestamp"
+        },
+        "array": {
+          "type": "array",
+          "elementType": "integer",
+          "count": 5,
+          "value": [1, 2, 3, 4, 5],
+          "comment": "homogeneous integer array; read-only"
+        },
+        "structure": {
+          "type": "structure",
+          "value": [
+            { "type": "boolean", "value": true  },
+            { "type": "integer", "value": 42    }
+          ],
+          "comment": "ordered structure; components without a name are called comp0, comp1, ...; read-only"
+        },
+        "array-rw": {
+          "type": "array",
+          "elementType": "integer",
+          "count": 4,
+          "value": [10, 20, 30, 40],
+          "writable": true,
+          "comment": "writable integer array; target of element and range alternate access"
+        },
+        "structure-rw": {
+          "type": "structure",
+          "value": [
+            { "name": "flag",  "type": "boolean", "value": false },
+            { "name": "count", "type": "integer", "value": 7 }
+          ],
+          "writable": true,
+          "comment": "writable structure with named components; target of component alternate access"
+        },
+        "report-trigger": {
+          "type": "integer",
+          "size": 32,
+          "value": 0,
+          "writable": true,
+          "comment": "writing any value makes the server send the informationReports below to the writing connection"
+        }
+      },
+      "journals": {
+        "log1": {
+          "entries": [
+            { "entryId": 1, "occurrenceTime": "2024-01-01T00:00:01.000Z", "tag": "interop/integer", "type": "integer", "value": 1,  "reasonCode": 2 },
+            { "entryId": 2, "occurrenceTime": "2024-01-01T00:00:02.000Z", "tag": "interop/integer", "type": "integer", "value": 2,  "reasonCode": 2 },
+            { "entryId": 3, "occurrenceTime": "2024-01-01T00:00:03.000Z", "tag": "interop/boolean", "type": "boolean", "value": false, "reasonCode": 4 },
+            { "entryId": 4, "occurrenceTime": "2024-01-01T00:00:04.000Z", "tag": "interop/integer", "type": "integer", "value": 4,  "reasonCode": 2 }
+          ],
+          "comment": "entryId is encoded as 8 little-endian bytes; every entry also carries a ReasonCode variable (7-bit bit-string), as libiec61850 always adds one"
+        }
+      }
+    }
+  },
+  "informationReports": [
+    {
+      "variables": ["interop/integer", "interop/boolean"],
+      "comment": "listOfVariable form"
+    },
+    {
+      "vmdList": "interop-report",
+      "variables": ["interop/integer", "interop/boolean"],
+      "comment": "VMD-specific named variable list form; values are those of the listed variables"
+    }
+  ],
+  "files": {
+    "REC01.CFG": {
+      "content": "station,device,1999\n1,1A,0D\n",
+      "lastModified": "2024-01-02T03:04:05Z"
+    },
+    "REC01.DAT": {
+      "hex": "000102030405060708090a0b0c0d0e0f",
+      "lastModified": "2024-01-02T03:04:05Z"
+    },
+    "LARGE.BIN": {
+      "size": 150000,
+      "comment": "generated content: byte i is i % 251; larger than one MMS PDU so FileRead needs several chunks",
+      "lastModified": "2024-01-02T03:04:05Z"
+    },
+    "COMTRADE/REC02.CFG": {
+      "content": "nested file in a subdirectory\n",
+      "lastModified": "2024-01-02T03:04:05Z"
+    },
+    "DELETE.ME": {
+      "content": "target of the FileDelete test\n",
+      "lastModified": "2024-01-02T03:04:05Z"
+    },
+    "RENAME.ME": {
+      "content": "target of the FileRename test\n",
+      "lastModified": "2024-01-02T03:04:05Z"
+    },
+    "NOTIME.TXT": {
+      "content": "file without a fixture modification time\n",
+      "comment": "a store that does not know the time omits the optional lastModified; libiec61850 always reports the file system time"
+    }
+  }
+}

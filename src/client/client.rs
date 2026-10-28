@@ -11,12 +11,16 @@ use super::controlreports::ControlReports;
 use super::{Error, Result};
 
 /// Configures a [`Client`].
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Options {
     /// An ACSE authentication password.
     pub password: Option<String>,
     /// Bounds the connection handshake.
     pub timeout: Option<Duration>,
+    /// Bounds the wait for each request's response; `None` waits
+    /// indefinitely. The default is [`mms::DEFAULT_REQUEST_TIMEOUT`]. See
+    /// [`mms::Options::request_timeout`].
+    pub request_timeout: Option<Duration>,
     /// The ACSE identity to address; devices that check the called AP-title
     /// refuse an association that omits it.
     pub called: mms::AcseIdentity,
@@ -36,6 +40,24 @@ pub struct Options {
     pub tls_server_name: Option<String>,
 }
 
+impl Default for Options {
+    fn default() -> Options {
+        Options {
+            password: None,
+            timeout: None,
+            request_timeout: Some(mms::DEFAULT_REQUEST_TIMEOUT),
+            called: mms::AcseIdentity::default(),
+            calling: mms::AcseIdentity::default(),
+            initiate: None,
+            application_context: mms::ApplicationContext::default(),
+            #[cfg(feature = "tls")]
+            tls: None,
+            #[cfg(feature = "tls")]
+            tls_server_name: None,
+        }
+    }
+}
+
 impl Options {
     pub fn new() -> Options {
         Options::default()
@@ -52,6 +74,22 @@ impl Options {
     #[must_use]
     pub fn with_timeout(mut self, d: Duration) -> Options {
         self.timeout = Some(d);
+        self
+    }
+
+    /// Bounds the wait for each request's response, after which the request
+    /// fails with a timeout.
+    #[must_use]
+    pub fn with_request_timeout(mut self, d: Duration) -> Options {
+        self.request_timeout = Some(d);
+        self
+    }
+
+    /// Waits for responses indefinitely, for a server known to take longer
+    /// than any fixed bound.
+    #[must_use]
+    pub fn without_request_timeout(mut self) -> Options {
+        self.request_timeout = None;
         self
     }
 
@@ -96,6 +134,7 @@ impl Options {
             password: self.password,
             initiate: self.initiate,
             connect_timeout: self.timeout,
+            request_timeout: self.request_timeout,
             called: self.called,
             calling: self.calling,
             application_context: self.application_context,
