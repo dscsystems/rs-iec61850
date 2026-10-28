@@ -27,7 +27,10 @@ pub use client_ext::{
     encode_status_response, logical, parse_file_name, parse_file_rename, physical,
     JournalStatus, ObtainSource, ServerStatus,
 };
-pub use conn::{AcseIdentity, ApplicationContext, Conn, HandlerId, Options, Outstanding, State};
+pub use conn::{
+    AcseIdentity, ApplicationContext, Conn, HandlerId, Options, Outstanding, State,
+    DEFAULT_REQUEST_TIMEOUT,
+};
 pub use errors::{DataAccessError, Error, ErrorClass, Result, ServiceError};
 pub use pdu::{
     encode_initiate_request, encode_initiate_response, parse_initiate_request,

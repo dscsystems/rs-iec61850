@@ -55,8 +55,11 @@ impl std::fmt::Display for State {
     }
 }
 
+/// How long a confirmed request waits for its response unless
+/// [`Options::request_timeout`] says otherwise.
+pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Configures an MMS client connection.
-#[derive(Default)]
 pub struct Options {
     /// When set, the ACSE authentication value sent in the AARQ.
     pub password: Option<String>,
@@ -64,6 +67,17 @@ pub struct Options {
     pub initiate: Option<InitiateRequest>,
     /// Bounds the TCP and association handshake.
     pub connect_timeout: Option<Duration>,
+    /// Bounds the wait for each confirmed request's response (and each
+    /// Cancel's), after which the request fails with [`Error::Timeout`] and
+    /// a late response is discarded. A server that cannot decode a request
+    /// may drop it without answering, so without a bound the caller waits
+    /// for good. `None` waits indefinitely. The default is
+    /// [`DEFAULT_REQUEST_TIMEOUT`].
+    ///
+    /// It does not bound [`Outstanding::wait`], whose caller holds the
+    /// request, nor an ObtainFile, which lasts as long as the server takes
+    /// to read the file from this end.
+    pub request_timeout: Option<Duration>,
     /// The ACSE identity to address. Devices that check the called AP-title
     /// refuse an association that omits it.
     pub called: AcseIdentity,
@@ -87,10 +101,37 @@ impl std::fmt::Debug for Options {
             .field("password", &self.password.as_ref().map(|_| "<redacted>"))
             .field("initiate", &self.initiate)
             .field("connect_timeout", &self.connect_timeout)
+            .field("request_timeout", &self.request_timeout)
             .field("called", &self.called)
             .field("calling", &self.calling)
             .field("application_context", &self.application_context)
             .finish_non_exhaustive()
+    }
+}
+
+impl Default for Options {
+    fn default() -> Options {
+        Options {
+            password: None,
+            initiate: None,
+            connect_timeout: None,
+            request_timeout: Some(DEFAULT_REQUEST_TIMEOUT),
+            called: AcseIdentity::default(),
+            calling: AcseIdentity::default(),
+            application_context: ApplicationContext::default(),
+            #[cfg(feature = "tls")]
+            tls: None,
+            #[cfg(feature = "tls")]
+            tls_server_name: None,
+        }
+    }
+}
+
+/// Bounds a wait by the request timeout, when there is one.
+async fn bounded<T>(limit: Option<Duration>, fut: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+    match limit {
+        Some(d) => tokio::time::timeout(d, fut).await.map_err(|_| Error::Timeout)?,
+        None => fut.await,
     }
 }
 
@@ -130,6 +171,7 @@ pub(crate) struct Shared {
     done_tx: watch::Sender<bool>,
     next_id: AtomicU32,
     next_handler: AtomicU64,
+    request_timeout: Option<Duration>,
     pub(crate) writer: AsyncMutex<FramingWriter>,
 }
 
@@ -293,10 +335,17 @@ async fn cancel(shared: &Arc<Shared>, invoke_id: u32) -> Result<()> {
         shared.cancels.lock().unwrap().remove(&invoke_id);
         return Err(e);
     }
-    match rx.await {
-        Ok(res) => res,
-        Err(_) => Err(Error::Closed),
+    let res = bounded(shared.request_timeout, async {
+        match rx.await {
+            Ok(res) => res,
+            Err(_) => Err(Error::Closed),
+        }
+    })
+    .await;
+    if matches!(res, Err(Error::Timeout)) {
+        shared.cancels.lock().unwrap().remove(&invoke_id);
     }
+    res
 }
 
 /// An established MMS association.
@@ -429,6 +478,7 @@ impl Conn {
             done_tx,
             next_id: AtomicU32::new(1),
             next_handler: AtomicU64::new(1),
+            request_timeout: opts.request_timeout,
             writer: AsyncMutex::new(writer),
         });
 
@@ -556,12 +606,20 @@ impl Conn {
     /// thorough census wants to try `GetCapabilityList` and vendor services,
     /// and a proxy may need to forward whatever a client sends. A confirmed
     /// error comes back as [`Error::Service`], a per-item access failure as
-    /// [`Error::Access`].
+    /// [`Error::Access`]. It is bounded by [`Options::request_timeout`].
     pub async fn call(&self, service: Element) -> Result<Vec<u8>> {
         self.call_inner(service).await
     }
 
     pub(crate) async fn call_inner(&self, service: Element) -> Result<Vec<u8>> {
+        // Dropping the request on a timeout releases its response slot.
+        let req = self.start(service).await?;
+        bounded(self.shared.request_timeout, req.wait()).await
+    }
+
+    /// Issues a confirmed request and waits for its response without the
+    /// request timeout.
+    pub(crate) async fn call_unbounded(&self, service: Element) -> Result<Vec<u8>> {
         self.start(service).await?.wait().await
     }
 
