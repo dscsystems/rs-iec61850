@@ -514,3 +514,41 @@ async fn ed2_classes_are_served_in_shape() {
             .unwrap_or_else(|e| panic!("{item}: {e}"));
     }
 }
+
+// --- Control writes ---------------------------------------------------------
+
+/// A control write names a control structure of the model. One spelled like
+/// an `Oper`, `SBOw` or `Cancel` on an object that has none (a status-only
+/// `Beh`, a `Health`) is a write to a variable that does not exist, and its
+/// `stVal` stays what the process made it, whatever the writable FCs allow.
+#[tokio::test]
+async fn a_forged_control_write_is_refused() {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/simpleIO_direct_control.cid");
+    let m = scl::load_model(path, &scl::BuildOptions::new()).unwrap();
+    let s = Server::new(m, Options::new());
+    let addr = serve(&s).await;
+    let c = dial(&addr, ClientOptions::new()).await;
+
+    let st = "simpleIOGenericIO/GGIO1.Beh.stVal";
+    let before = c.read(st, Fc::St).await.unwrap();
+    for attr in ["Oper", "SBOw", "Cancel"] {
+        let forged = Value::structure(vec![Value::int8(2)]);
+        let err = c
+            .write(format!("simpleIOGenericIO/GGIO1.Beh.{attr}"), Fc::Co, forged)
+            .await
+            .expect_err("Beh has no control structure");
+        assert!(err.to_string().contains("object-non-existent"), "{attr}: {err}");
+    }
+    assert_eq!(c.read(st, Fc::St).await.unwrap(), before, "stVal is untouched");
+
+    // A real control still operates.
+    let co = c.control_for("simpleIOGenericIO/GGIO1.SPCSO1").await.unwrap();
+    co.operate(Value::boolean(true), &ControlOptions::new().with_model(CtlModel::DirectNormal))
+        .await
+        .expect("a real control operates");
+    assert!(c
+        .read("simpleIOGenericIO/GGIO1.SPCSO1.stVal", Fc::St)
+        .await
+        .unwrap()
+        .as_bool());
+}

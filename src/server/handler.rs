@@ -622,6 +622,19 @@ impl Handler {
             _ => ServiceType::OPERATE,
         };
         let reference = control::control_ref(domain, &base);
+        // The item names a control structure of the model, or there is no
+        // such variable: a status-only object, or a made-up spelling, has no
+        // control to operate and its `stVal` is not writable this way.
+        let exists = self
+            .inner
+            .model
+            .read()
+            .unwrap()
+            .attribute(&reference.child(phase_name), model::Fc::Co)
+            .is_some();
+        if !exists {
+            return Err(DataAccessError::ObjectNonExistent);
+        }
         let ctl_item = format!("{base}${phase_name}");
         let sc = self.inner.conns.lock().unwrap().get(&self.conn).cloned();
         let mut ctx =
