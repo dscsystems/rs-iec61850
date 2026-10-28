@@ -21,14 +21,27 @@ use iec61850::server::{self, Identity, Server};
 const LD: &str = "simpleIOGenericIO";
 
 fn reference_model() -> iec61850::model::Model {
-    scl::load_model(
+    let mut m = scl::load_model(
         concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/testdata/simpleIO_direct_control.cid"
         ),
         &scl::BuildOptions::new(),
     )
-    .expect("the reference CID loads")
+    .expect("the reference CID loads");
+    // Tests reconfigure these controls to other models by their ctlModel, and
+    // a select is a write to SBOw, which a direct control does not have.
+    for name in ["SPCSO1", "SPCSO3"] {
+        let object = m
+            .device_mut(LD)
+            .and_then(|ld| ld.node_mut("GGIO1"))
+            .and_then(|ln| ln.object_mut(name))
+            .expect("the control is there");
+        let mut sbow = object.attribute("Oper").expect("Oper").clone();
+        sbow.name = "SBOw".into();
+        object.attributes.push(sbow);
+    }
+    m
 }
 
 /// Brings up a server on the reference model and a client joined to it by an
