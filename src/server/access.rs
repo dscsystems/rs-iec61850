@@ -371,7 +371,41 @@ fn da_type_spec(da: &DataAttribute) -> TypeSpec {
         }
         return ts;
     }
-    value_type_spec(da.value.as_ref())
+    match btype_type_spec(&da.btype) {
+        // An array of a basic type names the element's type.
+        Some(el) if da.kind == Some(Type::Array) => TypeSpec::array(da.count, el),
+        Some(spec) => spec,
+        None => value_type_spec(da.value.as_ref()),
+    }
+}
+
+/// The declared type of a leaf from its basic type, at the width IEC
+/// 61850-8-1 maps it to.
+///
+/// A value only says it is an integer or a string, not how wide one: an
+/// `Enum` described from its value would be a 32-bit integer, where 8-1 makes
+/// it an 8-bit one, and a client that maps types back to basic types (as
+/// iec61850bean does) cannot place it. Basic types without a fixed mapping
+/// here are described from their value.
+fn btype_type_spec(btype: &str) -> Option<TypeSpec> {
+    let (kind, size) = match btype {
+        "INT8" | "Enum" => (Type::Integer, 8),
+        "INT16" => (Type::Integer, 16),
+        "INT32" => (Type::Integer, 32),
+        "INT64" => (Type::Integer, 64),
+        "INT8U" => (Type::Unsigned, 8),
+        "INT16U" => (Type::Unsigned, 16),
+        "INT24U" => (Type::Unsigned, 24),
+        "INT32U" => (Type::Unsigned, 32),
+        "VisString32" => (Type::VisibleString, 32),
+        "VisString64" => (Type::VisibleString, 64),
+        "VisString65" => (Type::VisibleString, 65),
+        "VisString129" | "ObjRef" => (Type::VisibleString, 129),
+        "VisString255" => (Type::VisibleString, 255),
+        "Unicode255" => (Type::MmsString, 255),
+        _ => return None,
+    };
+    Some(TypeSpec::sized(kind, size))
 }
 
 /// Derives the declared type of a leaf from the value it holds.
@@ -676,6 +710,29 @@ mod tests {
                     "{name} is advertised but does not resolve"
                 );
             }
+        }
+    }
+
+    /// Leaves are described at the width their basic type maps to, not from
+    /// the value they hold: an Enum is an 8-bit integer whatever its value.
+    #[test]
+    fn leaf_type_specs_follow_the_basic_type() {
+        let m: Model = scl::load_model(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/mms-interop/iec61850/interop.icd"),
+            &scl::BuildOptions::new(),
+        )
+        .expect("the interop fixture loads");
+        let ld = &m.devices[0];
+        let spec = |ln: &str, item: &str| type_spec_for(ld.node(ln).unwrap(), item).unwrap();
+        for (ln, item, kind, size) in [
+            ("LLN0", "LLN0$CF$Mod$ctlModel", Type::Integer, 8),
+            ("LLN0", "LLN0$ST$Mod$stVal", Type::Integer, 32),
+            ("LLN0", "LLN0$DC$Mod$d", Type::VisibleString, 255),
+            ("GGIO1", "GGIO1$CO$SPCSO1$Oper$ctlNum", Type::Unsigned, 8),
+            ("MMTR1", "MMTR1$ST$TotVAh$actVal", Type::Unsigned, 32),
+        ] {
+            let ts = spec(ln, item);
+            assert_eq!((ts.kind, ts.size), (Some(kind), size), "{item}");
         }
     }
 }
