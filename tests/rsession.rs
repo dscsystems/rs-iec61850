@@ -176,8 +176,11 @@ fn a_replay_is_refused() {
     )
     .unwrap();
     let c = UdpSocket::bind("127.0.0.1:0").unwrap();
-    for _ in 0..3 {
-        c.send_to(&b, recv.local_addr().unwrap()).unwrap();
+    c.send_to(&b, recv.local_addr().unwrap()).unwrap();
+    for _ in 0..2 {
+        // A changed UDP source port must not create a fresh replay window.
+        let other_port = UdpSocket::bind("127.0.0.1:0").unwrap();
+        other_port.send_to(&b, recv.local_addr().unwrap()).unwrap();
     }
     assert_eq!(receive(&recv).number, 10);
     assert!(recv.receive_timeout(Duration::from_millis(300)).unwrap().is_none());
@@ -274,6 +277,7 @@ fn sv_over_a_session() {
     });
     let pdu = sv::Pdu {
         app_id: 0x4001,
+            simulation: false,
         asdus: vec![sv::Asdu {
             sv_id: "RSV1".into(),
             smp_cnt: 17,

@@ -40,6 +40,8 @@ pub struct Message {
     pub num_dat_set_entries: u32,
     pub values: Vec<Value>,
     pub app_id: u16,
+    /// IEC 61850 simulation bit in Reserved1 (independent of `test`).
+    pub simulation: bool,
     /// The quality of `t`. `None` means the crate default, leap seconds known
     /// and accuracy 10. It is an option because every value of the octet is a
     /// real quality, 0 included, and a parsed message re-marshals with the
@@ -89,7 +91,7 @@ impl Message {
         let mut buf = Vec::with_capacity(length);
         buf.extend_from_slice(&self.app_id.to_be_bytes());
         buf.extend_from_slice(&(length as u16).to_be_bytes());
-        buf.extend_from_slice(&[0, 0, 0, 0]); // the two reserved words
+        buf.extend_from_slice(&[if self.simulation { 0x80 } else { 0 }, 0, 0, 0]);
         pdu.append(&mut buf);
         buf
     }
@@ -105,6 +107,7 @@ pub fn parse(apdu: &[u8]) -> Result<Message> {
     }
     let mut m = Message {
         app_id: u16::from_be_bytes([apdu[0], apdu[1]]),
+        simulation: apdu[4] & 0x80 != 0,
         ..Default::default()
     };
     // The length field covers the header and the PDU, and a publisher may pad
@@ -201,6 +204,7 @@ mod tests {
             num_dat_set_entries: 2,
             values: vec![Value::boolean(true), Quality::GOOD.value()],
             app_id: 0x1000,
+            simulation: false,
             time_quality: Some(TimeQuality::DEFAULT),
             anomalies: Anomalies::default(),
         }
@@ -394,4 +398,17 @@ mod tests {
             let _ = parse(&bad);
         }
     }
+
+    #[test]
+    fn simulation_uses_the_reserved_word_independently_of_test() {
+        let mut message = sample();
+        message.simulation = true;
+        message.test = false;
+        let wire = message.marshal();
+        assert_eq!(&wire[4..8], &[0x80, 0, 0, 0]);
+        let decoded = parse(&wire).unwrap();
+        assert!(decoded.simulation);
+        assert!(!decoded.test);
+    }
+
 }

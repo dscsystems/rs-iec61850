@@ -208,6 +208,12 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("mms: {0}")]
     Protocol(String),
+    #[cfg(feature = "e2e")]
+    #[error(transparent)]
+    E2E(#[from] crate::iec62351::e2e::Error),
+    #[cfg(feature = "tls")]
+    #[error(transparent)]
+    AProfile(#[from] crate::iec62351::aprofile::Error),
     /// The server refused the association: its AARE carried result rejected,
     /// with this ACSE service-user diagnostic.
     #[error("mms: association rejected{}", rejected_reason(*.0))]
@@ -276,6 +282,8 @@ impl Error {
     /// handed to the first; the others get the same kind with its message.
     pub(crate) fn duplicate(&self) -> Error {
         match self {
+            #[cfg(feature = "e2e")]
+            Error::E2E(error) => Error::E2E(error.clone()),
             Error::Service(se) => Error::Service(se.clone()),
             Error::Access(e) => Error::Access(*e),
             Error::Rejected(d) => Error::Rejected(*d),

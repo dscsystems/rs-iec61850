@@ -478,7 +478,7 @@ impl Session {
 
     fn fresh(&self, from: SocketAddr, spdu: &Spdu) -> bool {
         let k = StreamKey {
-            from,
+            from: SocketAddr::new(from.ip(), 0),
             si: spdu.si,
             key_id: spdu.key_id,
         };
@@ -488,6 +488,9 @@ impl Session {
             if let Some(reset) = self.replay_reset {
                 replay.retain(|_, w| w.last().is_some_and(|l| now.saturating_duration_since(l) <= reset));
             }
+        }
+        if !replay.contains_key(&k) && replay.len() >= MAX_STREAMS {
+            return false;
         }
         replay.entry(k).or_default().accept(
             spdu.number,

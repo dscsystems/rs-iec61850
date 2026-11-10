@@ -92,6 +92,11 @@ impl Supervision {
             return;
         }
         let mut d = self.deadlines.lock().unwrap();
+        if !d.blocks.contains_key(go_cb_ref) && d.blocks.len() >= 4096 {
+            if let Some(oldest) = d.blocks.iter().min_by_key(|(_, (at, _))| *at).map(|(key, _)| key.clone()) {
+                d.blocks.remove(&oldest);
+            }
+        }
         d.blocks
             .insert(go_cb_ref.to_string(), (Instant::now() + tatl, false));
         self.wake.notify_one();
@@ -110,19 +115,20 @@ impl Supervision {
                 return;
             }
             let now = Instant::now();
-            let due: Vec<String> = d
+            let due: Vec<(String, Instant)> = d
                 .blocks
                 .iter_mut()
                 .filter(|(_, (at, fired))| !*fired && *at <= now)
-                .map(|(r, (_, fired))| {
+                .map(|(r, (at, fired))| {
                     *fired = true;
-                    r.clone()
+                    (r.clone(), *at)
                 })
                 .collect();
             if !due.is_empty() {
                 drop(d);
-                for r in &due {
-                    expired(r);
+                for (r, at) in &due {
+                    let current = self.deadlines.lock().unwrap().blocks.get(r).is_some_and(|(current, fired)| *fired && current == at);
+                    if current { expired(r); }
                 }
                 d = self.deadlines.lock().unwrap();
                 continue;
@@ -195,6 +201,11 @@ impl SequenceTracker {
                 st.tatl = tatl;
             }
             None => {
+                if self.states.len() >= 4096 {
+                    if let Some(oldest) = self.states.iter().min_by_key(|(_, s)| s.arrival).map(|(k, _)| k.clone()) {
+                        self.states.remove(&oldest);
+                    }
+                }
                 self.states.insert(
                     m.go_cb_ref.clone(),
                     SeqState {

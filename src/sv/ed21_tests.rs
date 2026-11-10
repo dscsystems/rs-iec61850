@@ -102,6 +102,7 @@ fn smp_mod_round_trips() {
     for m in [None, Some(SmpMod::SmpPerPeriod), Some(SmpMod::SmpPerSec), Some(SmpMod::SecPerSmp)] {
         let raw = Pdu {
             app_id: 0x4000,
+            simulation: false,
             asdus: vec![asdu_with(m)],
         }
         .marshal();
@@ -128,6 +129,7 @@ fn smp_mod_wire_values() {
         };
         let raw = Pdu {
             app_id: 0x4000,
+            simulation: false,
             asdus: vec![a],
         }
         .marshal();
@@ -189,6 +191,7 @@ fn refr_tm_carries_the_clock_quality() {
         });
         let raw = Pdu {
             app_id: 0x4000,
+            simulation: false,
             asdus: vec![p.asdu(&LeSample::default())],
         }
         .marshal();
@@ -240,6 +243,7 @@ fn gm_identity() {
     let a = p.asdu(&LeSample::default());
     let raw = Pdu {
         app_id: 0x4000,
+            simulation: false,
         asdus: vec![a.clone()],
     }
     .marshal();

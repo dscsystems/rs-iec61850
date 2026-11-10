@@ -88,6 +88,15 @@ pub struct Handler {
     /// The tracking a read request owes (a select by reading SBO), applied
     /// once its read lock is released.
     read_tracking: Mutex<Vec<PendingSelect>>,
+    open_files: Mutex<std::collections::HashSet<i32>>,
+}
+
+impl Drop for Handler {
+    fn drop(&mut self) {
+        if let Some(files) = &self.inner.files {
+            for id in self.open_files.get_mut().unwrap().drain() { files.close(id); }
+        }
+    }
 }
 
 impl std::fmt::Debug for Handler {
@@ -150,6 +159,7 @@ impl Handler {
             peer,
             changes: Mutex::default(),
             read_tracking: Mutex::default(),
+            open_files: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -635,6 +645,13 @@ impl Handler {
         if !exists {
             return Err(DataAccessError::ObjectNonExistent);
         }
+        if phase == Phase::Oper || phase == Phase::Sbow {
+            let model = self.inner.model.read().unwrap();
+            if let Some(da) = model.attribute(&reference.child(phase_name).child("ctlVal"), model::Fc::Co) {
+                let Some(value) = v.children().first() else { return Err(DataAccessError::TypeInconsistent); };
+                if !value_fits(da, value) { return Err(DataAccessError::TypeInconsistent); }
+            }
+        }
         let ctl_item = format!("{base}${phase_name}");
         let sc = self.inner.conns.lock().unwrap().get(&self.conn).cloned();
         let mut ctx =
@@ -897,10 +914,16 @@ impl Handler {
             let spec = Decoder::new(entry).expect(context_constructed(0))?;
             let (md, mi) = parse_object_name(spec)?;
             let (reference, fc) = model::from_mms(&md, &mi);
+            if entries.len() >= 1024 {
+                return Err(mms::ServiceError::new(mms::ErrorClass::RESOURCE, 0).into());
+            }
             entries.push(Fcda::new(reference, fc));
         }
 
         let mut m = self.inner.model.write().unwrap();
+        if m.devices.iter().flat_map(|d| &d.nodes).flat_map(|n| &n.data_sets).filter(|ds| ds.deletable).count() >= 256 {
+            return Err(mms::ServiceError::new(mms::ErrorClass::RESOURCE, 0).into());
+        }
         let ln = m
             .device_mut(&domain)
             .and_then(|ld| ld.node_mut(ln_name))
@@ -996,6 +1019,10 @@ impl Handler {
                 let mut dec = Decoder::new(content);
                 let name_seq = dec.expect(context_constructed(0))?;
                 let name = mms::parse_file_name(name_seq).unwrap_or_default();
+                let mut owned = self.open_files.lock().unwrap();
+                if owned.len() >= 16 {
+                    return Err(mms::ServiceError::new(mms::ErrorClass::RESOURCE, 0).into());
+                }
                 let (id, size, modified) = files.open(&name).map_err(|e| {
                     // Tell a directory apart from a missing file: a client
                     // that picked a directory out of a listing needs to know
@@ -1010,6 +1037,7 @@ impl Handler {
                         _ => DataAccessError::ObjectNonExistent,
                     }
                 })?;
+                owned.insert(id);
                 let mut attrs = cons(
                     context_constructed(1),
                     [uint_elem(context_primitive(0), u64::from(size))],
@@ -1026,7 +1054,10 @@ impl Handler {
                 ))
             }
             SVC_FILE_READ => {
-                let id = asn1::decode_int(content).unwrap_or(0) as i32;
+                let id = i32::try_from(asn1::decode_int(content)?).map_err(|_| DataAccessError::ObjectValueInvalid)?;
+                if !self.open_files.lock().unwrap().contains(&id) {
+                    return Err(DataAccessError::ObjectNonExistent.into());
+                }
                 // A chunk fills what the association's PDU leaves after the
                 // response's own framing.
                 let limit = if max_pdu == 0 {
@@ -1046,7 +1077,11 @@ impl Handler {
                 ))
             }
             SVC_FILE_CLOSE => {
-                let id = asn1::decode_int(content).unwrap_or(0) as i32;
+                let id = i32::try_from(asn1::decode_int(content)?).map_err(|_| DataAccessError::ObjectValueInvalid)?;
+                if !self.open_files.lock().unwrap().contains(&id) {
+                    return Err(DataAccessError::ObjectNonExistent.into());
+                }
+                self.open_files.lock().unwrap().remove(&id);
                 files.close(id);
                 Ok(prim(context_primitive(SVC_FILE_CLOSE), Vec::new()))
             }

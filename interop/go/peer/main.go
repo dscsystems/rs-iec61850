@@ -41,6 +41,9 @@ import (
 	"github.com/dscsystems/go-iec61850/gdoi"
 	"github.com/dscsystems/go-iec61850/goose"
 	"github.com/dscsystems/go-iec61850/iec62351"
+	"github.com/dscsystems/go-iec61850/iec62351/aprofile"
+	"github.com/dscsystems/go-iec61850/iec62351/e2e"
+	"github.com/dscsystems/go-iec61850/iec62351/e2e/e2efile"
 	"github.com/dscsystems/go-iec61850/mms"
 	"github.com/dscsystems/go-iec61850/model"
 	"github.com/dscsystems/go-iec61850/rsession"
@@ -67,6 +70,10 @@ func main() {
 		gdoiServer(os.Args[2:])
 	case "gdoi-member":
 		gdoiMember(os.Args[2:])
+	case "e2e-server", "e2e-client":
+		nativeE2E(mode, os.Args[2:])
+	case "aprofile-server", "aprofile-client":
+		aProfile(mode, os.Args[2:])
 	case "tls-server":
 		tlsServer(os.Args[2:])
 	case "tls-client":
@@ -356,4 +363,109 @@ func tlsClient(args []string) {
 		fail("read: %v", err)
 	}
 	fmt.Printf("read %v\n", v)
+}
+
+// Exercise A-profile over a lab TCP transport; TLS is tested separately.
+func aProfile(mode string, args []string) {
+	if len(args) != 4 {
+		fail("usage: peer %s ADDR CERT KEY ROOT", mode)
+	}
+	cfg, err := aprofile.Load(aprofile.Files{Cert: args[1], Key: args[2], CA: []string{args[3]}}, 0)
+	if err != nil {
+		fail("configuration: %v", err)
+	}
+	cfg.AllowWithoutTLS = true
+	if mode == "aprofile-server" {
+		m, err := scl.LoadModel(os.Getenv("SIMPLEIO_CID"))
+		if err != nil {
+			fail("model: %v", err)
+		}
+		ln, err := net.Listen("tcp", args[0])
+		if err != nil {
+			fail("listen: %v", err)
+		}
+		srv := server.New(m, server.WithAProfile(cfg, true))
+		go srv.Serve(ln)
+		fmt.Printf("listening %s\n", ln.Addr())
+		untilStdinCloses()
+		srv.Close()
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	c, err := client.Dial(ctx, args[0], client.WithAProfile(cfg))
+	if err != nil {
+		fail("associate: %v", err)
+	}
+	defer c.Close()
+	value, err := c.Read(ctx, "simpleIOGenericIO/GGIO1.AnIn1.mag.f", model.MX)
+	if err != nil {
+		fail("read: %v", err)
+	}
+	fmt.Printf("read %v\n", value)
+}
+
+func nativeE2E(mode string, args []string) {
+	if len(args) != 11 {
+		fail("usage: peer %s ADDR CERT KEY ROOT OWN PEER GROUP ICV EDITION CORRECTIONS AUTH", mode)
+	}
+	own, err := e2efile.ParseAETitle(args[4])
+	if err != nil {
+		fail("own AE: %v", err)
+	}
+	remote, err := e2efile.ParseAETitle(args[5])
+	if err != nil {
+		fail("peer AE: %v", err)
+	}
+	loaded, err := e2efile.Load(e2efile.Files{Cert: args[1], Key: args[2], CA: []string{args[3]}}, own, 0)
+	if err != nil {
+		fail("credentials: %v", err)
+	}
+	group, _ := strconv.Atoi(args[6])
+	icv, _ := strconv.Atoi(args[7])
+	edition, err := e2e.ParseEdition(args[8])
+	if err != nil {
+		fail("edition: %v", err)
+	}
+	corrections, err := e2e.ParseCorrections(args[9])
+	if err != nil {
+		fail("corrections: %v", err)
+	}
+	auth, _ := strconv.Atoi(args[10])
+	policy := e2e.Policy{Trust: loaded.Trust, Revocation: loaded.Revocation, DHGroups: []e2e.Group{e2e.Group(group)}, ICVAlgs: []e2e.ICVAlg{e2e.ICVAlg(icv)}, Edition: edition, Corrections: corrections, Authenticator: e2e.AuthenticatorTagging(auth), MaxMessagesPerKey: 2}
+	if mode == "e2e-server" {
+		m, err := scl.LoadModel(os.Getenv("SIMPLEIO_CID"))
+		if err != nil {
+			fail("model: %v", err)
+		}
+		ln, err := net.Listen("tcp", args[0])
+		if err != nil {
+			fail("listen: %v", err)
+		}
+		cfg := &e2e.ServerConfig{Local: loaded.Identity, Policy: policy}
+		srv := server.New(m, server.WithE2E(cfg, true))
+		go srv.Serve(ln)
+		fmt.Printf("listening %s\n", ln.Addr())
+		untilStdinCloses()
+		srv.Close()
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	cfg := &e2e.ClientConfig{Local: loaded.Identity, Policy: policy, Peer: remote}
+	conn, err := client.Dial(ctx, args[0], client.WithE2E(cfg))
+	if err != nil {
+		fail("associate: %v", err)
+	}
+	for i := 0; i < 10; i++ {
+		value, err := conn.Read(ctx, "simpleIOGenericIO/GGIO1.AnIn1.mag.f", model.MX)
+		if err != nil {
+			fail("read: %v", err)
+		}
+		fmt.Printf("read %v\n", value)
+	}
+	if err := conn.Close(); err != nil {
+		fail("release: %v", err)
+	}
+	fmt.Println("released")
 }

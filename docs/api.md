@@ -976,3 +976,53 @@ See [`examples/`](../examples): `read`, `browse`, `report_monitor`, `control`,
 ```sh
 cargo run --example read -- 127.0.0.1:10102 simpleIOGenericIO/GGIO1.AnIn1.mag.f MX
 ```
+
+## Certificate-based ACSE authentication (A-profile)
+
+With feature `tls`, `iec62351::aprofile` authenticates the MMS association
+using a certificate and an RSA key. Configure TLS separately: ACSE
+signatures authenticate setup, while TLS protects the later data.
+
+```rust,no_run
+use std::sync::Arc;
+use iec61850::{client, iec62351::{aprofile, pki::UnavailablePolicy}};
+
+async fn example(tls: Arc<rustls::ClientConfig>) -> Result<(), Box<dyn std::error::Error>> {
+let profile = aprofile::Files {
+    certificate: "scada.pem".into(),
+    key: "scada.key".into(),
+    authorities: vec!["mms-ca.pem".into()],
+    crls: vec!["mms-ca.crl".into()],
+    ..Default::default()
+}.load(UnavailablePolicy::Warn)?;
+let options = client::Options::new()
+    .with_tls(tls)
+    .with_a_profile(Arc::new(profile));
+let client = client::Client::dial_with("ied.example:3782", options).await?;
+client.close().await?;
+Ok(())
+}
+```
+
+A server uses `server::Options::with_a_profile(profile, true)` to require
+certificate authentication, or `false` during migration. Share the same
+`Config`/`Verifier` between all associations: its replay cache is endpoint
+state. `mms::AssociationRequest::a_profile_peer` is the authenticated
+certificate for authorization; the ACSE calling identity alone is a claim.
+`mms::Conn::peer_a_profile_certificate()` exposes the server certificate.
+Applications supplying a TLS stream directly to `mms::accept_conn_opts`
+must set `AcceptOptions::tls_active` themselves.
+
+Trust anchors can be replaced on the shared `pki::TrustStore`; CRLs can be
+replaced on a `pki::RevocationChecker`. `UnavailablePolicy::Warn` permits
+unavailable revocation information; `FailClosed` requires a current,
+issuer-signed CRL. A signed revocation always refuses the peer.
+
+
+## Native E2E security
+
+With feature `e2e`, `client::Options::with_e2e(config, peer)` and
+`server::Options::with_e2e(config, required)` protect the association and
+subsequent MMS PDUs end to end. See [the native E2E guide](e2e.md) for
+certificate requirements, policy and a complete example. The A-profile
+and E2E are separate authentication modes.

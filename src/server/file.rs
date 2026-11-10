@@ -25,8 +25,8 @@ pub struct FileInfo {
 /// A file the server has open for a client.
 #[derive(Debug)]
 struct OpenFile {
-    data: Vec<u8>,
-    pos: usize,
+    file: std::fs::File,
+    remaining: u64,
 }
 
 /// The server's filestore: a directory on disk.
@@ -165,21 +165,24 @@ impl FileStore {
                 "file name escapes the filestore",
             )
         })?;
-        let meta = std::fs::metadata(&path)?;
+        let file = std::fs::File::open(&path)?;
+        let meta = file.metadata()?;
         if meta.is_dir() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "the name addresses a directory, not a file",
             ));
         }
-        let data = std::fs::read(&path)?;
+        if !meta.is_file() || meta.len() > u64::from(u32::MAX) {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a regular MMS-sized file"));
+        }
         let modified = meta.modified().ok();
-        let size = data.len().min(u32::MAX as usize) as u32;
+        let size = meta.len() as u32;
 
         let mut st = self.state.lock().unwrap();
         let id = st.next;
         st.next = st.next.wrapping_add(1).max(1);
-        st.open.insert(id, OpenFile { data, pos: 0 });
+        st.open.insert(id, OpenFile { file, remaining: u64::from(size) });
         Ok((id, size, modified))
     }
 
@@ -190,11 +193,15 @@ impl FileStore {
     pub fn read(&self, id: i32, max_chunk: usize) -> Option<(Vec<u8>, bool)> {
         let mut st = self.state.lock().unwrap();
         let f = st.open.get_mut(&id)?;
-        let end = (f.pos + max_chunk.max(1)).min(f.data.len());
-        let chunk = f.data[f.pos..end].to_vec();
-        f.pos = end;
-        let more = f.pos < f.data.len();
-        Some((chunk, more))
+        use std::io::Read;
+        let n = f.remaining.min(max_chunk.clamp(1, FILE_CHUNK_SIZE) as u64) as usize;
+        let mut chunk = vec![0; n];
+        if f.file.read_exact(&mut chunk).is_err() {
+            st.open.remove(&id);
+            return None;
+        }
+        f.remaining -= n as u64;
+        Some((chunk, f.remaining > 0))
     }
 
     /// Releases a file-read state machine.

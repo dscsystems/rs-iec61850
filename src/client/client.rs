@@ -1,3 +1,5 @@
+#[cfg(feature = "e2e")]
+use crate::mms::secure as super_e2e;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,6 +17,11 @@ use super::{Error, Result};
 pub struct Options {
     /// An ACSE authentication password.
     pub password: Option<String>,
+    /// IEC 62351-4 compatibility-mode authentication.
+    #[cfg(feature = "tls")]
+    pub a_profile: Option<Arc<crate::iec62351::aprofile::Config>>,
+    #[cfg(feature = "e2e")]
+    pub e2e: Option<super_e2e::ClientSecurity>,
     /// Bounds the connection handshake.
     pub timeout: Option<Duration>,
     /// Bounds the wait for each request's response; `None` waits
@@ -44,6 +51,10 @@ impl Default for Options {
     fn default() -> Options {
         Options {
             password: None,
+            #[cfg(feature = "tls")]
+            a_profile: None,
+            #[cfg(feature = "e2e")]
+            e2e: None,
             timeout: None,
             request_timeout: Some(mms::DEFAULT_REQUEST_TIMEOUT),
             called: mms::AcseIdentity::default(),
@@ -129,9 +140,26 @@ impl Options {
         self
     }
 
+    #[cfg(feature = "tls")]
+    #[must_use]
+    pub fn with_a_profile(mut self, config: Arc<crate::iec62351::aprofile::Config>) -> Self {
+        self.a_profile = Some(config);
+        self
+    }
+
+    #[cfg(feature = "e2e")]
+    #[must_use]
+    pub fn with_e2e(mut self, config: Arc<crate::iec62351::e2e::Config>, peer: crate::iec62351::e2e::AeTitle) -> Self {
+        self.e2e = Some(super_e2e::ClientSecurity { config, peer }); self
+    }
+
     fn into_mms(self) -> mms::Options {
         mms::Options {
             password: self.password,
+            #[cfg(feature = "tls")]
+            a_profile: self.a_profile,
+            #[cfg(feature = "e2e")]
+            e2e: self.e2e,
             initiate: self.initiate,
             connect_timeout: self.timeout,
             request_timeout: self.request_timeout,

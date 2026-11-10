@@ -143,6 +143,7 @@ pub struct App {
     pub addr: String,
     pub password: String,
     pub tls: bool,
+    pub tls_args: crate::tls::TlsArgs,
 
     pub ctx: Ctx,
     pub ident: String,
@@ -178,6 +179,7 @@ impl App {
             addr,
             password,
             tls,
+            tls_args: crate::tls::TlsArgs::default(),
             ctx: Ctx { client: None, tx },
             ident: String::new(),
             connected: false,
@@ -217,18 +219,21 @@ impl App {
         );
         let (addr, password, tls) = (self.addr.clone(), self.password.clone(), self.tls);
         let tx = self.ctx.tx.clone();
+        let tls_args = self.tls_args.clone();
         tokio::spawn(async move {
             let mut opts = Options::new().with_timeout(std::time::Duration::from_secs(6));
             if !password.is_empty() {
                 opts = opts.with_password(password);
             }
-            if tls {
-                // The TLS path needs a trust configuration the UI has no way to
-                // ask for; say so rather than silently connecting in the clear.
-                let _ = tx.send(Msg::ConnectFailed(
-                    "TLS needs a certificate configuration; use the library API".into(),
-                ));
-                return;
+            if tls || tls_args.application_security_enabled() {
+                if tls && !tls_args.enabled() {
+                    let _ = tx.send(Msg::ConnectFailed("TLS needs --tls-cert, --tls-key and --tls-ca".into()));
+                    return;
+                }
+                opts = match tls_args.client(opts) {
+                    Ok(opts) => opts,
+                    Err(error) => { let _ = tx.send(Msg::ConnectFailed(error.to_string())); return; }
+                };
             }
             match Client::dial_with(&addr, opts).await {
                 Ok(c) => {

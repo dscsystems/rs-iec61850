@@ -64,6 +64,8 @@ pub struct Asdu {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Pdu {
     pub app_id: u16,
+    /// IEC 61850 simulation bit in Reserved1.
+    pub simulation: bool,
     pub asdus: Vec<Asdu>,
 }
 
@@ -132,7 +134,7 @@ impl Pdu {
         let mut buf = Vec::with_capacity(length);
         buf.extend_from_slice(&self.app_id.to_be_bytes());
         buf.extend_from_slice(&(length as u16).to_be_bytes());
-        buf.extend_from_slice(&[0, 0, 0, 0]);
+        buf.extend_from_slice(&[if self.simulation { 0x80 } else { 0 }, 0, 0, 0]);
         sav.append(&mut buf);
         buf
     }
@@ -148,6 +150,7 @@ pub fn parse(apdu: &[u8]) -> Result<Pdu> {
     }
     let mut p = Pdu {
         app_id: u16::from_be_bytes([apdu[0], apdu[1]]),
+            simulation: apdu[4] & 0x80 != 0,
         asdus: Vec::new(),
     };
     let length = usize::from(u16::from_be_bytes([apdu[2], apdu[3]]));
@@ -291,6 +294,7 @@ mod tests {
     fn a_pdu_round_trips_through_the_wire_format() {
         let p = Pdu {
             app_id: 0x4000,
+            simulation: false,
             asdus: vec![asdu(7)],
         };
         let back = parse(&p.marshal()).expect("decodes");
@@ -313,6 +317,7 @@ mod tests {
     fn several_asdus_in_one_frame_all_decode() {
         let p = Pdu {
             app_id: 0x4000,
+            simulation: false,
             asdus: (0..8).map(asdu).collect(),
         };
         let back = parse(&p.marshal()).unwrap();
@@ -329,6 +334,7 @@ mod tests {
         for smp_cnt in [0u16, 1, 7, 255, 256, 3999, 65535] {
             let p = Pdu {
                 app_id: 0x4000,
+            simulation: false,
                 asdus: vec![Asdu {
                     smp_cnt,
                     ..asdu(smp_cnt)
@@ -364,6 +370,7 @@ mod tests {
         };
         let p = Pdu {
             app_id: 0x4000,
+            simulation: false,
             asdus: vec![a.clone()],
         };
         let back = parse(&p.marshal()).unwrap();
@@ -377,6 +384,7 @@ mod tests {
     fn the_apdu_header_carries_the_appid_and_length() {
         let p = Pdu {
             app_id: 0x4000,
+            simulation: false,
             asdus: vec![asdu(1)],
         };
         let b = p.marshal();
@@ -390,6 +398,7 @@ mod tests {
     fn trailing_padding_beyond_the_length_field_is_ignored() {
         let p = Pdu {
             app_id: 0x4000,
+            simulation: false,
             asdus: vec![asdu(5)],
         };
         let mut b = p.marshal();
@@ -404,6 +413,7 @@ mod tests {
 
         let good = Pdu {
             app_id: 0x4000,
+            simulation: false,
             asdus: vec![asdu(1)],
         }
         .marshal();
@@ -428,4 +438,13 @@ mod tests {
         // A publisher that pads gets the same answer.
         assert_eq!(be_u16(&[0x00, 0x00, 0x01, 0x00]), 256);
     }
+
+    #[test]
+    fn simulation_uses_reserved1() {
+        let message = Pdu { app_id: 0x4000, simulation: true, asdus: vec![asdu(1)] };
+        let wire = message.marshal();
+        assert_eq!(&wire[4..8], &[0x80, 0, 0, 0]);
+        assert!(parse(&wire).unwrap().simulation);
+    }
+
 }

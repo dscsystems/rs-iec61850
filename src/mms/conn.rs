@@ -1,3 +1,5 @@
+#[cfg(feature = "e2e")]
+use crate::mms::secure as super_e2e;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -63,6 +65,11 @@ pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 pub struct Options {
     /// When set, the ACSE authentication value sent in the AARQ.
     pub password: Option<String>,
+    /// IEC 62351-4 compatibility-mode authentication.
+    #[cfg(feature = "tls")]
+    pub a_profile: Option<Arc<crate::iec62351::aprofile::Config>>,
+    #[cfg(feature = "e2e")]
+    pub e2e: Option<super_e2e::ClientSecurity>,
     /// Overrides the proposed MMS association parameters.
     pub initiate: Option<InitiateRequest>,
     /// Bounds the TCP and association handshake.
@@ -113,6 +120,10 @@ impl Default for Options {
     fn default() -> Options {
         Options {
             password: None,
+            #[cfg(feature = "tls")]
+            a_profile: None,
+            #[cfg(feature = "e2e")]
+            e2e: None,
             initiate: None,
             connect_timeout: None,
             request_timeout: Some(DEFAULT_REQUEST_TIMEOUT),
@@ -172,7 +183,8 @@ pub(crate) struct Shared {
     next_id: AtomicU32,
     next_handler: AtomicU64,
     request_timeout: Option<Duration>,
-    pub(crate) writer: AsyncMutex<FramingWriter>,
+    max_pdu: usize,
+    pub(crate) writer: Arc<AsyncMutex<FramingWriter>>,
 }
 
 impl Shared {
@@ -199,7 +211,7 @@ impl Shared {
             let mut life = self.life.lock().unwrap();
             // The first cause wins; a Close or Abort records its own before
             // the reader ever sees the transport end.
-            if life.state == State::Connected {
+            if life.state == State::Connected || (life.state == State::Closing && life.close_err.is_none()) {
                 life.close_err = Some(Arc::new(err));
             }
             life.state = State::Closed;
@@ -246,10 +258,17 @@ impl Shared {
         )
         .encode();
 
+        if req.len() > self.max_pdu {
+            self.pending.lock().unwrap().remove(&id);
+            return Err(Error::protocol("request exceeds negotiated PDU size"));
+        }
         tracing::trace!(invoke_id = id, len = req.len(), "mms: tx PDU");
-        let send = self.writer.lock().await.send_mms(&req).await;
+        let send = bounded(self.request_timeout, async {
+            self.writer.lock().await.send_mms(&req).await
+        }).await;
         if let Err(e) = send {
             self.pending.lock().unwrap().remove(&id);
+            self.fail_all(e.duplicate());
             return Err(e);
         }
         Ok(Outstanding {
@@ -331,8 +350,9 @@ async fn cancel(shared: &Arc<Shared>, invoke_id: u32) -> Result<()> {
         cancels.insert(invoke_id, tx);
     }
     let pdu = asn1::uint_elem(TAG_CANCEL_REQUEST, u64::from(invoke_id)).encode();
-    if let Err(e) = shared.writer.lock().await.send_mms(&pdu).await {
+    if let Err(e) = bounded(shared.request_timeout, async { shared.writer.lock().await.send_mms(&pdu).await }).await {
         shared.cancels.lock().unwrap().remove(&invoke_id);
+        shared.fail_all(e.duplicate());
         return Err(e);
     }
     let res = bounded(shared.request_timeout, async {
@@ -360,8 +380,14 @@ pub struct Conn {
     reader_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     negotiated: InitiateRequest,
     responding: AcseIdentity,
+    #[cfg(feature = "tls")]
+    a_profile_peer: Option<crate::x509::Certificate>,
     /// Runs one ObtainFile at a time.
     pub(crate) obtain_lock: AsyncMutex<()>,
+    #[cfg(feature = "e2e")]
+    e2e_peer: Option<crate::iec62351::e2e::PeerSecurity>,
+    #[cfg(feature = "e2e")]
+    rekey_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl std::fmt::Debug for Conn {
@@ -392,24 +418,28 @@ impl Conn {
         // every round trip; MMS is strictly request/response.
         let _ = tcp.set_nodelay(true);
 
+        #[allow(unused_mut)]
+        let mut tls_peer_certificate: Option<Vec<u8>> = None;
         #[cfg(feature = "tls")]
         let stream: BoxTransport = match &opts.tls {
             Some(cfg) => {
                 let name = opts
                     .tls_server_name
                     .clone()
-                    .unwrap_or_else(|| addr.rsplit_once(':').map_or(addr, |(h, _)| h).to_string());
+                    .unwrap_or_else(|| addr.rsplit_once(':').map_or(addr, |(h, _)| h).trim_start_matches('[').trim_end_matches(']').to_string());
                 let server_name = tokio_rustls::rustls::pki_types::ServerName::try_from(name)
                     .map_err(|e| Error::protocol(format!("invalid TLS server name: {e}")))?;
                 let connector = tokio_rustls::TlsConnector::from(cfg.clone());
-                Box::new(connector.connect(server_name, tcp).await?)
+                let tls = connector.connect(server_name, tcp).await?;
+                tls_peer_certificate = tls.get_ref().1.peer_certificates().and_then(|chain| chain.first()).map(|cert| cert.to_vec());
+                Box::new(tls)
             }
             None => Box::new(tcp),
         };
         #[cfg(not(feature = "tls"))]
         let stream: BoxTransport = Box::new(tcp);
 
-        Conn::handshake(stream, opts).await
+        Conn::handshake(stream, opts, tls_peer_certificate).await
     }
 
     /// Establishes an association over an already-connected stream.
@@ -417,13 +447,22 @@ impl Conn {
     /// This is what the in-memory tests and the TLS path share, and it is the
     /// entry point for callers that bring their own transport.
     pub async fn from_stream(stream: BoxTransport, opts: Options) -> Result<Conn> {
-        Conn::handshake(stream, opts).await
+        bounded(opts.connect_timeout, Conn::handshake(stream, opts, None)).await
     }
 
-    async fn handshake(stream: BoxTransport, opts: Options) -> Result<Conn> {
+    async fn handshake(stream: BoxTransport, opts: Options, #[allow(unused_variables)] tls_peer_certificate: Option<Vec<u8>>) -> Result<Conn> {
         let mut ct = cotp::Conn::connect(stream, cotp::Options::default()).await?;
 
         let init = opts.initiate.clone().unwrap_or_default();
+        #[cfg(feature = "e2e")]
+        if let Some(security) = &opts.e2e {
+            if opts.password.as_ref().is_some_and(|p| !p.is_empty()) || opts.a_profile.is_some() {
+                return Err(Error::protocol("E2E uses the ACSE kernel and cannot be combined with password or A-profile"));
+            }
+            let (reader, mut writer, negotiated, responding) = super::secure::client_handshake(ct, &opts, security, &init, tls_peer_certificate.as_deref()).await?;
+            writer.write_timeout = opts.request_timeout;
+            return Self::established(reader, writer, negotiated, responding, opts.request_timeout);
+        }
         // The ACSE AARQ wraps the MMS InitiateRequest; the presentation CP
         // wraps the AARQ; the session CONNECT carries the CP.
         let aarq = acse::aarq_for(
@@ -433,6 +472,17 @@ impl Conn {
             &opts.calling,
             opts.application_context,
         );
+        #[cfg(feature = "tls")]
+        let aarq = if let Some(ap) = &opts.a_profile {
+            if opts.password.as_ref().is_some_and(|p| !p.is_empty()) {
+                return Err(Error::protocol("A-profile cannot be combined with a password"));
+            }
+            if opts.tls.is_none() && !ap.allow_without_tls {
+                return Err(Error::protocol("A-profile requires TLS"));
+            }
+            let value = ap.value()?;
+            acse::with_authentication(&aarq, true, &ap.mechanism.clone().unwrap_or_else(crate::iec62351::aprofile::mechanism), &value.encode())?
+        } else { aarq };
         let cp = presentation::build_cp(
             presentation::DEFAULT_CALLING_PSEL,
             presentation::DEFAULT_CALLED_PSEL,
@@ -460,12 +510,49 @@ impl Conn {
         if !res.accepted {
             return Err(Error::Rejected(res.diagnostic));
         }
+        #[cfg(feature = "tls")]
+        let a_profile_peer = if let Some(ap) = &opts.a_profile {
+            let verified = (|| {
+                if res.mechanism.is_none() { return Err(Error::protocol("AARE has no authentication mechanism")); }
+                let value = res.authentication.as_deref().ok_or_else(|| Error::protocol("AARE has no A-profile value"))?;
+                let value = crate::iec62351::aprofile::Value::parse(value)?;
+                ap.verifier.verify(&value).map_err(Error::from)
+            })();
+            match verified {
+                Ok(cert) => Some(cert),
+                Err(e) => {
+                    let _ = session::abort(&mut ct, &[]).await;
+                    return Err(e);
+                }
+            }
+        } else { None };
+        if opts.called.ap_title.as_ref().is_some_and(|id| Some(id) != res.responding.ap_title.as_ref())
+            || opts.called.ae_qualifier.is_some_and(|id| Some(id) != res.responding.ae_qualifier) {
+            return Err(Error::protocol("responding ACSE identity does not match called identity"));
+        }
         let negotiated = parse_initiate_response(&res.user_data)?;
 
         // We proposed the contexts, so their identifiers are ours.
-        let (reader, writer) =
+        let (reader, mut writer) =
             transport::split(ct, presentation::CONTEXT_MMS, presentation::CONTEXT_ACSE);
+        writer.write_timeout = opts.request_timeout;
+        #[allow(unused_mut)]
+        let mut conn = Self::established(reader, writer, negotiated, res.responding, opts.request_timeout)?;
+        #[cfg(feature = "tls")]
+        { conn.a_profile_peer = a_profile_peer; }
+        Ok(conn)
+    }
+
+    #[allow(unused_mut)]
+    fn established(mut reader: FramingReader, writer: FramingWriter, negotiated: InitiateRequest, responding: AcseIdentity, request_timeout: Option<Duration>) -> Result<Self> {
+        #[cfg(feature = "e2e")]
+        let security = writer.security.clone();
+        #[cfg(feature = "e2e")]
+        let e2e_peer = security.as_ref().and_then(|s| s.association.lock().unwrap().peer_security().cloned());
         let (done_tx, done_rx) = watch::channel(false);
+        let writer = Arc::new(AsyncMutex::new(writer));
+        #[cfg(feature = "e2e")]
+        reader.attach_writer(writer.clone());
         let shared = Arc::new(Shared {
             pending: Mutex::new(HashMap::new()),
             cancels: Mutex::new(HashMap::new()),
@@ -478,19 +565,52 @@ impl Conn {
             done_tx,
             next_id: AtomicU32::new(1),
             next_handler: AtomicU64::new(1),
-            request_timeout: opts.request_timeout,
-            writer: AsyncMutex::new(writer),
+            request_timeout,
+            max_pdu: usize::try_from(negotiated.local_detail).unwrap_or(0).max(1),
+            writer,
         });
 
         let reader_task = tokio::spawn(read_loop(reader, Arc::clone(&shared)));
+        #[cfg(feature = "e2e")]
+        let rekey_task = security.map(|security| {
+            let weak = Arc::downgrade(&shared);
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(Duration::from_secs(1));
+                loop {
+                    ticker.tick().await;
+                    let Some(shared) = weak.upgrade() else { return };
+                    if shared.state() != State::Connected { return; }
+                    let overdue = security.association.lock().unwrap().rekey_overdue(Duration::from_secs(30));
+                    if overdue {
+                        shared.fail_all(Error::E2E(crate::iec62351::e2e::Error::data(0, "rekey acknowledgement overdue")));
+                        let _ = shared.writer.lock().await.shutdown().await;
+                        return;
+                    }
+                    let due = security.association.lock().unwrap().rekey_due();
+                    if due {
+                        let request = asn1::bool_elem(context_primitive(super::service::STATUS as u32), false);
+                        match shared.start(request).await {
+                            Ok(request) => { let _ = bounded(shared.request_timeout, request.wait()).await; }
+                            Err(_) => return,
+                        }
+                    }
+                }
+            })
+        });
 
         Ok(Conn {
             shared,
             done_rx,
             reader_task: Mutex::new(Some(reader_task)),
             negotiated,
-            responding: res.responding,
+            responding,
+            #[cfg(feature = "tls")]
+            a_profile_peer: None,
             obtain_lock: AsyncMutex::new(()),
+            #[cfg(feature = "e2e")]
+            e2e_peer,
+            #[cfg(feature = "e2e")]
+            rekey_task: Mutex::new(rekey_task),
         })
     }
 
@@ -498,6 +618,14 @@ impl Conn {
     ///
     /// It is empty when the peer omitted it, which is legal, and which a proxy
     /// has to reproduce faithfully rather than inventing one.
+    #[cfg(feature = "tls")]
+    pub fn peer_a_profile_certificate(&self) -> Option<&crate::x509::Certificate> {
+        self.a_profile_peer.as_ref()
+    }
+
+    #[cfg(feature = "e2e")]
+    pub fn peer_e2e_security(&self) -> Option<&crate::iec62351::e2e::PeerSecurity> { self.e2e_peer.as_ref() }
+
     pub fn responding_identity(&self) -> &AcseIdentity {
         &self.responding
     }
@@ -657,6 +785,7 @@ impl Conn {
             let _ = w.shutdown().await;
             res
         };
+        self.shared.fail_all(Error::Closed);
         self.finish_close().await;
         res
     }
@@ -674,12 +803,32 @@ impl Conn {
             life.close_err = Some(Arc::new(Error::Closed));
         }
 
+        #[cfg(feature = "e2e")]
+        {
+            let mut w = self.shared.writer.lock().await;
+            if w.security.is_some() {
+                self.shared.life.lock().unwrap().close_err = None;
+                let sent = w.send_release(false).await;
+                drop(w);
+                let outcome = if sent.is_ok() {
+                    bounded(self.shared.request_timeout, async {
+                        self.closed().await;
+                        match self.err() { Some(error) if !matches!(&*error, Error::Closed) => Err(error.duplicate()), _ => Ok(()) }
+                    }).await
+                } else { sent };
+                self.shared.fail_all(match &outcome { Err(error) => error.duplicate(), _ => Error::Closed });
+                let _ = self.shared.writer.lock().await.shutdown().await;
+                self.finish_close().await;
+                return outcome;
+            }
+        }
         {
             let mut w = self.shared.writer.lock().await;
             let conclude = prim(TAG_CONCLUDE_REQUEST, Vec::new()).encode();
             let _ = w.send_mms(&conclude).await;
             let _ = w.shutdown().await;
         }
+        self.shared.fail_all(Error::Closed);
         self.finish_close().await;
         Ok(())
     }
@@ -701,6 +850,8 @@ impl Conn {
 
 impl Drop for Conn {
     fn drop(&mut self) {
+        #[cfg(feature = "e2e")]
+        if let Some(task) = self.rekey_task.lock().unwrap().take() { task.abort(); }
         // Stop the reader rather than leaking a task that holds the socket.
         if let Some(h) = self.reader_task.lock().unwrap().take() {
             h.abort();
@@ -709,8 +860,14 @@ impl Drop for Conn {
 }
 
 async fn read_loop(mut reader: FramingReader, shared: Arc<Shared>) {
+    let mut done = shared.done_tx.subscribe();
     loop {
-        match reader.recv_mms().await {
+        if *done.borrow() { return; }
+        let received = tokio::select! {
+            _ = done.changed() => return,
+            received = reader.recv_mms() => received,
+        };
+        match received {
             Ok(pdu) => dispatch(&pdu, &shared),
             Err(e) => {
                 shared.fail_all(e);

@@ -58,8 +58,7 @@ impl PublicKey {
     pub fn rsa_bits(&self) -> Option<usize> {
         match self {
             PublicKey::Rsa { n, .. } => {
-                let first = n.first().copied().unwrap_or(0);
-                Some(n.len() * 8 - first.leading_zeros() as usize)
+                Some(n.first().map_or(0, |first| n.len() * 8 - first.leading_zeros() as usize))
             }
             _ => None,
         }
@@ -110,6 +109,7 @@ pub struct Crl {
     pub issuer: Vec<u8>,
     /// When the next CRL is due, in seconds since the Unix epoch.
     pub next_update: Option<i64>,
+    pub this_update: i64,
     /// The serial numbers revoked, as INTEGER content octets.
     pub revoked: Vec<Vec<u8>>,
     pub signed: Signed,
@@ -182,7 +182,11 @@ pub fn parse(der: &[u8]) -> Result<Certificate> {
     let (signed, tbs) = parse_signed(der)?;
     let mut d = Decoder::new(tbs);
     let version = match d.optional(context(0, true))? {
-        Some(v) => asn1::decode_int(Decoder::new(v).expect(TAG_INTEGER)?)? as u8 + 1,
+        Some(v) => {
+            let value = asn1::decode_int(Decoder::new(v).expect(TAG_INTEGER)?)?;
+            if !(0..=2).contains(&value) { return Err(Error("invalid certificate version".into())); }
+            value as u8 + 1
+        },
         None => 1,
     };
     let serial = d.expect(TAG_INTEGER)?.to_vec();
@@ -232,7 +236,7 @@ pub fn parse_crl(der: &[u8]) -> Result<Crl> {
     d.optional(TAG_INTEGER)?; // version
     d.expect(TAG_SEQUENCE)?; // signature algorithm
     let (issuer, _) = tlv(&mut d, TAG_SEQUENCE)?;
-    parse_time(&mut d)?; // thisUpdate
+    let this_update = parse_time(&mut d)?; // thisUpdate
     let next_update = match d.peek() {
         Ok(t) if t == TAG_UTC_TIME || t == asn1::TAG_GENERAL_TIME => Some(parse_time(&mut d)?),
         _ => None,
@@ -248,6 +252,7 @@ pub fn parse_crl(der: &[u8]) -> Result<Crl> {
     Ok(Crl {
         issuer: issuer.to_vec(),
         next_update,
+        this_update,
         revoked,
         signed,
     })

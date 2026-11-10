@@ -54,13 +54,9 @@ impl AfPacket {
     pub fn open(ifname: &str, ether_types: &[u16]) -> Result<AfPacket> {
         let index = interface_index(ifname)?;
 
-        // One requested EtherType is also filtered in the kernel via the bind
-        // protocol; otherwise everything is received and filtered here.
-        let proto: u16 = if ether_types.len() == 1 {
-            ether_types[0]
-        } else {
-            libc::ETH_P_ALL as u16
-        };
+        // Receive the outer VLAN EtherType too, then filter on the inner
+        // protocol after decapsulation.
+        let proto = libc::ETH_P_ALL as u16;
 
         // SAFETY: a plain socket(2) call with constant arguments.
         let fd = unsafe {
@@ -93,6 +89,21 @@ impl AfPacket {
             // SAFETY: fd is open and not used again.
             unsafe { libc::close(fd) };
             return Err(Error::Frame(format!("bind {ifname}: {e}")));
+        }
+
+        let mut membership: libc::packet_mreq = unsafe { std::mem::zeroed() };
+        membership.mr_ifindex = index;
+        membership.mr_type = libc::PACKET_MR_ALLMULTI as u16;
+        // SAFETY: membership is a packet_mreq for the bound interface.
+        let rc = unsafe {
+            libc::setsockopt(fd, libc::SOL_PACKET, libc::PACKET_ADD_MEMBERSHIP,
+                std::ptr::addr_of!(membership).cast(),
+                std::mem::size_of::<libc::packet_mreq>() as libc::socklen_t)
+        };
+        if rc < 0 {
+            let e = std::io::Error::last_os_error();
+            unsafe { libc::close(fd) };
+            return Err(Error::Frame(format!("multicast membership: {e}")));
         }
 
         let tv = read_timeout();
@@ -192,8 +203,8 @@ impl Interface for AfPacket {
         if self.closed.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
-        // SAFETY: fd is open, and the swap above guarantees one close only.
-        unsafe { libc::close(self.fd) };
+        // Reads observe the flag after their receive timeout. Retain the fd
+        // until Drop so an in-flight syscall cannot use a recycled descriptor.
         Ok(())
     }
 }
@@ -201,6 +212,8 @@ impl Interface for AfPacket {
 impl Drop for AfPacket {
     fn drop(&mut self) {
         let _ = self.close();
+        // SAFETY: Drop has exclusive ownership; no method can still use fd.
+        unsafe { libc::close(self.fd) };
     }
 }
 

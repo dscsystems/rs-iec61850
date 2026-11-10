@@ -20,6 +20,10 @@ pub struct AssociationRequest {
     /// TLS. An authenticator can combine the IEC 62351-3 certificate with a
     /// password or an allow-list.
     pub peer_certificates: Vec<Vec<u8>>,
+    #[cfg(feature = "tls")]
+    pub a_profile_peer: Option<crate::x509::Certificate>,
+    #[cfg(feature = "e2e")]
+    pub e2e_peer: Option<crate::iec62351::e2e::PeerSecurity>,
 }
 
 /// Decides whether to accept a client: `Ok` accepts, an error refuses with the

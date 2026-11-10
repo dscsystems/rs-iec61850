@@ -9,6 +9,8 @@
 //! ```
 
 mod sweep;
+#[path = "../common/tls.rs"]
+mod tls;
 
 use std::time::Duration;
 
@@ -19,6 +21,14 @@ use iec61850::model::{Fc, OrCat};
 fn usage() -> ! {
     eprintln!(
         "usage: ied-client [--addr HOST:PORT] [--password PW] COMMAND
+
+  --e2e-cert PEM --e2e-key PEM --e2e-ca PEM
+  --e2e-peer OID/QUAL  expected server AE (clients)
+  --e2e-edition 2018|2020  native E2E wire edition
+TLS: --tls-cert PEM --tls-key PEM --tls-ca PEM [--tls-crl PEM]
+     [--tls-server-name NAME | --tls-no-server-name] [--tls13]
+ACSE: --mms-cert PEM --mms-key PEM --mms-ca PEM [--mms-crl PEM]
+      [--mms-legacy-mechanism] [--mms-without-tls]
 
 commands:
   identify                      report the server's vendor, model and revision
@@ -56,10 +66,12 @@ fn parse_value(s: &str) -> Value {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut addr = "127.0.0.1:10102".to_string();
     let mut password: Option<String> = None;
+    let mut tls = tls::TlsArgs::default();
     let mut rest: Vec<String> = Vec::new();
 
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
+        if tls.parse(&a, &mut it)? { continue; }
         match a.as_str() {
             "--addr" => addr = it.next().unwrap_or_else(|| usage()),
             "--password" => password = Some(it.next().unwrap_or_else(|| usage())),
@@ -79,10 +91,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(pw) = password {
         opts = opts.with_password(pw);
     }
+    let opts = tls.client(opts)?;
     let client = Client::dial_with(&addr, opts).await?;
 
-    let code = run(&client, &rest).await;
-    client.close().await.ok();
+    let mut code = run(&client, &rest).await;
+    if let Err(error) = client.close().await {
+        eprintln!("close: {error}");
+        code = 1;
+    }
     std::process::exit(code);
 }
 

@@ -50,3 +50,6 @@ pub use value::{TimeQuality, Type, Value};
 pub use value_codec::{
     append_data, data_element, decode_access_result, decode_data, encode_data,
 };
+
+#[cfg(feature = "e2e")]
+pub mod secure;

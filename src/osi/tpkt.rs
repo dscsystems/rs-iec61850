@@ -11,7 +11,7 @@ const VERSION: u8 = 3;
 
 /// Bounds a single TPKT to guard against hostile length fields; IEC 61850
 /// payloads are far smaller.
-pub const MAX_PACKET: usize = 1 << 20;
+pub const MAX_PACKET: usize = u16::MAX as usize;
 
 /// Frames `payload` as a TPKT and writes it to `w`.
 pub async fn write_packet<W>(w: &mut W, payload: &[u8]) -> Result<()>
@@ -88,4 +88,15 @@ mod tests {
             Err(Error::Tpkt(_))
         ));
     }
+
+    #[tokio::test]
+    async fn frame_length_cannot_overflow_the_wire_field() {
+        let mut wire = Vec::new();
+        write_packet(&mut wire, &vec![1; 65531]).await.unwrap();
+        assert_eq!(&wire[..4], &[3, 0, 255, 255]);
+        let mut rejected = Vec::new();
+        assert!(write_packet(&mut rejected, &vec![1; 65532]).await.is_err());
+        assert!(rejected.is_empty());
+    }
+
 }

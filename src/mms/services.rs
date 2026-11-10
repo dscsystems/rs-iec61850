@@ -238,12 +238,17 @@ impl Conn {
     ) -> Result<Vec<String>> {
         let mut names = Vec::new();
         let mut after = String::new();
+        let mut seen = std::collections::HashSet::new();
         loop {
             let (batch, more) = self.get_name_list_page(class, domain, &after).await?;
             let last = batch.last().cloned();
             names.extend(batch);
+            if names.len() > 1 << 20 {
+                return Err(Error::protocol("name list exceeds limit"));
+            }
             match (more, last) {
-                (true, Some(l)) => after = l,
+                (true, Some(l)) if l != after && seen.insert(l.clone()) => after = l,
+                (true, _) => return Err(Error::protocol("name list continuation did not advance")),
                 _ => return Ok(names),
             }
         }
@@ -640,12 +645,17 @@ impl Conn {
     pub async fn file_directory(&self, path: &str) -> Result<Vec<FileEntry>> {
         let mut entries = Vec::new();
         let mut after = String::new();
+        let mut seen = std::collections::HashSet::new();
         loop {
             let (batch, more) = self.file_directory_page(path, &after).await?;
             let last = batch.last().map(|e| e.name.clone());
             entries.extend(batch);
+            if entries.len() > 1 << 20 {
+                return Err(Error::protocol("file directory exceeds limit"));
+            }
             match (more, last) {
-                (true, Some(l)) => after = l,
+                (true, Some(l)) if l != after && seen.insert(l.clone()) => after = l,
+                (true, _) => return Err(Error::protocol("file directory continuation did not advance")),
                 _ => return Ok(entries),
             }
         }
@@ -795,15 +805,23 @@ impl Conn {
         end: Option<SystemTime>,
     ) -> Result<Vec<JournalEntry>> {
         let mut all = Vec::new();
+        let mut seen = std::collections::HashSet::new();
         loop {
             let (entries, more) = self.read_journal(req).await?;
             let last = entries.last().cloned();
             all.extend(entries);
+            if all.len() > 1 << 20 {
+                return Err(Error::protocol("journal exceeds limit"));
+            }
             match (more, last) {
                 (true, Some(last)) => {
+                    if !seen.insert((last.entry_id.clone(), last.occurrence_time)) {
+                        return Err(Error::protocol("journal continuation did not advance"));
+                    }
                     let after = last.occurrence_time.unwrap_or(SystemTime::UNIX_EPOCH);
                     req = after_request(domain, item, after, &last.entry_id, end);
                 }
+                (true, None) => return Err(Error::protocol("empty journal continuation")),
                 _ => return Ok(all),
             }
         }

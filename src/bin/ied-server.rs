@@ -5,6 +5,9 @@
 //! ied-server --scl testdata/simpleIO_direct_control.cid --addr :10102 --files /tmp/comtrade
 //! ```
 
+#[path = "common/tls.rs"]
+mod tls;
+
 use std::time::Duration;
 
 use iec61850::model::{AddCause, Fc, Quality};
@@ -18,6 +21,7 @@ struct Args {
     ied: String,
     setting_groups: u8,
     quiet: bool,
+    tls: tls::TlsArgs,
 }
 
 fn usage() -> ! {
@@ -29,6 +33,13 @@ fn usage() -> ! {
   --ied NAME       IED to instantiate when the file holds several
   --files DIR      serve MMS file services from DIR
   --setting-groups N  enable N setting groups
+  --e2e-cert PEM --e2e-key PEM --e2e-ca PEM
+  --e2e-edition 2018|2020  native E2E wire edition
+  --tls-cert PEM --tls-key PEM --tls-ca PEM [--tls-crl PEM] [--tls13]
+                   enable mutually authenticated TLS
+  --mms-cert PEM --mms-key PEM --mms-ca PEM [--mms-crl PEM]
+                   require certificate-based ACSE authentication
+  --mms-without-tls allow A-profile without TLS in a lab
   --quiet          do not log connections and controls
   --help"
     );
@@ -43,9 +54,15 @@ fn parse_args() -> Args {
         ied: String::new(),
         setting_groups: 0,
         quiet: false,
+        tls: tls::TlsArgs::default(),
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
+        match a.tls.parse(&flag, &mut it) {
+            Ok(true) => continue,
+            Ok(false) => {},
+            Err(error) => { eprintln!("{error}"); usage(); }
+        }
         match flag.as_str() {
             "--scl" => a.scl = it.next().unwrap_or_else(|| usage()),
             "--addr" => a.addr = it.next().unwrap_or_else(|| usage()),
@@ -106,6 +123,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         opts = opts.with_setting_groups(args.setting_groups);
     }
 
+    let opts = args.tls.server(opts)?;
     let server = Server::new(model, opts);
 
     if !args.quiet {
@@ -141,8 +159,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     spawn_simulation(server.clone(), devices);
 
-    println!("ied-server: listening on {}", args.addr);
-    server.listen_and_serve(&args.addr).await?;
+    let listener = server.bind(&args.addr).await?;
+    println!("ied-server: listening on {}", listener.local_addr()?);
+    server.serve(listener).await?;
     Ok(())
 }
 

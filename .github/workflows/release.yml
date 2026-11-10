@@ -32,7 +32,7 @@ env:
   CARGO_TERM_COLOR: always
   # Release binaries carry the terminal UI. TLS stays off: rustls pulls in
   # aws-lc-rs, whose C build would need a working cross toolchain for every
-  # target below, and none of these tools speak TLS anyway.
+  # target below. TLS/E2E tools can be built separately with their features.
   FEATURES: tui
   # Debug symbols would multiply the download size for no benefit here. Set as
   # an environment variable rather than in Cargo.toml so a local release build

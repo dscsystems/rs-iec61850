@@ -29,6 +29,7 @@ const PI_SESSION_USER_REQ: u8 = 0x14;
 const PI_CALLING_SSEL: u8 = 0x33;
 const PI_CALLED_SSEL: u8 = 0x34;
 const PGI_USER_DATA: u8 = 0xc1;
+const PGI_EXTENDED_USER_DATA: u8 = 0xc2;
 const PI_TRANSPORT_DISC: u8 = 0x11;
 const PI_REASON_CODE: u8 = 0x32;
 
@@ -141,8 +142,16 @@ where
 {
     let mut params = Vec::new();
     write_pi(&mut params, PI_TRANSPORT_DISC, &[0x0b]);
-    write_pi(&mut params, PGI_USER_DATA, user_data);
+    write_pi(&mut params, if user_data.len() > 512 { PGI_EXTENDED_USER_DATA } else { PGI_USER_DATA }, user_data);
     t.send_tsdu(&spdu(SI_ABORT, &params)).await
+}
+
+/// FINISH / DISCONNECT carrying the ACSE orderly release APDU.
+pub async fn release<T: SendTsdu>(transport: &mut T, response: bool, user_data: &[u8]) -> Result<()> {
+    let mut params = Vec::new();
+    if !response { write_pi(&mut params, PI_TRANSPORT_DISC, &[1]); }
+    write_pi(&mut params, PGI_USER_DATA, user_data);
+    transport.send_tsdu(&spdu(if response { 0x0a } else { 0x09 }, &params)).await
 }
 
 fn spdu(si: u8, params: &[u8]) -> Vec<u8> {
@@ -170,6 +179,10 @@ where
     T: RecvTsdu,
 {
     let tsdu = t.recv_tsdu().await?;
+    if matches!(tsdu.first(), Some(0x09 | 0x0a)) {
+        let user_data = find_user_data(spdu_params(&tsdu)?)?.ok_or_else(|| Error::Session("release without user data".into()))?;
+        return Err(Error::Release { response: tsdu[0] == 0x0a, user_data });
+    }
     if tsdu.first() == Some(&SI_ABORT) {
         let user_data = spdu_params(&tsdu)
             .ok()
@@ -221,7 +234,7 @@ fn build_connect(si: u8, calling_ssel: &[u8], called_ssel: &[u8], user_data: &[u
     }
 
     // The user data parameter group carries the presentation PDU.
-    write_pi(&mut params, PGI_USER_DATA, user_data);
+    write_pi(&mut params, if user_data.len() > 512 { PGI_EXTENDED_USER_DATA } else { PGI_USER_DATA }, user_data);
     spdu(si, &params)
 }
 
@@ -301,7 +314,7 @@ fn find_user_data(mut params: &[u8]) -> Result<Option<Vec<u8>>> {
                 "parameter length {plen} overflows"
             )));
         }
-        if code == PGI_USER_DATA {
+        if code == PGI_USER_DATA || code == PGI_EXTENDED_USER_DATA {
             return Ok(Some(params[1 + n..1 + n + plen].to_vec()));
         }
         params = &params[1 + n + plen..];

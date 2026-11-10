@@ -201,6 +201,12 @@ impl ServiceSupport {
 /// services the client can actually take part in.
 fn default_service_support() -> ServiceSupport {
     ServiceSupport::with(&[
+        service::STATUS,
+        service::OBTAIN_FILE,
+        service::INITIALIZE_JOURNAL,
+        service::REPORT_JOURNAL_STATUS,
+        service::FILE_RENAME,
+        service::CANCEL,
         service::GET_NAME_LIST,
         service::IDENTIFY,
         service::READ,
