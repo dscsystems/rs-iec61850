@@ -113,6 +113,7 @@ impl Ca {
 
 fn options(id: &Identity, roots: &[&Ca]) -> Options {
     Options {
+        no_server_name: true,
         certificates: id.chain.clone(),
         key: Some(id.key.clone_key()),
         roots: roots.iter().map(|c| c.root()).collect(),
@@ -443,4 +444,21 @@ async fn x509_v1_certificates() {
     let stranger = issue_v1(&other, "stranger", 103);
     assert!(dial(&addr, options(&stranger, &[&root])).await.is_err());
     let _ = root.issue("unused", None, &[]);
+}
+
+#[tokio::test]
+async fn default_server_name_is_bound_to_the_dial_address() {
+    let mut ca = Ca::new("name-default-ca");
+    let srv = ca.issue("127.0.0.1", None, &[]);
+    let cli = ca.issue("scada", None, &[]);
+    let (addr, _) = serve(options(&srv, &[&ca])).await;
+    let mut client = options(&cli, &[&ca]);
+    client.no_server_name = false;
+    dial(&addr, client).await.expect("CN matches dialled IP for a legacy certificate without SAN");
+    let wrong = ca.issue("some-other-ied", None, &[]);
+    let (addr, _) = serve(options(&wrong, &[&ca])).await;
+    let mut client = options(&cli, &[&ca]);
+    client.no_server_name = false;
+    let err = dial(&addr, client).await.unwrap_err();
+    assert!(err.contains("does not name the server"), "{err}");
 }

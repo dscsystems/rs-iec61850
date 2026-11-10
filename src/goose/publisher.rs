@@ -48,6 +48,7 @@ pub struct PublisherConfig {
     /// [`Publisher::set_test`] and [`Publisher::set_nds_com`] change them.
     pub test: bool,
     pub nds_com: bool,
+    pub simulation: bool,
     /// The quality of the message timestamp. `None` carries the crate
     /// default: leap seconds known and accuracy 10.
     pub time_quality: Option<TimeQuality>,
@@ -68,6 +69,7 @@ impl Default for PublisherConfig {
             retrans: Vec::new(),
             test: false,
             nds_com: false,
+            simulation: false,
             time_quality: None,
         }
     }
@@ -225,6 +227,7 @@ impl Publisher {
             num_dat_set_entries: values.len() as u32,
             values,
             app_id: cfg.app_id,
+            simulation: cfg.simulation,
             time_quality: cfg.time_quality,
             ..Default::default()
         };
@@ -250,7 +253,7 @@ impl Publisher {
         st.generation += 1;
         let generation = st.generation;
         drop(st);
-        self.shared.send(&msg)?;
+        let result = self.shared.send(&msg);
 
         // Replace the retransmission task. The old one notices the newer
         // generation and stops, so a stale frame can never follow the new
@@ -259,7 +262,7 @@ impl Publisher {
         if let Some(h) = task.replace(handle) {
             h.abort();
         }
-        Ok(())
+        result
     }
 
     /// Returns the current state number, which counts state changes.
@@ -335,8 +338,8 @@ async fn retransmit(shared: Arc<Shared>, mut msg: Message, generation: u64) {
             return;
         }
         st.sq_num = msg.sq_num;
-        if shared.send(&msg).is_err() {
-            return;
+        if let Err(error) = shared.send(&msg) {
+            tracing::warn!(%error, "GOOSE retransmission failed; retrying on schedule");
         }
     }
 }
@@ -516,6 +519,35 @@ mod tests {
         assert_eq!(tag.vid, 10);
         pub_.close();
     }
+
+    #[derive(Debug)]
+    struct TransientFailure {
+        pipe: Arc<dyn Interface>,
+        attempts: std::sync::atomic::AtomicUsize,
+    }
+    impl Interface for TransientFailure {
+        fn write_frame(&self, f: &Frame) -> crate::ethernet::Result<()> {
+            if self.attempts.fetch_add(1, Ordering::SeqCst) < 2 {
+                return Err(crate::ethernet::Error::Frame("transient".into()));
+            }
+            self.pipe.write_frame(f)
+        }
+        fn read_frame(&self) -> crate::ethernet::Result<Frame> { self.pipe.read_frame() }
+        fn close(&self) -> crate::ethernet::Result<()> { self.pipe.close() }
+    }
+    #[tokio::test]
+    async fn retransmission_recovers_from_initial_and_later_send_failures() {
+        let (send, recv) = ethernet::pipe();
+        let publisher = Publisher::new(Arc::new(TransientFailure { pipe: Arc::new(send), attempts: std::sync::atomic::AtomicUsize::new(0) }), config()).unwrap();
+        assert!(publisher.publish(vec![Value::boolean(true)]).is_err());
+        let read = tokio::task::spawn_blocking(move || recv.read_frame());
+        let frame = tokio::time::timeout(Duration::from_secs(1), read).await.unwrap().unwrap().unwrap();
+        let msg = super::super::parse(&frame.payload).unwrap();
+        assert_eq!(msg.st_num, 1);
+        assert_eq!(msg.sq_num, 2);
+        publisher.close();
+    }
+
 }
 
 #[cfg(test)]

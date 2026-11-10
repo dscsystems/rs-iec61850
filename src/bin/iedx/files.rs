@@ -103,7 +103,10 @@ impl FilesPanel {
             // Save under the base name in the working directory, so a nested
             // COMTRADE path does not need directories creating.
             let out = name.rsplit('/').next().unwrap_or(&name).to_string();
-            match std::fs::write(&out, &data) {
+            use std::io::Write;
+            let save = std::fs::OpenOptions::new().write(true).create_new(true).open(&out)
+                .and_then(|mut file| file.write_all(&data));
+            match save {
                 Ok(()) => ctx.ok(format!(
                     "saved {name} ({} octets) to ./{out}",
                     data.len()

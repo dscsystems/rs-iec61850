@@ -56,6 +56,7 @@ pub struct LeConfig {
     /// The initial grandmaster identity declared when `opts.synch_source_id`
     /// is set; [`LePublisher::set_gm_identity`] changes it.
     pub gm_identity: [u8; 8],
+    pub simulation: bool,
     /// The optional ASDU fields to include.
     pub opts: AsduOpts,
 }
@@ -76,6 +77,7 @@ impl Default for LeConfig {
             dat_set: String::new(),
             time_quality: None,
             gm_identity: [0; 8],
+            simulation: false,
             opts: AsduOpts::default(),
         }
     }
@@ -226,6 +228,7 @@ impl LePublisher {
     pub fn emit_all(&self, samples: &[LeSample]) -> Result<()> {
         let pdu = Pdu {
             app_id: self.cfg.app_id,
+            simulation: self.cfg.simulation,
             asdus: samples.iter().map(|s| self.asdu(s)).collect(),
         };
         self.iface.write_frame(&Frame {

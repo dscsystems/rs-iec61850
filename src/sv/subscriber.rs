@@ -202,6 +202,7 @@ mod tests {
         // Eight samples batched into one frame, as a real publisher does.
         let pdu = Pdu {
             app_id: 0x4000,
+            simulation: false,
             asdus: (0..8).map(|i| asdu("MU01", i)).collect(),
         };
         a.write_frame(&ethernet::Frame {
@@ -232,6 +233,7 @@ mod tests {
 
         let pdu = Pdu {
             app_id: 0x4000,
+            simulation: false,
             asdus: (1..=3).map(|i| asdu("MU01", i)).collect(),
         };
         a.write_frame(&ethernet::Frame {

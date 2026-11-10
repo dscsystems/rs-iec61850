@@ -42,6 +42,8 @@ pub enum Error {
     /// The peer closed the association (COTP DR, or a clean EOF).
     #[error("association closed by peer")]
     Closed,
+    #[error("session orderly release")]
+    Release { response: bool, user_data: Vec<u8> },
     /// The peer refused the session CONNECT (a REFUSE SPDU); the user data
     /// is the presentation CPR carrying the rejecting AARE.
     #[error("session: connection refused (reason {reason})")]

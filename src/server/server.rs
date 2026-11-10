@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::time::Duration;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -131,6 +132,19 @@ pub struct Options {
     /// The initial quality of the server's clock; see
     /// [`Server::set_time_quality`].
     pub time_quality: Option<mms::TimeQuality>,
+    /// None uses a ten-second association deadline, zero disables it.
+    pub handshake_timeout: Option<Duration>,
+    /// None uses a thirty-second PDU write deadline, zero disables it.
+    pub write_timeout: Option<Duration>,
+    #[cfg(feature = "tls")]
+    pub a_profile: Option<Arc<crate::iec62351::aprofile::Config>>,
+    #[cfg(feature = "tls")]
+    pub a_profile_required: bool,
+    #[cfg(feature = "e2e")]
+    pub e2e: Option<Arc<crate::iec62351::e2e::Config>>,
+    #[cfg(feature = "e2e")]
+    pub e2e_required: bool,
+    pub ae_identity: Option<mms::AcseIdentity>,
     /// Enables TLS per IEC 62351-3.
     #[cfg(feature = "tls")]
     pub tls: Option<Arc<tokio_rustls::rustls::ServerConfig>>,
@@ -151,6 +165,38 @@ impl std::fmt::Debug for Options {
 impl Options {
     pub fn new() -> Options {
         Options::default()
+    }
+
+    #[must_use]
+    pub fn with_handshake_timeout(mut self, limit: Duration) -> Self {
+        self.handshake_timeout = Some(limit);
+        self
+    }
+
+    #[must_use]
+    pub fn with_write_timeout(mut self, limit: Duration) -> Self {
+        self.write_timeout = Some(limit);
+        self
+    }
+
+    #[must_use]
+    pub fn with_ae_identity(mut self, identity: mms::AcseIdentity) -> Self {
+        self.ae_identity = Some(identity);
+        self
+    }
+
+    #[cfg(feature = "tls")]
+    #[must_use]
+    pub fn with_a_profile(mut self, config: Arc<crate::iec62351::aprofile::Config>, required: bool) -> Self {
+        self.a_profile = Some(config);
+        self.a_profile_required = required;
+        self
+    }
+
+    #[cfg(feature = "e2e")]
+    #[must_use]
+    pub fn with_e2e(mut self, config: Arc<crate::iec62351::e2e::Config>, required: bool) -> Self {
+        self.e2e = Some(config); self.e2e_required = required; self
     }
 
     #[must_use]
@@ -289,6 +335,18 @@ pub(crate) struct Inner {
     /// What the Status service answers: logical << 8 | physical.
     pub status: AtomicU32,
     pub authenticator: Option<mms::Authenticator>,
+    pub handshake_timeout: Option<Duration>,
+    pub write_timeout: Option<Duration>,
+    #[cfg(feature = "tls")]
+    pub a_profile: Option<Arc<crate::iec62351::aprofile::Config>>,
+    #[cfg(feature = "tls")]
+    pub a_profile_required: bool,
+    #[cfg(feature = "e2e")]
+    pub e2e: Option<Arc<crate::iec62351::e2e::Config>>,
+    #[cfg(feature = "e2e")]
+    pub e2e_required: bool,
+    pub ae_identity: Option<mms::AcseIdentity>,
+    pub closed: std::sync::atomic::AtomicBool,
     pub deletable_logs: bool,
     pub conns: Mutex<ConnMap>,
     pub selections: Mutex<Selections>,
@@ -305,6 +363,25 @@ pub(crate) struct Inner {
     pub next_conn: AtomicU64,
     #[cfg(feature = "tls")]
     pub tls: Option<Arc<tokio_rustls::rustls::ServerConfig>>,
+}
+
+/// A slot covers TCP/TLS/ACSE setup and is returned on every early exit.
+struct ConnectionSlot(Option<Arc<Inner>>);
+impl ConnectionSlot {
+    fn acquire(inner: &Arc<Inner>, peer: Option<SocketAddr>) -> Option<Self> {
+        let (open, allowed) = inner.take_slot();
+        if !allowed {
+            inner.notify(ConnectionEvent { peer, state: ConnectionState::Refused, open, conn: None });
+            return None;
+        }
+        Some(Self(Some(inner.clone())))
+    }
+    fn release(&mut self) -> usize {
+        self.0.take().map_or(0, |inner| inner.release_slot())
+    }
+}
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) { self.release(); }
 }
 
 impl std::fmt::Debug for Inner {
@@ -379,7 +456,7 @@ impl Inner {
     /// the limit allowed it.
     fn take_slot(&self) -> (usize, bool) {
         let mut open = self.open.lock().unwrap();
-        if self.max_conns > 0 && *open >= self.max_conns {
+        if self.closed.load(Ordering::SeqCst) || (self.max_conns > 0 && *open >= self.max_conns) {
             return (*open, false);
         }
         *open += 1;
@@ -503,6 +580,18 @@ impl Server {
                 clock,
                 status: AtomicU32::new(0),
                 authenticator: opts.authenticator,
+                handshake_timeout: opts.handshake_timeout,
+                write_timeout: opts.write_timeout,
+                #[cfg(feature = "tls")]
+                a_profile: opts.a_profile,
+                #[cfg(feature = "tls")]
+                a_profile_required: opts.a_profile_required,
+                #[cfg(feature = "e2e")]
+                e2e: opts.e2e,
+                #[cfg(feature = "e2e")]
+                e2e_required: opts.e2e_required,
+                ae_identity: opts.ae_identity,
+                closed: std::sync::atomic::AtomicBool::new(false),
                 deletable_logs: opts.deletable_logs,
                 conns: Mutex::new(HashMap::new()),
                 selections: Mutex::new(Selections::default()),
@@ -645,10 +734,11 @@ impl Server {
     /// This is what the in-memory tests use, and the entry point for callers
     /// that bring their own transport.
     pub async fn serve_stream(&self, stream: BoxTransport, peer: Option<SocketAddr>) {
-        self.serve_transport(stream, peer, Vec::new()).await;
+        self.serve_transport(stream, peer, Vec::new(), None).await;
     }
 
     async fn serve_conn(&self, stream: TcpStream, peer: SocketAddr) {
+        let Some(slot) = ConnectionSlot::acquire(&self.inner, Some(peer)) else { return };
         // Nagle would add latency to every response; MMS is request/response.
         let _ = stream.set_nodelay(true);
 
@@ -656,7 +746,12 @@ impl Server {
         let (transport, certs): (BoxTransport, Vec<Vec<u8>>) = match &self.inner.tls {
             Some(cfg) => {
                 let acceptor = tokio_rustls::TlsAcceptor::from(Arc::clone(cfg));
-                match acceptor.accept(stream).await {
+                let limit = self.inner.handshake_timeout.unwrap_or(Duration::from_secs(10));
+                let handshake = acceptor.accept(stream);
+                let tls = if limit.is_zero() { handshake.await } else {
+                    tokio::time::timeout(limit, handshake).await.unwrap_or_else(|_| Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "TLS handshake timeout")))
+                };
+                match tls {
                     Ok(s) => {
                         // The chain the TLS configuration verified, for the
                         // authenticator.
@@ -679,7 +774,7 @@ impl Server {
         #[cfg(not(feature = "tls"))]
         let (transport, certs): (BoxTransport, Vec<Vec<u8>>) = (Box::new(stream), Vec::new());
 
-        self.serve_transport(transport, Some(peer), certs).await;
+        self.serve_transport(transport, Some(peer), certs, Some(slot)).await;
     }
 
     async fn serve_transport(
@@ -687,34 +782,44 @@ impl Server {
         stream: BoxTransport,
         peer: Option<SocketAddr>,
         peer_certificates: Vec<Vec<u8>>,
+        slot: Option<ConnectionSlot>,
     ) {
         let inner = &self.inner;
 
-        // The slot is taken before the handshake, so a flood of half-open
-        // connections cannot outrun the limit.
-        let (open, allowed) = inner.take_slot();
-        if !allowed {
-            tracing::warn!(?peer, max = inner.max_conns, "server: connection refused");
-            inner.notify(ConnectionEvent {
-                peer,
-                state: ConnectionState::Refused,
-                open,
-                conn: None,
-            });
-            return;
-        }
+        let mut slot = match slot.or_else(|| ConnectionSlot::acquire(inner, peer)) {
+            Some(slot) => slot,
+            None => return,
+        };
 
         let accept = mms::AcceptOptions {
             initiate: Some(inner.initiate()),
             authenticate: inner.authenticator.clone(),
             peer_certificates,
+            responding: inner.ae_identity.clone(),
+            write_timeout: inner.write_timeout,
+            #[cfg(feature = "tls")]
+            tls_active: inner.tls.is_some(),
+            #[cfg(feature = "tls")]
+            a_profile: inner.a_profile.clone(),
+            #[cfg(feature = "tls")]
+            a_profile_required: inner.a_profile_required,
+            #[cfg(feature = "e2e")]
+            e2e: inner.e2e.clone(),
+            #[cfg(feature = "e2e")]
+            e2e_required: inner.e2e_required,
             ..Default::default()
         };
-        let sc = match mms::accept_conn_opts(stream, peer, &accept).await {
+        let handshake = mms::accept_conn_opts(stream, peer, &accept);
+        let limit = inner.handshake_timeout.unwrap_or(Duration::from_secs(10));
+        let accepted = if limit.is_zero() {
+            handshake.await
+        } else {
+            tokio::time::timeout(limit, handshake).await.unwrap_or(Err(mms::Error::Timeout))
+        };
+        let sc = match accepted {
             Ok(sc) => Arc::new(sc),
             Err(e) => {
                 tracing::warn!(?peer, error = %e, "server: association setup failed");
-                inner.release_slot();
                 return;
             }
         };
@@ -722,8 +827,16 @@ impl Server {
         let id = ConnId(inner.next_conn.fetch_add(1, Ordering::Relaxed));
         let open = {
             let mut conns = inner.conns.lock().unwrap();
-            conns.insert(id, Arc::clone(&sc));
-            conns.len()
+            if inner.closed.load(Ordering::SeqCst) {
+                None
+            } else {
+                conns.insert(id, Arc::clone(&sc));
+                Some(conns.len())
+            }
+        };
+        let Some(open) = open else {
+            let _ = sc.close().await;
+            return;
         };
         tracing::info!(?peer, %id, "server: association established");
         inner.notify(ConnectionEvent {
@@ -751,7 +864,7 @@ impl Server {
         };
         inner.queue_sv(sv_events);
         inner.flush_sv();
-        let open = inner.release_slot();
+        let open = slot.release();
         inner.selections.lock().unwrap().release_conn(id);
         let _ = sc.close().await;
         inner.notify(ConnectionEvent {
@@ -789,6 +902,7 @@ impl Server {
 
     /// Closes every open association and stops the report engine.
     pub async fn close(&self) -> Result<()> {
+        self.inner.closed.store(true, Ordering::SeqCst);
         self.inner.reports.shutdown();
         self.inner.logs.close();
         let conns: Vec<Arc<mms::ServerConn>> =

@@ -147,6 +147,56 @@ pub fn build_cp(calling_psel: &[u8], called_psel: &[u8], acse_data: &[u8]) -> Ve
     cons(TAG_SET, [mode_selector(), normal]).encode() // CP-type ::= SET
 }
 
+/// CP proposing the native-mode security context as well as ACSE and MMS.
+pub fn build_cp_e2e(acse_data: &[u8]) -> Vec<u8> {
+    let normal = cons(context_constructed(2), [
+        prim(context_primitive(1), DEFAULT_CALLING_PSEL.to_vec()),
+        prim(context_primitive(2), DEFAULT_CALLED_PSEL.to_vec()),
+        cons(context_constructed(4), [context_entry(CONTEXT_ACSE, &oid_acse()), context_entry(CONTEXT_MMS, &oid_mms()), context_entry(5, &Oid::from([1,0,62351,4,1,2,1]))]),
+        user_data(CONTEXT_ACSE, acse_data),
+    ]);
+    cons(TAG_SET, [mode_selector(), normal]).encode()
+}
+pub fn e2e_context(proposed: &[Context]) -> Option<i64> {
+    proposed.iter().find(|c| c.id > 0 && c.id % 2 == 1 && c.ber() && c.abstract_syntax.as_ref() == Some(&Oid::from([1,0,62351,4,1,2,1]))).map(|c| c.id)
+}
+pub fn build_e2e_answer(selector: &[u8], proposed: &[Context], acse_data: &[u8], accepted: bool) -> Vec<u8> {
+    let neg = negotiate(proposed); let security = e2e_context(proposed);
+    let results = cons(context_constructed(5), proposed.iter().map(|c| context_result(if c.acceptable() || security == Some(c.id) { ContextResult::Acceptance } else { ContextResult::ProviderRejection })));
+    let fields = [prim(context_primitive(3), selector.to_vec()), results, user_data(acse_context_or_default(neg), acse_data)];
+    if accepted { cons(TAG_SET, [mode_selector(), cons(context_constructed(2), fields)]).encode() } else { cons(TAG_SEQUENCE, fields).encode() }
+}
+/// Strict native-mode single-ASN1-type PDV, retaining the selected context.
+pub fn unwrap_data_strict(pdu: &[u8], expected: i64) -> Result<Vec<u8>> {
+    let mut outer = Decoder::new(pdu); let mut data = Decoder::new(outer.expect(application_constructed(1))?);
+    let mut pdv = Decoder::new(data.expect(TAG_SEQUENCE)?);
+    pdv.optional(TAG_OID)?;
+    let context = asn1::decode_int(pdv.expect(TAG_INTEGER)?)?;
+    let value = pdv.expect(context_constructed(0))?;
+    if outer.more() || data.more() || pdv.more() || context != expected { return Err(Error::Presentation("invalid native-mode context or multiple PDVs".into())); }
+    Ok(value.to_vec())
+}
+
+/// Verify that the native client's three proposed contexts were accepted.
+pub fn check_e2e_cpa(pdu: &[u8]) -> Result<()> {
+    let mut outer = Decoder::new(pdu); let mut set = Decoder::new(outer.expect(TAG_SET)?);
+    let mut count = None;
+    while set.more() { let (tag, content) = set.read_tlv()?; if tag != context_constructed(2) { continue; }
+        let mut fields = Decoder::new(content);
+        while fields.more() { let (tag, content) = fields.read_tlv()?; if tag != context_constructed(5) { continue; }
+            if count.is_some() { return Err(Error::Presentation("duplicate context results".into())); }
+            let mut results = Decoder::new(content); let mut accepted = 0;
+            while results.more() { let mut result = Decoder::new(results.expect(TAG_SEQUENCE)?);
+                if asn1::decode_int(result.expect(context_primitive(0))?)? != 0 || asn1::decode_oid(result.expect(context_primitive(1))?)? != oid_ber() || result.more() { return Err(Error::Presentation("native presentation context refused".into())); }
+                accepted += 1;
+            }
+            count = Some(accepted);
+        }
+    }
+    if outer.more() || count != Some(3) { return Err(Error::Presentation("native mode needs all three context results".into())); }
+    Ok(())
+}
+
 /// Builds a CPA (Connect Presentation Accept) PDU wrapping `acse_data` (the
 /// ACSE AARE), accepting the contexts this crate can serve and rejecting the
 /// rest.
@@ -267,6 +317,7 @@ pub struct Cp {
     pub contexts: Vec<Context>,
     /// The ACSE AARQ.
     pub user_data: Vec<u8>,
+    pub user_context: i64,
 }
 
 /// Decodes a CP PDU.
@@ -293,7 +344,9 @@ pub fn parse_cp(pdu: &[u8]) -> Result<Cp> {
                 x if x == context_constructed(4) => cp.contexts = parse_context_list(c),
                 // fully-encoded-data
                 x if x == application_constructed(1) => {
-                    cp.user_data = parse_pdv_list(c)?.1;
+                    let (context, data) = parse_pdv_list(c)?;
+                    cp.user_context = context;
+                    cp.user_data = data;
                     have_user_data = true;
                 }
                 _ => {}

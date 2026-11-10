@@ -102,6 +102,18 @@ pub struct AcceptOptions {
     /// the association runs over, verified by the TLS layer, for the
     /// authenticator to inspect. Empty without TLS.
     pub peer_certificates: Vec<Vec<u8>>,
+    /// True when the caller has already secured the transport with TLS.
+    pub tls_active: bool,
+    /// Maximum duration of a PDU write. None uses 30 seconds; zero disables.
+    pub write_timeout: Option<std::time::Duration>,
+    #[cfg(feature = "tls")]
+    pub a_profile: Option<Arc<crate::iec62351::aprofile::Config>>,
+    #[cfg(feature = "tls")]
+    pub a_profile_required: bool,
+    #[cfg(feature = "e2e")]
+    pub e2e: Option<Arc<crate::iec62351::e2e::Config>>,
+    #[cfg(feature = "e2e")]
+    pub e2e_required: bool,
 }
 
 impl std::fmt::Debug for AcceptOptions {
@@ -136,6 +148,10 @@ pub struct ServerConn {
     pump: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// The ACSE authentication value presented by the client.
     pub password: Option<String>,
+    #[cfg(feature = "tls")]
+    pub a_profile_peer: Option<crate::x509::Certificate>,
+    #[cfg(feature = "e2e")]
+    pub e2e_peer: Option<crate::iec62351::e2e::PeerSecurity>,
     pub peer: Option<SocketAddr>,
     /// The identity the client addressed. A client that fills this in is
     /// checking which application entity it reached and will compare the
@@ -207,12 +223,46 @@ pub async fn accept_conn_opts(
     let cp = presentation::parse_cp(&res.user_data)?;
     opts.trace("rx AARQ", &cp.user_data);
     let areq = acse::parse_aarq(&cp.user_data)?;
+    #[cfg(feature = "e2e")]
+    if super::secure::is_native(areq.application_context.as_ref(), opts) || opts.e2e_required {
+        return super::secure::server_handshake(ct, peer, opts, res, cp, areq).await;
+    }
     // The responder's selector is the one the peer addressed, so it sees the
     // entity it dialled answer rather than a stack default.
     let responding_psel = if cp.called_psel.is_empty() {
         presentation::DEFAULT_CALLED_PSEL.to_vec()
     } else {
         cp.called_psel.clone()
+    };
+
+    #[cfg(feature = "tls")]
+    let (a_profile_peer, response_auth) = {
+        use crate::iec62351::aprofile;
+        let sent = areq.authentication.as_deref().is_some_and(|v| Decoder::new(v).peek_is(context_constructed(2)));
+        match &opts.a_profile {
+            Some(ap) if sent || opts.a_profile_required => {
+                let diagnostic = if !opts.tls_active && !ap.allow_without_tls { Some(acse::DIAG_AUTHENTICATION_FAILURE) }
+                    else if areq.mechanism.is_none() { Some(12) }
+                    else if !sent { Some(acse::DIAG_AUTHENTICATION_REQUIRED) } else { None };
+                if let Some(diagnostic) = diagnostic {
+                    let aare = acse::aare_reject_for(areq.application_context.as_ref(), diagnostic);
+                    let cpr = presentation::build_cpr(&responding_psel, &cp.contexts, &aare);
+                    let _ = session::refuse(&mut ct, &cpr).await;
+                    return Err(Error::AssociationRejected("A-profile authentication required".into()));
+                }
+                let verification = aprofile::Value::parse(areq.authentication.as_deref().unwrap()).and_then(|v| ap.verifier.verify(&v));
+                let cert = match verification {
+                    Ok(cert) => cert,
+                    Err(e) => {
+                        let _ = session::abort(&mut ct, &[]).await;
+                        return Err(Error::AssociationRejected(e.to_string()));
+                    }
+                };
+                let value = ap.value().map_err(|e| Error::protocol(e.to_string()))?;
+                (Some(cert), Some((areq.mechanism.clone().unwrap(), value.encode())))
+            }
+            _ => (None, None),
+        }
     };
 
     if let Some(auth) = &opts.authenticate {
@@ -222,6 +272,10 @@ pub async fn accept_conn_opts(
             called: areq.called.clone(),
             calling: areq.calling.clone(),
             peer_certificates: opts.peer_certificates.clone(),
+            #[cfg(feature = "tls")]
+            a_profile_peer: a_profile_peer.clone(),
+            #[cfg(feature = "e2e")]
+            e2e_peer: None,
         };
         if let Err(e) = auth(&ar) {
             let diag = if matches!(e, Error::AuthenticationRequired) {
@@ -267,13 +321,31 @@ pub async fn accept_conn_opts(
         areq.application_context.as_ref(),
         neg.mms,
     );
+    #[cfg(feature = "tls")]
+    let aare = if let Some((mechanism, value)) = response_auth {
+        acse::with_authentication(&aare, false, &mechanism, &value)?
+    } else { aare };
     opts.trace("tx AARE", &aare);
     let (_, cpa) = presentation::build_cpa(&responding_psel, &cp.contexts, &aare);
     opts.trace("tx CPA", &cpa);
     session::reply(&mut ct, res.called_ssel.as_deref().unwrap_or(&[]), &cpa).await?;
 
-    let (reader, writer) = transport::split(ct, neg.mms, neg.acse);
+    let (reader, mut writer) = transport::split(ct, neg.mms, neg.acse);
+    writer.write_timeout = Some(opts.write_timeout.unwrap_or(std::time::Duration::from_secs(30)));
+    #[allow(unused_mut)]
+    let mut conn = established(reader, writer, peer, areq, proposed, answer)?;
+    #[cfg(feature = "tls")]
+    { conn.a_profile_peer = a_profile_peer; }
+    Ok(conn)
+}
+
+#[allow(unused_mut)]
+pub(super) fn established(mut reader: FramingReader, writer: FramingWriter, peer: Option<SocketAddr>, areq: acse::AarqRequest, proposed: InitiateRequest, answer: InitiateRequest) -> Result<ServerConn> {
+    #[cfg(feature = "e2e")]
+    let e2e_peer = writer.security.as_ref().and_then(|s| s.association.lock().unwrap().peer_security().cloned());
     let writer = Arc::new(AsyncMutex::new(writer));
+    #[cfg(feature = "e2e")]
+    reader.attach_writer(writer.clone());
     let (unconf_tx, unconf_rx) = mpsc::channel(UNCONFIRMED_QUEUE_DEPTH);
 
     // A dedicated writer task drains unconfirmed PDUs (reports) so callers
@@ -286,6 +358,10 @@ pub async fn accept_conn_opts(
         unconf_tx,
         pump: Mutex::new(Some(pump)),
         password: areq.password,
+        #[cfg(feature = "tls")]
+        a_profile_peer: None,
+        #[cfg(feature = "e2e")]
+        e2e_peer,
         peer,
         called: areq.called,
         calling: areq.calling,
@@ -337,9 +413,14 @@ impl ServerConn {
                 }
             }
         });
+        let mut closed = self.writer.lock().await.closed();
         let mut deferred: FuturesUnordered<Deferred<'_>> = FuturesUnordered::new();
         let result = loop {
+            if *closed.borrow() {
+                break Err(Error::Closed);
+            }
             tokio::select! {
+                _ = closed.changed() => break Err(Error::Closed),
                 Some(()) = deferred.next(), if !deferred.is_empty() => {}
                 msg = rx.recv() => match msg {
                     None => break Ok(()),
@@ -367,10 +448,14 @@ impl ServerConn {
     ) -> Result<bool> {
         let mut dec = Decoder::new(pdu);
         let Ok((tag, content)) = dec.read_tlv() else {
-            return Ok(true); // ignore malformed PDUs
+            self.reject(None, 5, 1).await?;
+            return Ok(true);
         };
         if tag == TAG_CONFIRMED_REQUEST {
             let Some(req) = parse_confirmed_request(content) else {
+                let id = Decoder::new(content).expect(asn1::TAG_INTEGER).ok()
+                    .and_then(|v| asn1::decode_uint(v).ok()).and_then(|v| u32::try_from(v).ok());
+                self.reject(id, 1, 4).await?;
                 return Ok(true);
             };
             if handler.is_deferred(&req) {
@@ -395,6 +480,13 @@ impl ServerConn {
         } else {
             Ok(true)
         }
+    }
+
+    async fn reject(&self, id: Option<u32>, category: u32, reason: i64) -> Result<()> {
+        let mut pdu = cons(TAG_REJECT_PDU, []);
+        if let Some(id) = id { pdu.push(asn1::uint_elem(context_primitive(0), u64::from(id))); }
+        pdu.push(asn1::int_elem(context_primitive(category), reason));
+        self.send(&pdu.encode()).await
     }
 
     async fn handle_confirmed<H: Handler>(&self, req: Request, handler: &H) -> Result<()> {
@@ -504,7 +596,15 @@ impl ServerConn {
     pub async fn call(&self, service: Element) -> Result<Vec<u8>> {
         let id = self.next_call.fetch_add(1, Ordering::Relaxed) + 1;
         let (tx, rx) = oneshot::channel();
-        self.calls.lock().unwrap().insert(id, tx);
+        {
+            let mut calls = self.calls.lock().unwrap();
+            let limit = self.negotiated.max_serv_outstanding_called;
+            let limit = if limit > 0 { limit } else { self.negotiated.max_serv_outstanding }.max(1) as usize;
+            if calls.len() >= limit {
+                return Err(resource_error());
+            }
+            calls.insert(id, tx);
+        }
         let req = cons(
             TAG_CONFIRMED_REQUEST,
             [asn1::uint_elem(asn1::TAG_INTEGER, u64::from(id)), service],
@@ -747,9 +847,11 @@ pub(crate) fn encode_error_pdu(invoke_id: u32, err: &Error) -> Vec<u8> {
 pub(crate) fn parse_confirmed_request(content: &[u8]) -> Option<Request> {
     let mut dec = Decoder::new(content);
     let id_bytes = dec.expect(asn1::TAG_INTEGER).ok()?;
-    let invoke_id = asn1::decode_uint(id_bytes).ok()? as u32;
+    if id_bytes.first().is_none_or(|b| b & 0x80 != 0) { return None; }
+    let invoke_id = u32::try_from(asn1::decode_uint(id_bytes).ok()?).ok()?;
     // The service is the next element; its tag number is the service id.
     let (service_tag, service_content) = dec.read_tlv().ok()?;
+    if service_tag.class != asn1::Class::ContextSpecific { return None; }
     Some(Request {
         invoke_id,
         service: service_tag.number,

@@ -246,3 +246,47 @@ async fn status_and_identify_survive_concurrent_use() {
     a.unwrap();
     b.unwrap();
 }
+
+#[tokio::test]
+async fn file_handles_are_scoped_bounded_and_released_with_the_association() {
+    let root = temp_dir("file-handle-isolation");
+    std::fs::write(root.join("data.bin"), b"private file").unwrap();
+    let (server, addr) = start(Options::new().with_file_store(&root)).await;
+    let first = dial(&addr).await;
+    let second = dial(&addr).await;
+    let (id, _) = first.mms().file_open("/data.bin").await.unwrap();
+    assert!(second.mms().file_read(id).await.is_err());
+    assert!(second.mms().file_close(id).await.is_err());
+    // Large ids may not truncate to a valid handle on the wire.
+    let err = second.mms().call(iec61850::asn1::int_elem(iec61850::asn1::context_primitive(service::FILE_READ as u32), i64::from(id) + (1i64 << 32))).await;
+    assert!(err.is_err());
+    assert_eq!(first.mms().file_read(id).await.unwrap().0, b"private file");
+    let mut ids = vec![id];
+    for _ in 1..16 { ids.push(first.mms().file_open("data.bin").await.unwrap().0); }
+    assert!(first.mms().file_open("data.bin").await.is_err());
+    // One full association cannot deny another its allowance.
+    let other = second.mms().file_open("data.bin").await.unwrap().0;
+    second.mms().file_close(other).await.unwrap();
+    for id in ids { first.mms().file_close(id).await.unwrap(); }
+    first.close().await.unwrap();
+    second.close().await.unwrap();
+    server.close().await.unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn missing_report_blocks_are_errors_and_disable_releases_reservation() {
+    let (server, addr) = start(Options::new()).await;
+    let first = dial(&addr).await;
+    assert!(first.get_rcb(format!("{LD}/LLN0.RP.missing")).await.is_err());
+    let blocks = first.logical_node_directory(format!("{LD}/LLN0"), iec61850::client::AcsiClass::Urcb).await.unwrap();
+    assert!(!blocks.is_empty());
+    let reference = format!("{LD}/LLN0.RP.{}", blocks[0]);
+    let rcb = first.get_rcb(reference.clone()).await.unwrap();
+    let subscription = first.enable_reporting(&rcb, |_| {}).await.unwrap();
+    subscription.disable().await.unwrap();
+    let second = dial(&addr).await;
+    let rcb = second.get_rcb(reference).await.unwrap();
+    second.enable_reporting(&rcb, |_| {}).await.unwrap().disable().await.unwrap();
+    server.close().await.unwrap();
+}

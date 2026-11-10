@@ -189,6 +189,30 @@ pub fn aarq_for(
     seq.encode()
 }
 
+/// Adds certificate authentication to an AARQ (`request = true`) or AARE.
+/// `value` is the complete Authentication-value CHOICE encoding.
+pub fn with_authentication(apdu: &[u8], request: bool, mechanism: &Oid, value: &[u8]) -> Result<Vec<u8>> {
+    let tag = if request { tag_aarq() } else { tag_aare() };
+    let content = Decoder::new(apdu).expect(tag)?;
+    let (requirements, mechanism_tag, value_tag) = if request { (10, 11, 12) } else { (8, 9, 10) };
+    let mut out = cons(tag, []);
+    let mut fields = Decoder::new(content);
+    let mut user_information = None;
+    while fields.more() {
+        let (t, c) = fields.read_tlv()?;
+        if t == context_constructed(30) {
+            user_information = Some(raw_content(t, c.to_vec()));
+        } else if !(requirements..=value_tag).contains(&t.number) || t.class != Class::ContextSpecific {
+            out.push(raw_content(t, c.to_vec()));
+        }
+    }
+    out.push(bit_string_elem(context_primitive(requirements), &BitString::from_u32(1, 1)));
+    out.push(oid_elem(context_primitive(mechanism_tag), mechanism));
+    out.push(raw_content(context_constructed(value_tag), value.to_vec()));
+    if let Some(user) = user_information { out.push(user); }
+    Ok(out.encode())
+}
+
 /// Appends the identity fields to an AARQ or AARE, starting at the given
 /// context tag number.
 ///
@@ -390,6 +414,11 @@ pub struct AareResult {
     /// clients see the device's identity; it is empty when the peer omitted
     /// the fields, which is legal.
     pub responding: Identity,
+    pub application_context: Option<Oid>,
+    pub user_information: Vec<Vec<u8>>,
+    pub mechanism: Option<Oid>,
+    /// Encoded Authentication-value CHOICE, including its tag.
+    pub authentication: Option<Vec<u8>>,
 }
 
 /// Parses an A-ASSOCIATE response and extracts the MMS user data.
@@ -399,9 +428,10 @@ pub fn parse_aare(apdu: &[u8]) -> Result<AareResult> {
         .expect(tag_aare())
         .map_err(|e| Error::Acse(format!("not an AARE: {e}")))?;
     let mut res = AareResult {
-        accepted: true,
+        accepted: false,
         ..Default::default()
     };
+    let mut has_result = false;
     let mut inner = Decoder::new(content);
     while inner.more() {
         let (tag, c) = inner.read_tlv()?;
@@ -409,20 +439,35 @@ pub fn parse_aare(apdu: &[u8]) -> Result<AareResult> {
         if parse_identity(tag, c, 4, &mut res.responding) {
             continue;
         }
-        if tag == context_constructed(2) {
+        if tag == context_constructed(1) {
+            res.application_context = first_oid(c);
+        } else if tag == context_constructed(2) {
             // result
-            if let Ok(n) = decode_int(first_int(c)) {
-                if n != 0 {
-                    res.accepted = false;
-                }
+            if has_result {
+                return Err(Error::Acse("duplicate AARE result".into()));
             }
+            let mut result = Decoder::new(c);
+            let n = decode_int(result.expect(TAG_INTEGER)?)?;
+            if result.more() || !(0..=2).contains(&n) {
+                return Err(Error::Acse("invalid AARE result".into()));
+            }
+            has_result = true;
+            res.accepted = n == 0;
         } else if tag == context_constructed(3) {
             // result-source-diagnostic
             res.diagnostic = parse_diagnostic(c);
+        } else if tag == context_primitive(9) {
+            res.mechanism = Some(decode_oid(c)?);
+        } else if tag == context_constructed(10) {
+            res.authentication = Some(c.to_vec());
         } else if tag == context_constructed(30) {
             // user-information
+            res.user_information = parse_externals(c)?;
             res.user_data = parse_user_info(c)?;
         }
+    }
+    if !has_result {
+        return Err(Error::Acse("AARE has no result".into()));
     }
     Ok(res)
 }
@@ -436,10 +481,14 @@ pub struct AarqRequest {
     /// The MMS InitiateRequestPDU.
     pub user_data: Vec<u8>,
     pub password: Option<String>,
+    pub mechanism: Option<Oid>,
+    pub authentication: Option<Vec<u8>>,
     /// The identity the peer addressed. A client that fills this in is
     /// checking who it reached, and expects the responding identity in the
     /// AARE to match.
     pub called: Identity,
+    pub user_information: Vec<Vec<u8>>,
+    pub non_kernel: bool,
     /// The identity the peer claims.
     pub calling: Identity,
 }
@@ -461,16 +510,21 @@ pub fn parse_aarq(apdu: &[u8]) -> Result<AarqRequest> {
         {
             continue;
         }
+        if (10..=12).contains(&tag.number) && tag.class == Class::ContextSpecific { req.non_kernel = true; }
         if tag == context_constructed(1) {
             // application-context-name
             req.application_context = first_oid(c);
+        } else if tag == context_primitive(11) {
+            req.mechanism = Some(decode_oid(c)?);
         } else if tag == context_constructed(12) {
+            req.authentication = Some(c.to_vec());
             // calling-authentication-value
             let mut av = Decoder::new(c);
             if let Some(pw) = av.optional(context_primitive(0))? {
                 req.password = Some(String::from_utf8_lossy(pw).into_owned());
             }
         } else if tag == context_constructed(30) {
+            req.user_information = parse_externals(c)?;
             req.user_data = parse_user_info(c)?;
         }
     }
@@ -485,6 +539,40 @@ pub fn is_release(apdu: &[u8]) -> bool {
 /// Reports whether `apdu` is an RLRE (release response).
 pub fn is_release_response(apdu: &[u8]) -> bool {
     Decoder::new(apdu).peek_is(tag_rlre())
+}
+
+/// Native-mode ACSE kernel AARQ with complete EXTERNAL values.
+pub fn kernel_aarq(context: &Oid, called: &Identity, calling: &Identity, information: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = cons(tag_aarq(), [cons(context_constructed(1), [oid_elem(TAG_OID, context)])]);
+    add_identity(&mut out, 2, called); add_identity(&mut out, 6, calling);
+    out.push(cons(context_constructed(30), information.iter().cloned().map(crate::asn1::raw_tlv)));
+    out.encode()
+}
+pub fn kernel_aare(context: &Oid, accepted: bool, diagnostic: i64, responding: &Identity, information: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = cons(tag_aare(), [
+        cons(context_constructed(1), [oid_elem(TAG_OID, context)]),
+        cons(context_constructed(2), [int_elem(TAG_INTEGER, i64::from(!accepted))]),
+        cons(context_constructed(3), [cons(context_constructed(1), [int_elem(TAG_INTEGER, diagnostic)])]),
+    ]);
+    add_identity(&mut out, 4, responding);
+    if !information.is_empty() { out.push(cons(context_constructed(30), information.iter().cloned().map(crate::asn1::raw_tlv))); }
+    out.encode()
+}
+/// ABRT (4), RLRQ (2) or RLRE (3), with native-mode user information.
+pub fn kernel_control(application_tag: u32, reason: i64, information: &[Vec<u8>]) -> Vec<u8> {
+    cons(application_constructed(application_tag), [int_elem(context_primitive(0), reason), cons(context_constructed(30), information.iter().cloned().map(crate::asn1::raw_tlv))]).encode()
+}
+pub fn control_information(apdu: &[u8], application_tag: u32) -> Result<Vec<Vec<u8>>> {
+    let mut outer = Decoder::new(apdu); let mut fields = Decoder::new(outer.expect(application_constructed(application_tag))?);
+    if outer.more() { return Err(Error::Acse("trailing control APDU".into())); }
+    let mut result = None;
+    while fields.more() { let (tag, content) = fields.read_tlv()?; if tag == context_constructed(30) { if result.is_some() { return Err(Error::Acse("duplicate user information".into())); } result = Some(parse_externals(content)?); } }
+    result.ok_or_else(|| Error::Acse("control APDU has no user information".into()))
+}
+fn parse_externals(content: &[u8]) -> Result<Vec<Vec<u8>>> {
+    let mut d = Decoder::new(content); let mut out = Vec::new();
+    while d.more() { let before = d.rest(); d.expect(tag_external())?; out.push(before[..before.len()-d.rest().len()].to_vec()); if out.len() > 16 { return Err(Error::Acse("too many EXTERNALs".into())); } }
+    Ok(out)
 }
 
 fn parse_user_info(content: &[u8]) -> Result<Vec<u8>> {
@@ -708,4 +796,12 @@ mod tests {
         assert!(parse_aarq(&[0x60]).is_err());
         assert!(parse_aare(&aarq(&[0xa8, 0x00], "")).is_err(), "AARQ is not an AARE");
     }
+
+    #[test]
+    fn aare_without_a_valid_result_never_accepts() {
+        for apdu in [vec![0x61, 0], vec![0x61, 2, 0xa2, 0], vec![0x61, 5, 0xa2, 3, 2, 1, 3]] {
+            assert!(parse_aare(&apdu).is_err());
+        }
+    }
+
 }

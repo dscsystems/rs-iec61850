@@ -20,6 +20,8 @@ mod reports;
 mod settings;
 mod theme;
 mod widgets;
+#[path = "../common/tls.rs"]
+mod tls;
 
 use std::io::{self, Stdout};
 use std::time::Duration;
@@ -45,6 +47,12 @@ usage: iedx [options] [host[:port]]
 options:
   -p, --password <s>   password for the ACSE authentication value
       --tls            connect with TLS (IEC 62351-3)
+  --e2e-cert PEM --e2e-key PEM --e2e-ca PEM
+  --e2e-peer OID/QUAL  expected server AE (clients)
+  --e2e-edition 2018|2020  native E2E wire edition
+      --tls-cert PEM --tls-key PEM --tls-ca PEM [--tls-crl PEM]
+      --tls-server-name NAME | --tls-no-server-name
+      --tls13           require TLS 1.3
   -h, --help           show this help
 
 The port defaults to 102. With no address the connect form opens.
@@ -54,6 +62,7 @@ struct Args {
     addr: String,
     password: String,
     tls: bool,
+    tls_args: tls::TlsArgs,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -61,9 +70,11 @@ fn parse_args() -> Result<Args, String> {
         addr: String::new(),
         password: String::new(),
         tls: false,
+        tls_args: tls::TlsArgs::default(),
     };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
+        if out.tls_args.parse(&a, &mut it)? { out.tls = out.tls_args.enabled(); continue; }
         match a.as_str() {
             "-h" | "--help" => {
                 print!("{USAGE}");
@@ -177,11 +188,13 @@ async fn main() {
     let input = spawn_input(ev_tx);
 
     let mut app = App::new(args.addr, args.password, args.tls, msg_tx);
+    app.tls_args = args.tls_args;
     app.start();
 
     let result = run(&mut term, &mut app, msg_rx, ev_rx).await;
 
     restore_terminal();
+    let close_error = if let Some(client) = app.ctx.client.take() { client.close().await.err() } else { None };
     // The reader thread ends once its channel closes, which the drop above
     // has already done; joining keeps it from writing after the restore.
     drop(term);
@@ -189,6 +202,10 @@ async fn main() {
 
     if let Err(e) = result {
         eprintln!("iedx: {e}");
+        std::process::exit(1);
+    }
+    if let Some(error) = close_error {
+        eprintln!("iedx: close: {error}");
         std::process::exit(1);
     }
 }

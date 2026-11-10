@@ -130,13 +130,16 @@ impl BitString {
         if i >= self.length {
             return false;
         }
-        self.bits[i / 8] & (0x80 >> (i % 8)) != 0
+        self.bits.get(i / 8).is_some_and(|b| b & (0x80 >> (i % 8)) != 0)
     }
 
     /// Sets bit `i` to `v`; out-of-range indices are ignored.
     pub fn set_bit(&mut self, i: usize, v: bool) {
         if i >= self.length {
             return;
+        }
+        if self.bits.len() < self.length.div_ceil(8) {
+            self.bits.resize(self.length.div_ceil(8), 0);
         }
         if v {
             self.bits[i / 8] |= 0x80 >> (i % 8);
@@ -171,9 +174,13 @@ impl BitString {
 
 /// Appends bit string content octets (padding count prefix then packed bits).
 pub fn append_bit_string(dst: &mut Vec<u8>, bs: &BitString) {
-    let pad = bs.bits.len() * 8 - bs.length;
+    let octets = bs.length.div_ceil(8);
+    let pad = (8 - bs.length % 8) % 8;
     dst.push(pad as u8);
-    dst.extend_from_slice(&bs.bits);
+    for i in 0..octets {
+        let byte = bs.bits.get(i).copied().unwrap_or(0);
+        dst.push(if i + 1 == octets { byte & (0xff << pad) } else { byte });
+    }
 }
 
 /// Decodes bit string content octets.
@@ -314,4 +321,18 @@ mod tests {
         assert!(decode_bit_string(&[8]).is_err(), "padding > 7");
         assert!(decode_float(&[0; 4]).is_err());
     }
+
+    #[test]
+    fn bit_string_encoding_normalizes_storage_and_padding() {
+        for (bits, length, want) in [
+            (vec![255, 255], 3, vec![5, 224]),
+            (vec![], 9, vec![7, 0, 0]),
+            (vec![255], 0, vec![0]),
+        ] {
+            let mut wire = Vec::new();
+            append_bit_string(&mut wire, &BitString { bits, length });
+            assert_eq!(wire, want);
+        }
+    }
+
 }

@@ -23,6 +23,9 @@ const PARAM_DST_TSAP: u8 = 0xc2;
 /// End-of-transmission flag in a DT TPDU's number octet.
 const EOT: u8 = 0x80;
 
+/// Maximum reassembled service data unit, including OSI security overhead.
+pub const MAX_TSDU: usize = 1 << 20;
+
 /// The transport selector used by common IEC 61850 stacks.
 pub const DEFAULT_TSAP: &[u8] = &[0x00, 0x01];
 
@@ -68,10 +71,12 @@ where
 {
     /// Performs the CR/CC handshake as the calling (client) side.
     pub async fn connect(stream: S, opts: Options) -> Result<Conn<S>> {
-        let size_code = if opts.tpdu_size_code == 0 {
-            10
-        } else {
-            opts.tpdu_size_code
+        if opts.src_tsap.len() > 32 || opts.dst_tsap.len() > 32 {
+            return Err(Error::Cotp("transport selector exceeds 32 octets".into()));
+        }
+        let size_code = match opts.tpdu_size_code {
+            0 => 10,
+            n => n.clamp(7, 13),
         };
         let mut c = Conn {
             stream,
@@ -104,6 +109,9 @@ where
             return Err(Error::Cotp(format!("expected CR, got type 0x{typ:02x}")));
         }
         // body = destRef(2) srcRef(2) class(1) params...
+        if body.len() < 5 || body[4] != 0 {
+            return Err(Error::Cotp("invalid class-0 CR".into()));
+        }
         if body.len() >= 4 {
             c.dst_ref = u16::from_be_bytes([body[2], body[3]]);
         }
@@ -119,13 +127,15 @@ where
                 let val = &params[2..2 + plen];
                 match code {
                     PARAM_TPDU_SIZE if plen == 1 => {
-                        size_code = val[0];
-                        c.max_tpdu = 1usize << size_code.min(24);
+                        size_code = val[0].clamp(7, 13);
+                        c.max_tpdu = 1usize << size_code;
                     }
-                    // The peer's source selector is our destination, and
-                    // vice versa.
-                    PARAM_SRC_TSAP => c.dst_tsap = val.to_vec(),
-                    PARAM_DST_TSAP => c.src_tsap = val.to_vec(),
+                    // CC retains the calling/called roles of the CR.
+                    PARAM_SRC_TSAP if plen <= 32 => c.src_tsap = val.to_vec(),
+                    PARAM_DST_TSAP if plen <= 32 => c.dst_tsap = val.to_vec(),
+                    PARAM_SRC_TSAP | PARAM_DST_TSAP => {
+                        return Err(Error::Cotp("transport selector exceeds 32 octets".into()));
+                    }
                     _ => {}
                 }
                 params = &params[2 + plen..];
@@ -176,6 +186,9 @@ where
         if body.len() < 5 {
             return Err(Error::Cotp("short CC".into()));
         }
+        if u16::from_be_bytes([body[0], body[1]]) != self.src_ref || body[4] != 0 {
+            return Err(Error::Cotp("CC reference or transport class mismatch".into()));
+        }
         // body = destRef(2) srcRef(2) class(1) params...; the peer's srcRef
         // is our destination reference.
         self.dst_ref = u16::from_be_bytes([body[2], body[3]]);
@@ -193,9 +206,9 @@ where
                 return;
             }
             let val = &params[2..2 + plen];
-            if code == PARAM_TPDU_SIZE && plen == 1 {
+            if code == PARAM_TPDU_SIZE && plen == 1 && (7..=13).contains(&val[0]) {
                 // Only ever negotiate downwards.
-                let sz = 1usize << val[0].min(24);
+                let sz = 1usize << val[0];
                 if sz > 0 && sz < self.max_tpdu {
                     self.max_tpdu = sz;
                 }
@@ -239,7 +252,11 @@ where
                         return Err(Error::Cotp("short DT".into()));
                     }
                     let num = body[0];
-                    buf.extend_from_slice(&tpdu[1 + li..]);
+                    let data = &tpdu[1 + li..];
+                    if buf.len() + data.len() > MAX_TSDU {
+                        return Err(Error::Cotp("reassembled TSDU exceeds limit".into()));
+                    }
+                    buf.extend_from_slice(data);
                     if num & EOT != 0 {
                         return Ok(buf);
                     }
@@ -302,7 +319,11 @@ impl<R: AsyncRead + Unpin> Reader<R> {
                         return Err(Error::Cotp("short DT".into()));
                     }
                     let num = body[0];
-                    buf.extend_from_slice(&tpdu[1 + li..]);
+                    let data = &tpdu[1 + li..];
+                    if buf.len() + data.len() > MAX_TSDU {
+                        return Err(Error::Cotp("reassembled TSDU exceeds limit".into()));
+                    }
+                    buf.extend_from_slice(data);
                     if num & EOT != 0 {
                         return Ok(buf);
                     }
@@ -484,4 +505,29 @@ mod tests {
         assert!(parse_header(&[0x00, 0xf0]).is_err(), "LI of zero");
         assert!(parse_header(&[0xff, 0xf0]).is_err(), "LI past the buffer");
     }
+
+    #[tokio::test]
+    async fn calling_and_called_selectors_keep_their_roles() {
+        let (cli, mut srv) = tokio::io::duplex(4096);
+        let task = tokio::spawn(async move {
+            let c = Conn::accept(&mut srv).await.unwrap();
+            assert_eq!(c.src_tsap, [1, 2, 3]);
+            assert_eq!(c.dst_tsap, [4, 5]);
+        });
+        let c = Conn::connect(cli, Options { src_tsap: vec![1,2,3], dst_tsap: vec![4,5], tpdu_size_code: 255 }).await.unwrap();
+        assert_eq!(c.max_tpdu(), 8192);
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn connection_confirm_for_another_reference_is_refused() {
+        let (cli, mut srv) = tokio::io::duplex(4096);
+        let task = tokio::spawn(async move {
+            tpkt::read_packet(&mut srv).await.unwrap();
+            tpkt::write_packet(&mut srv, &[6, TPDU_CC, 0, 2, 0, 1, 0]).await.unwrap();
+        });
+        assert!(Conn::connect(cli, Options::default()).await.is_err());
+        task.await.unwrap();
+    }
+
 }

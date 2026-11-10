@@ -10,8 +10,10 @@ mod interop_common;
 
 #[cfg(feature = "gdoi")]
 use std::net::SocketAddr;
+#[cfg(feature = "tls")]
+use std::sync::Arc;
 #[cfg(feature = "gdoi")]
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 #[cfg(feature = "tls")]
 use std::time::Duration;
 
@@ -100,7 +102,10 @@ impl Pki {
     }
 
     fn issue(&self, cn: &str) -> Identity {
-        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        self.issue_with(cn, &rcgen::PKCS_ECDSA_P256_SHA256)
+    }
+    fn issue_with(&self, cn: &str, algorithm: &'static rcgen::SignatureAlgorithm) -> Identity {
+        let key = rcgen::KeyPair::generate_for(algorithm).unwrap();
         let mut p = rcgen::CertificateParams::default();
         p.distinguished_name = rcgen::DistinguishedName::new();
         p.distinguished_name.push(rcgen::DnType::CommonName, cn);
@@ -403,4 +408,48 @@ mod tls_interop {
         let (out, ok) = run(&bin, &["tls-client", &addr, &cli.cert, &cli.key, &cli.root, "ied2"], None, Duration::from_secs(15)).await;
         assert!(!ok, "the Go client accepted the Rust server as ied2:\n{out}");
     }
+}
+
+#[cfg(feature = "tls")]
+fn a_profile_config(pki: &Pki, identity: &Identity) -> Arc<iec61850::iec62351::aprofile::Config> {
+    use iec61850::iec62351::{aprofile::{Config, Credential, Verifier}, pki::TrustStore};
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+    let credential = Credential::new(identity.der.clone(), PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(identity.key_der.clone()))).unwrap();
+    let trust = Arc::new(TrustStore::new(vec![CertificateDer::from(pki.root_der())]).unwrap());
+    let mut config = Config::new(credential, Arc::new(Verifier::new(trust)));
+    config.allow_without_tls = true;
+    Arc::new(config)
+}
+
+#[cfg(feature = "tls")]
+#[tokio::test]
+async fn rust_client_go_a_profile_server() {
+    let Some(bin) = need("IEC61850_GO_PEER") else { return };
+    let pki = Pki::new("aprofile-go-server");
+    let server = pki.issue_with("ied1", &rcgen::PKCS_RSA_SHA256);
+    let client = pki.issue_with("scada", &rcgen::PKCS_RSA_SHA256);
+    let mut peer = GoPeer::start(&bin, &["aprofile-server", "127.0.0.1:0", &server.cert, &server.key, &server.root]);
+    let addr = peer.expect("listening ").await;
+    let config = a_profile_config(&pki, &client);
+    let options = iec61850::client::Options::new().with_a_profile(config).with_timeout(Duration::from_secs(5));
+    let conn = iec61850::client::Client::dial_with(&addr, options).await.expect("Go A-profile authentication");
+    conn.read("simpleIOGenericIO/GGIO1.AnIn1.mag.f", iec61850::model::Fc::Mx).await.unwrap();
+    conn.close().await.unwrap();
+    peer.finish().await;
+}
+
+#[cfg(feature = "tls")]
+#[tokio::test]
+async fn go_client_rust_a_profile_server() {
+    let Some(bin) = need("IEC61850_GO_PEER") else { return };
+    let pki = Pki::new("aprofile-rust-server");
+    let server_id = pki.issue_with("ied1", &rcgen::PKCS_RSA_SHA256);
+    let client = pki.issue_with("scada", &rcgen::PKCS_RSA_SHA256);
+    let model = iec61850::scl::load_model(testdata("simpleIO_direct_control.cid"), &iec61850::scl::BuildOptions::new()).unwrap();
+    let server = iec61850::server::Server::new(model, iec61850::server::Options::new().with_a_profile(a_profile_config(&pki, &server_id), true));
+    let (host, port) = serve(&server).await;
+    let addr = format!("{host}:{port}");
+    let (out, ok) = run(&bin, &["aprofile-client", &addr, &client.cert, &client.key, &client.root], None, Duration::from_secs(15)).await;
+    assert!(ok && out.contains("read "), "Go A-profile client: {out}");
+    server.close().await.unwrap();
 }

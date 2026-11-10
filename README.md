@@ -8,7 +8,9 @@ A pure-Rust implementation of the IEC 61850 protocol family:
 - **GOOSE** publisher and subscriber (raw Ethernet, Linux AF_PACKET)
 - **Sampled Values** (IEC 61850-9-2 / 9-2LE, Amendment 1) publisher and subscriber
 - **R-GOOSE and R-SV** over UDP (IEC 61850-90-5), signed or encrypted
-- **IEC 62351-3** TLS profile for MMS, and **IEC 62351-9** GDOI key distribution
+- **IEC 62351-3** TLS profile for MMS, **IEC 62351-4** certificate-based ACSE
+  authentication (A-profile), native E2E integrity protection (feature `e2e`),
+  and **IEC 62351-9** GDOI key distribution
 - **SCL** (ICD/CID/SCD, Edition 1 to 2.1) parsing and runtime model instantiation
 
 No C bindings, no `unsafe` outside the AF_PACKET socket calls, async on tokio.
@@ -78,6 +80,8 @@ server.listen_and_serve("0.0.0.0:102").await?;
 - [SKILL.md](SKILL.md) — a task-oriented guide for building applications on the
   crate, written for AI coding agents: recipes, the traps that cause real bugs,
   and how to test against a live server
+- [docs/e2e.md](docs/e2e.md) — native E2E credentials, policy, API and tools
+- [docs/go-parity.md](docs/go-parity.md) — comparison with Go, verified changes and remaining gaps
 - [docs/api.md](docs/api.md) — an example for every part of the public API
 - [docs/developer-guide.md](docs/developer-guide.md) — architecture, and the
   protocol details that bite when adding a service
@@ -133,9 +137,10 @@ The `File directory` failure is the reference client reading the first
 directory listing entry without checking whether it is a directory; it fails
 identically against its own server.
 
-**go-iec61850, security** (`interop/go-security.sh`, 8 tests): R-GOOSE and
+**go-iec61850, security** (`interop/go-security.sh`, 10 tests): R-GOOSE and
 R-SV in every key mode both ways, GDOI registrations with pre-shared keys and
-certificates in both directions, and MMS over TLS both ways. All pass.
+certificates in both directions, MMS over TLS both ways, and A-profile ACSE
+authentication in both directions.
 
 ```sh
 GO_IEC61850=/path/to/go-iec61850 interop/run.sh
@@ -166,9 +171,12 @@ GOOSE and SV raw-socket transport is Linux-only (AF_PACKET, needs
 `ethernet::pipe()` to exercise the process-bus protocols without a NIC.
 
 Not yet implemented: report segmentation, and GOOSE/SV capture backends for
-non-Linux platforms. The `iedx` terminal UI connects in the clear only; a TLS
-session needs a trust configuration it has no way to ask for, so use the
-library API for that.
+non-Linux platforms. The bundled tools accept `--tls-cert`, `--tls-key`, `--tls-ca`, optional
+`--tls-crl`, `--tls-server-name` and `--tls13` (build with `--features tls`).
+The client checks the dialled server name by default. `iedx` retains its TLS
+configuration across reconnects. Native IEC 62351-4 E2E integrity protection is available with `--features e2e`
+and the `--e2e-*` credential options; see [the guide](docs/e2e.md). OpenSSL TLS
+engines remain a separate gap; see [the comparison](docs/go-parity.md).
 
 ## Testing
 
@@ -178,6 +186,8 @@ cargo test --all-features           # and TLS, GDOI and the terminal UI
 cargo clippy --all-targets --all-features
 interop/run.sh                      # against independent implementations
 interop/go-security.sh
+bash interop/cli-security.sh
+bash interop/e2e.sh
 interop/libiec.sh
 ```
 

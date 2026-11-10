@@ -95,6 +95,7 @@ pub struct ReportSubscription {
     domain: String,
     item: String,
     closed: AtomicBool,
+    buffered: bool,
 }
 
 impl ReportSubscription {
@@ -115,10 +116,17 @@ impl ReportSubscription {
             .conn
             .write(&self.domain, &[&item], &[Value::boolean(false)])
             .await?;
-        match results.into_iter().next() {
-            Some(Err(code)) => Err(Error::client(format!("RCB write RptEna: {code}"))),
-            _ => Ok(()),
+        if let Some(Err(code)) = results.into_iter().next() {
+            return Err(Error::client(format!("RCB write RptEna: {code}")));
         }
+        if !self.buffered {
+            let item = format!("{}$Resv", self.item);
+            let results = self.conn.write(&self.domain, &[&item], &[Value::boolean(false)]).await?;
+            if let Some(Err(code)) = results.into_iter().next() {
+                return Err(Error::client(format!("RCB write Resv: {code}")));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -149,9 +157,7 @@ impl Client {
             ..Default::default()
         };
 
-        if let Ok(v) = self.read_rcb_attr(&rcb, "RptID").await {
-            rcb.rpt_id = v.text();
-        }
+        rcb.rpt_id = self.read_rcb_attr(&rcb, "RptID").await?.text();
         if let Ok(v) = self.read_rcb_attr(&rcb, "DatSet").await {
             rcb.data_set = v.text();
         }
@@ -228,6 +234,8 @@ impl Client {
         if !rcb.buffered {
             self.write_rcb(rcb, "Resv", Value::boolean(true)).await?;
         }
+        let result = async {
+        self.write_rcb(rcb, "BufTm", Value::uint32(rcb.buf_tm)).await?;
         if rcb.opt_flds != OptFlds::default() {
             self.write_rcb(rcb, "OptFlds", rcb.opt_flds.value()).await?;
         }
@@ -270,6 +278,7 @@ impl Client {
             domain: rcb.domain.clone(),
             item: rcb.item.clone(),
             closed: AtomicBool::new(false),
+            buffered: rcb.buffered,
         };
 
         if let Err(e) = self.write_rcb(rcb, "RptEna", Value::boolean(true)).await {
@@ -278,6 +287,11 @@ impl Client {
             return Err(e);
         }
         Ok(sub)
+        }.await;
+        if result.is_err() && !rcb.buffered {
+            let _ = self.write_rcb(rcb, "Resv", Value::boolean(false)).await;
+        }
+        result
     }
 
     /// Requests a general interrogation: the server sends a report containing

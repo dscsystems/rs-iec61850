@@ -43,14 +43,14 @@ pub fn append_oid(dst: &mut Vec<u8>, o: &Oid) {
     if o.0.len() < 2 {
         return;
     }
-    append_base128(dst, o.0[0] * 40 + o.0[1]);
+    append_base128(dst, u64::from(o.0[0]) * 40 + u64::from(o.0[1]));
     for &arc in &o.0[2..] {
-        append_base128(dst, arc);
+        append_base128(dst, u64::from(arc));
     }
 }
 
-fn append_base128(dst: &mut Vec<u8>, v: u32) {
-    let mut tmp = [0u8; 5];
+fn append_base128(dst: &mut Vec<u8>, v: u64) {
+    let mut tmp = [0u8; 10];
     let mut i = tmp.len();
     let mut v = v;
     loop {
@@ -74,21 +74,21 @@ pub fn decode_oid(content: &[u8]) -> Result<Oid> {
         return Err(Error::bad_value("empty OID"));
     }
     let mut arcs: Vec<u32> = Vec::new();
-    let mut v: u32 = 0;
+    let mut v: u64 = 0;
     let mut n = 0;
     for &b in content {
-        if n >= 5 {
+        if n >= 5 || v > ((u64::from(u32::MAX) + 80) >> 7) {
             return Err(Error::bad_value("OID arc too large"));
         }
-        v = (v << 7) | u32::from(b & 0x7f);
+        v = (v << 7) | u64::from(b & 0x7f);
         n += 1;
         if b & 0x80 == 0 {
             if arcs.is_empty() {
                 let first = (v / 40).min(2);
-                arcs.push(first);
-                arcs.push(v - first * 40);
+                arcs.push(first as u32);
+                arcs.push(u32::try_from(v - first * 40).map_err(|_| Error::bad_value("OID arc too large"))?);
             } else {
-                arcs.push(v);
+                arcs.push(u32::try_from(v).map_err(|_| Error::bad_value("OID arc too large"))?);
             }
             v = 0;
             n = 0;
@@ -147,4 +147,11 @@ mod tests {
         assert!(decode_oid(&[0x80]).is_err(), "truncated final arc");
         assert!(decode_oid(&[0x80, 0x80, 0x80, 0x80, 0x80, 0x00]).is_err());
     }
+
+    #[test]
+    fn oid_arcs_cannot_wrap_u32() {
+        assert!(decode_oid(&[40, 0x90, 0x80, 0x80, 0x80, 0]).is_err());
+        assert_eq!(decode_oid(&[40, 0x8f, 0xff, 0xff, 0xff, 0x7f]).unwrap().arcs(), &[1, 0, u32::MAX]);
+    }
+
 }

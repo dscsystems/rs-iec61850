@@ -64,7 +64,7 @@ impl<'a> Decoder<'a> {
                     offset: self.off,
                 });
             }
-            if i >= 5 {
+            if i >= 5 || t.number > (u32::MAX >> 7) {
                 return Err(Error::BadTag {
                     what: "tag number too large",
                     offset: self.off,
@@ -278,4 +278,12 @@ mod tests {
         let mut d = Decoder::new(&buf);
         assert!(matches!(d.read_tlv(), Err(Error::TooDeep { .. })));
     }
+
+    #[test]
+    fn high_tag_numbers_cannot_wrap_u32() {
+        assert!(Decoder::new(&[0x9f, 0x90, 0x80, 0x80, 0x80, 0, 0]).read_tlv().is_err());
+        let max = [0x9f, 0x8f, 0xff, 0xff, 0xff, 0x7f, 0];
+        assert_eq!(Decoder::new(&max).read_tlv().unwrap().0.number, u32::MAX);
+    }
+
 }

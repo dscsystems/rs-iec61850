@@ -36,6 +36,11 @@ use rustls::{DigitallySignedStruct, DistinguishedName, SignatureScheme};
 
 use crate::x509;
 
+pub mod pki;
+pub mod aprofile;
+#[cfg(feature = "e2e")]
+pub mod e2e;
+
 /// The port of MMS over TLS (IEC 62351-3, ISO-TSAP over TLS).
 pub const MMS_TLS_PORT: u16 = 3782;
 
@@ -94,8 +99,11 @@ pub struct Options {
     pub allowed_peers: Vec<CertificateDer<'static>>,
     /// On a client, the identity the server's certificate must carry: in a
     /// subject alternative name, or, for a certificate that has none, as its
-    /// common name. Empty checks the chain only.
+    /// common name. Empty checks the name passed to the TLS connector.
     pub server_name: String,
+    /// Disable the default check against the dialled host for legacy peers.
+    /// An explicit `server_name` is still checked.
+    pub no_server_name: bool,
     /// Refuses TLS 1.2.
     pub tls13_only: bool,
     pub on_event: Option<EventHandler>,
@@ -269,6 +277,7 @@ fn base(o: Options) -> Result<Base, Error> {
         allow_stale_crl: o.allow_stale_crl,
         allowed_peers: o.allowed_peers,
         server_name: o.server_name,
+        no_server_name: o.no_server_name,
         on_event: o.on_event,
         now: o.now,
     });
@@ -289,6 +298,7 @@ struct Verifier {
     allow_stale_crl: bool,
     allowed_peers: Vec<CertificateDer<'static>>,
     server_name: String,
+    no_server_name: bool,
     on_event: Option<EventHandler>,
     now: Option<fn() -> SystemTime>,
 }
@@ -423,9 +433,9 @@ impl Verifier {
         check_key(&root.public_key)?;
         for crl in self.crl_list.iter().filter(|c| c.issuer == leaf.issuer) {
             if !self.signed_by(&crl.signed, root) {
-                continue;
+                return Err(Error::Chain("CRL signature does not verify".into()));
             }
-            if !self.allow_stale_crl && crl.next_update.is_some_and(|n| now > n) {
+            if !self.allow_stale_crl && (now < crl.this_update || crl.next_update.is_none_or(|n| now > n)) {
                 return Err(Error::StaleCrl);
             }
             if crl.revoked.iter().any(|s| s == &leaf.serial) {
@@ -502,9 +512,23 @@ impl ServerCertVerifier for Verifier {
         _ocsp_response: &[u8],
         now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
-        // The name the connection was dialled by is an address more often
-        // than not; the profile names the server by Options::server_name.
+        // An explicit profile name overrides the connector name. Otherwise
+        // bind the authenticated certificate to the host that was dialled.
         self.check(end_entity, intermediates, now, true)?;
+        if self.server_name.is_empty() && !self.no_server_name {
+            let name = _server_name.to_str();
+            let cert = x509::parse(end_entity.as_ref()).map_err(|e| rustls::Error::General(e.to_string()))?;
+            let matches = if cert.version == 1 {
+                cert.common_name.as_deref() == Some(name.as_ref())
+            } else {
+                webpki::EndEntityCert::try_from(end_entity).is_ok_and(|ee| names_server(&ee, &cert, name.as_ref()))
+            };
+            if !matches {
+                let err = Error::ServerName(name.into_owned());
+                if let Some(handler) = &self.on_event { handler(&Event { peer: Some(end_entity.clone().into_owned()), err: err.clone() }); }
+                return Err(rustls::Error::General(err.to_string()));
+            }
+        }
         Ok(ServerCertVerified::assertion())
     }
 

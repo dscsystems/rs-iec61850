@@ -221,7 +221,8 @@ impl Client {
         // ctlModel lives under CF, not CO.
         let model = match self.read(reference.child("ctlModel"), Fc::Cf).await {
             Ok(v) => CtlModel::from_code(v.as_i64() as u8),
-            Err(_) => CtlModel::DirectNormal,
+            Err(e) if e.as_access_error() == Some(crate::mms::DataAccessError::ObjectNonExistent) => CtlModel::DirectNormal,
+            Err(e) => return Err(e),
         };
         Ok(ControlObject {
             client: self,

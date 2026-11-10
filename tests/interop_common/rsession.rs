@@ -227,6 +227,7 @@ pub async fn sv_to(bin: &str, modes: Vec<(&'static str, Option<Key>)>) {
         for i in 0..3u16 {
             let pdu = sv::Pdu {
                 app_id: 0x4001,
+            simulation: false,
                 asdus: vec![sv::Asdu {
                     sv_id: "RSV1".into(),
                     smp_cnt: i,

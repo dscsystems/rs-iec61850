@@ -527,7 +527,7 @@ pub(crate) fn parse_journal_query(content: &[u8]) -> mms::Result<JournalQuery> {
                 if start {
                     q.start_entry = Some(cv.to_vec());
                 } else {
-                    q.count = asn1::decode_int(cv)?.max(0) as usize;
+                    q.count = usize::try_from(asn1::decode_int(cv)?).map_err(|_| DataAccessError::ObjectValueInvalid)?;
                 }
             }
         } else if tag == context_constructed(4) {
