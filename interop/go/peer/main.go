@@ -17,6 +17,12 @@
 //	peer tls-client ADDR CERT KEY ROOT NAME
 //	    associates under the profile, reads GGIO1.AnIn1.mag.f, prints
 //	    "read VALUE".
+//
+// The TLS modes take IEC61850_TLS_GROUPS, a comma-separated list of key
+// exchange groups replacing the profile's (P256, P384, P521,
+// X25519MLKEM768, SecP256r1MLKEM768, SecP384r1MLKEM1024), and
+// IEC61850_TLS_VERSION, 1.2 or 1.3, to allow that version only. The
+// server prints "negotiated VERSION GROUP" for each connection.
 package main
 
 import (
@@ -34,6 +40,7 @@ import (
 	"net"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/dscsystems/go-iec61850/client"
@@ -309,6 +316,55 @@ func gdoiMember(args []string) {
 	}
 }
 
+// tlsOverrides applies IEC61850_TLS_GROUPS and IEC61850_TLS_VERSION to a
+// profile configuration.
+func tlsOverrides(cfg *tls.Config) {
+	names := map[string]tls.CurveID{
+		"P256": tls.CurveP256, "P384": tls.CurveP384, "P521": tls.CurveP521,
+		"X25519MLKEM768":     tls.X25519MLKEM768,
+		"SecP256r1MLKEM768":  tls.SecP256r1MLKEM768,
+		"SecP384r1MLKEM1024": tls.SecP384r1MLKEM1024,
+	}
+	if v := os.Getenv("IEC61850_TLS_GROUPS"); v != "" {
+		cfg.CurvePreferences = nil
+		for _, n := range strings.Split(v, ",") {
+			id, ok := names[n]
+			if !ok {
+				fail("unknown group %q", n)
+			}
+			cfg.CurvePreferences = append(cfg.CurvePreferences, id)
+		}
+	}
+	switch os.Getenv("IEC61850_TLS_VERSION") {
+	case "":
+	case "1.2":
+		cfg.MinVersion, cfg.MaxVersion = tls.VersionTLS12, tls.VersionTLS12
+	case "1.3":
+		cfg.MinVersion, cfg.MaxVersion = tls.VersionTLS13, tls.VersionTLS13
+	default:
+		fail("IEC61850_TLS_VERSION is 1.2 or 1.3")
+	}
+}
+
+// reportingListener completes each handshake as it accepts, and prints
+// what it negotiated.
+type reportingListener struct{ net.Listener }
+
+func (l reportingListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err != nil {
+		return c, err
+	}
+	tc := c.(*tls.Conn)
+	if err := tc.Handshake(); err != nil {
+		fmt.Printf("handshake %v\n", err)
+		return c, nil
+	}
+	cs := tc.ConnectionState()
+	fmt.Printf("negotiated %s %s\n", tls.VersionName(cs.Version), cs.CurveID)
+	return c, nil
+}
+
 func tlsServer(args []string) {
 	if len(args) != 4 {
 		fail("usage: peer tls-server ADDR CERT KEY ROOT")
@@ -323,6 +379,7 @@ func tlsServer(args []string) {
 	if err != nil {
 		fail("%v", err)
 	}
+	tlsOverrides(cfg)
 	m, err := scl.LoadModel(os.Getenv("SIMPLEIO_CID"))
 	if err != nil {
 		fail("model: %v", err)
@@ -332,7 +389,7 @@ func tlsServer(args []string) {
 		fail("listen: %v", err)
 	}
 	srv := server.New(m, server.WithTLS(cfg))
-	go srv.Serve(tls.NewListener(ln, cfg))
+	go srv.Serve(reportingListener{tls.NewListener(ln, cfg)})
 	fmt.Printf("listening %s\n", ln.Addr())
 	untilStdinCloses()
 	srv.Close()
@@ -351,6 +408,7 @@ func tlsClient(args []string) {
 	if err != nil {
 		fail("%v", err)
 	}
+	tlsOverrides(cfg)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	c, err := client.Dial(ctx, args[0], client.WithTLS(cfg), client.WithTimeout(5*time.Second))

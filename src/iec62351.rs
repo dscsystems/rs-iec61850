@@ -6,7 +6,9 @@
 //! the profile:
 //!
 //! - TLS 1.2 or 1.3 ([`Options::tls13_only`] refuses 1.2), with ephemeral
-//!   elliptic-curve key exchange (P-256, P-384) and AES-GCM only.
+//!   elliptic-curve key exchange (P-256, P-384, P-521) and AES-GCM only.
+//!   [`Options::kx_groups`] can instead offer ML-KEM hybrid key exchange in
+//!   TLS 1.3.
 //! - Both ends authenticate with certificates, which must chain to
 //!   [`Options::roots`]. A certificate with an extended key usage must allow
 //!   TLS server or client authentication as its role requires; IED
@@ -38,6 +40,9 @@ use crate::x509;
 
 pub mod pki;
 pub mod aprofile;
+mod kx;
+
+pub use kx::{KxGroup, DEFAULT_KX_GROUPS};
 #[cfg(feature = "e2e")]
 pub mod e2e;
 
@@ -106,6 +111,12 @@ pub struct Options {
     pub no_server_name: bool,
     /// Refuses TLS 1.2.
     pub tls13_only: bool,
+    /// The key exchange groups offered and accepted, in order of preference.
+    /// Empty is [`DEFAULT_KX_GROUPS`]. Both ends need a group in common.
+    /// Hybrids exist in TLS 1.3 only: listing hybrids alone requires
+    /// [`Options::tls13_only`]; adding a classical group keeps TLS 1.2 peers
+    /// and peers without hybrids connecting, with classical key exchange.
+    pub kx_groups: Vec<KxGroup>,
     pub on_event: Option<EventHandler>,
     /// Overrides the clock the certificates and CRLs are checked against
     /// (tests).
@@ -122,12 +133,18 @@ impl std::fmt::Debug for Options {
             .field("allowed_peers", &self.allowed_peers.len())
             .field("server_name", &self.server_name)
             .field("tls13_only", &self.tls13_only)
+            .field("kx_groups", &self.kx_groups)
             .finish_non_exhaustive()
     }
 }
 
-/// The provider of the profile: AES-GCM suites with ECDHE, P-256 and P-384.
+/// The provider of the profile with its default groups.
 fn provider() -> CryptoProvider {
+    provider_with(DEFAULT_KX_GROUPS)
+}
+
+/// The provider of the profile: AES-GCM suites with ECDHE over `groups`.
+fn provider_with(groups: &[KxGroup]) -> CryptoProvider {
     use crypto::aws_lc_rs as p;
     CryptoProvider {
         cipher_suites: vec![
@@ -138,7 +155,7 @@ fn provider() -> CryptoProvider {
             p::cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
             p::cipher_suite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
         ],
-        kx_groups: vec![p::kx_group::SECP256R1, p::kx_group::SECP384R1],
+        kx_groups: groups.iter().map(|g| g.supported()).collect(),
         ..p::default_provider()
     }
 }
@@ -251,7 +268,19 @@ fn base(o: Options) -> Result<Base, Error> {
         .iter()
         .map(|a| DistinguishedName::in_sequence(a.subject.as_ref()))
         .collect();
-    let provider = Arc::new(provider());
+    let mut groups: Vec<KxGroup> = Vec::new();
+    for &g in if o.kx_groups.is_empty() { DEFAULT_KX_GROUPS } else { &o.kx_groups } {
+        if !groups.contains(&g) {
+            groups.push(g);
+        }
+    }
+    if !o.tls13_only && groups.iter().all(|g| g.is_hybrid()) {
+        // TLS 1.2 would be offered with no group to run it on.
+        return Err(Error::Config(
+            "Options::kx_groups has only TLS 1.3 hybrids: set tls13_only, or add a classical group".into(),
+        ));
+    }
+    let provider = Arc::new(provider_with(&groups));
     static TLS13_ONLY: &[&rustls::SupportedProtocolVersion] = &[&rustls::version::TLS13];
     static TLS12_AND_13: &[&rustls::SupportedProtocolVersion] =
         &[&rustls::version::TLS13, &rustls::version::TLS12];
