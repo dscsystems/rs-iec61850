@@ -462,3 +462,212 @@ async fn default_server_name_is_bound_to_the_dial_address() {
     let err = dial(&addr, client).await.unwrap_err();
     assert!(err.contains("does not name the server"), "{err}");
 }
+
+/// Exercise the shipped profile against a separately configured, mutually
+/// authenticated peer. Inspect the negotiated group rather than inferring PQ
+/// protection from a successful TLS 1.3 connection.
+#[tokio::test]
+async fn tls_versions_and_mlkem_hybrid_compatibility() {
+    use rustls::crypto::{aws_lc_rs as p, SupportedKxGroup};
+    use rustls::{NamedGroup, ProtocolVersion};
+
+    async fn handshake(
+        client: Arc<rustls::ClientConfig>,
+        server: Arc<rustls::ServerConfig>,
+    ) -> Result<(ProtocolVersion, NamedGroup), String> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (c, s) = tokio::io::duplex(16 * 1024);
+        let exchange = async {
+            let client = async {
+                let mut tls = tokio_rustls::TlsConnector::from(client)
+                    .connect("ied1".try_into().unwrap(), c)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let conn = tls.get_ref().1;
+                let negotiated = (
+                    conn.protocol_version().unwrap(),
+                    conn.negotiated_key_exchange_group().unwrap().name(),
+                );
+                tls.write_all(b"probe").await.map_err(|e| e.to_string())?;
+                let mut reply = [0; 5];
+                tls.read_exact(&mut reply)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                assert_eq!(&reply, b"probe");
+                Ok::<_, String>(negotiated)
+            };
+            let server = async {
+                let mut tls = tokio_rustls::TlsAcceptor::from(server)
+                    .accept(s)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                assert!(tls.get_ref().1.peer_certificates().is_some());
+                let conn = tls.get_ref().1;
+                let negotiated = (
+                    conn.protocol_version().unwrap(),
+                    conn.negotiated_key_exchange_group().unwrap().name(),
+                );
+                let mut request = [0; 5];
+                tls.read_exact(&mut request)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                tls.write_all(&request).await.map_err(|e| e.to_string())?;
+                Ok::<_, String>(negotiated)
+            };
+            let (c, s) = tokio::join!(client, server);
+            let c = c?;
+            assert_eq!(c, s?);
+            Ok(c)
+        };
+        tokio::time::timeout(Duration::from_secs(3), exchange)
+            .await
+            .expect("TLS probe must finish")
+    }
+
+    let mut ca = Ca::new("hybrid-probe-ca");
+    let srv = ca.issue("ied1", None, &["ied1"]);
+    let cli = ca.issue("scada", None, &["scada"]);
+    let profile_client = iec62351::client_config(options(&cli, &[&ca])).unwrap();
+    let profile_server = iec62351::server_config(options(&srv, &[&ca])).unwrap();
+    let peers = |groups: Vec<&'static dyn SupportedKxGroup>, version| {
+        let provider = Arc::new(rustls::crypto::CryptoProvider {
+            kx_groups: groups,
+            ..p::default_provider()
+        });
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(ca.root()).unwrap();
+        let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+            Arc::new(roots.clone()),
+            provider.clone(),
+        )
+        .build()
+        .unwrap();
+        let client = rustls::ClientConfig::builder_with_provider(provider.clone())
+            .with_protocol_versions(&[version])
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_client_auth_cert(cli.chain.clone(), cli.key.clone_key())
+            .unwrap();
+        let server = rustls::ServerConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[version])
+            .unwrap()
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(srv.chain.clone(), srv.key.clone_key())
+            .unwrap();
+        (Arc::new(client), Arc::new(server))
+    };
+    for (version, expected) in [
+        (&rustls::version::TLS12, ProtocolVersion::TLSv1_2),
+        (&rustls::version::TLS13, ProtocolVersion::TLSv1_3),
+    ] {
+        for classical in [p::kx_group::SECP256R1, p::kx_group::SECP384R1] {
+            let (c, s) = peers(vec![classical], version);
+            assert_eq!(
+                handshake(c, profile_server.clone()).await.unwrap(),
+                (expected, classical.name())
+            );
+            assert_eq!(
+                handshake(profile_client.clone(), s).await.unwrap(),
+                (expected, classical.name())
+            );
+        }
+    }
+    for hybrid in [p::kx_group::X25519MLKEM768, p::kx_group::SECP256R1MLKEM768] {
+        // Both peers support hybrids: prove the locked crypto backend works.
+        let (c, s) = peers(vec![hybrid], &rustls::version::TLS13);
+        assert_eq!(
+            handshake(c.clone(), s.clone()).await.unwrap(),
+            (ProtocolVersion::TLSv1_3, hybrid.name())
+        );
+        // The shipped profile deliberately has no common group with a
+        // hybrid-only peer, on either side of the connection.
+        assert!(handshake(c, profile_server.clone()).await.is_err());
+        assert!(handshake(profile_client.clone(), s).await.is_err());
+        // Advertising a hybrid alongside P-256 remains interoperable, but
+        // the negotiated connection has classical key exchange only.
+        let (c, s) = peers(
+            vec![hybrid, p::kx_group::SECP256R1],
+            &rustls::version::TLS13,
+        );
+        let expected = (ProtocolVersion::TLSv1_3, NamedGroup::secp256r1);
+        assert_eq!(
+            handshake(c, profile_server.clone()).await.unwrap(),
+            expected
+        );
+        assert_eq!(
+            handshake(profile_client.clone(), s).await.unwrap(),
+            expected
+        );
+        assert!(!hybrid.usable_for_version(ProtocolVersion::TLSv1_2));
+
+        // A profile that opts into the hybrid negotiates it with rustls's
+        // own implementation, in both roles.
+        let kx = if hybrid.name() == NamedGroup::X25519MLKEM768 {
+            iec62351::KxGroup::X25519MlKem768
+        } else {
+            iec62351::KxGroup::P256MlKem768
+        };
+        let (c, s) = peers(vec![hybrid], &rustls::version::TLS13);
+        let opt_in = |id: &Identity| {
+            let mut o = options(id, &[&ca]);
+            o.kx_groups = vec![kx];
+            o.tls13_only = true;
+            o
+        };
+        let expected = (ProtocolVersion::TLSv1_3, hybrid.name());
+        let server = iec62351::server_config(opt_in(&srv)).unwrap();
+        let client = iec62351::client_config(opt_in(&cli)).unwrap();
+        assert_eq!(handshake(c, server).await.unwrap(), expected);
+        assert_eq!(handshake(client, s).await.unwrap(), expected);
+    }
+
+    // Profile to profile over each group it offers.
+    use iec62351::KxGroup;
+    for group in [
+        KxGroup::P256,
+        KxGroup::P384,
+        KxGroup::P521,
+        KxGroup::X25519MlKem768,
+        KxGroup::P256MlKem768,
+        KxGroup::P384MlKem1024,
+    ] {
+        let with = |id: &Identity| {
+            let mut o = options(id, &[&ca]);
+            o.kx_groups = vec![group];
+            o.tls13_only = group.is_hybrid();
+            o
+        };
+        let client = iec62351::client_config(with(&cli)).unwrap();
+        let server = iec62351::server_config(with(&srv)).unwrap();
+        assert_eq!(
+            handshake(client, server).await.unwrap(),
+            (ProtocolVersion::TLSv1_3, group.named_group()),
+            "{group:?}"
+        );
+    }
+    // The default prefers P-256 and offers P-521 too, as Go's profile does.
+    assert_eq!(
+        iec62351::DEFAULT_KX_GROUPS,
+        &[KxGroup::P256, KxGroup::P384, KxGroup::P521]
+    );
+    let mut o = options(&cli, &[&ca]);
+    o.kx_groups = vec![KxGroup::P521];
+    let p521 = iec62351::client_config(o).unwrap();
+    assert_eq!(
+        handshake(p521, profile_server.clone()).await.unwrap(),
+        (ProtocolVersion::TLSv1_3, NamedGroup::secp521r1)
+    );
+    // Hybrids alone cannot serve the TLS 1.2 the profile otherwise allows.
+    let mut o = options(&cli, &[&ca]);
+    o.kx_groups = vec![KxGroup::P384MlKem1024];
+    let err = iec62351::client_config(o).unwrap_err();
+    assert!(err.to_string().contains("tls13_only"), "{err}");
+    // A hybrid with a classical fallback reaches a classical-only profile.
+    let mut o = options(&cli, &[&ca]);
+    o.kx_groups = vec![KxGroup::P384MlKem1024, KxGroup::P384];
+    let mixed = iec62351::client_config(o).unwrap();
+    assert_eq!(
+        handshake(mixed, profile_server.clone()).await.unwrap(),
+        (ProtocolVersion::TLSv1_3, NamedGroup::secp384r1)
+    );
+}

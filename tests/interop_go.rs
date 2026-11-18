@@ -140,8 +140,13 @@ struct GoPeer {
 #[cfg(feature = "tls")]
 impl GoPeer {
     fn start(bin: &str, args: &[&str]) -> GoPeer {
+        Self::start_with_env(bin, args, &[])
+    }
+
+    fn start_with_env(bin: &str, args: &[&str], env: &[(&str, &str)]) -> GoPeer {
         let mut child = Command::new(bin)
             .args(args)
+            .envs(env.iter().copied())
             .env("SIMPLEIO_CID", testdata("simpleIO_direct_control.cid"))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -407,6 +412,65 @@ mod tls_interop {
         assert!(ok && out.contains("read "), "the Go client:\n{out}");
         let (out, ok) = run(&bin, &["tls-client", &addr, &cli.cert, &cli.key, &cli.root, "ied2"], None, Duration::from_secs(15)).await;
         assert!(!ok, "the Go client accepted the Rust server as ied2:\n{out}");
+    }
+
+    /// Every key exchange group of the profile, both ways, against Go's
+    /// crypto/tls: each end offers that group only, at one TLS version, so a
+    /// completed association used it. The Go server reports what it
+    /// negotiated.
+    #[tokio::test]
+    async fn tls_key_exchange_groups() {
+        use iec62351::KxGroup;
+        let Some(bin) = need("IEC61850_GO_PEER") else { return };
+        let pki = Pki::new("tls-kx");
+        let srv = pki.issue("ied1");
+        let cli = pki.issue("scada");
+        let cases = [
+            (KxGroup::P256, "P256", "CurveP256"),
+            (KxGroup::P384, "P384", "CurveP384"),
+            (KxGroup::P521, "P521", "CurveP521"),
+            (KxGroup::X25519MlKem768, "X25519MLKEM768", "X25519MLKEM768"),
+            (KxGroup::P256MlKem768, "SecP256r1MLKEM768", "SecP256r1MLKEM768"),
+            (KxGroup::P384MlKem1024, "SecP384r1MLKEM1024", "SecP384r1MLKEM1024"),
+        ];
+        for (group, go_name, go_display) in cases {
+            for version in ["1.2", "1.3"] {
+                if group.is_hybrid() && version == "1.2" {
+                    continue;
+                }
+                let env = [("IEC61850_TLS_GROUPS", go_name), ("IEC61850_TLS_VERSION", version)];
+                let with = |id: &Identity, name: &str| {
+                    let mut o = options(&pki, id, name);
+                    o.kx_groups = vec![group];
+                    o.tls13_only = group.is_hybrid();
+                    o
+                };
+
+                // The Rust client against the Go server.
+                let mut go = GoPeer::start_with_env(&bin, &["tls-server", "127.0.0.1:0", &srv.cert, &srv.key, &srv.root], &env);
+                let addr = go.expect("listening ").await;
+                let cfg = iec62351::client_config(with(&cli, "ied1")).unwrap();
+                let c = Client::dial_with(&addr, ClientOptions::new().with_tls(cfg).with_timeout(Duration::from_secs(5)))
+                    .await
+                    .unwrap_or_else(|e| panic!("{group:?} TLS {version}: {e}"));
+                c.read("simpleIOGenericIO/GGIO1.AnIn1.mag.f", Fc::Mx).await.unwrap();
+                c.close().await.unwrap();
+                assert_eq!(go.expect("negotiated ").await, format!("TLS {version} {go_display}"), "{group:?}");
+                drop(go.finish().await);
+
+                // The Go client against the Rust server.
+                let cfg = iec62351::server_config(with(&srv, "")).unwrap();
+                let server = Server::new(
+                    iec61850::scl::load_model(testdata("simpleIO_direct_control.cid"), &iec61850::scl::BuildOptions::new()).unwrap(),
+                    Options::new().with_tls(cfg),
+                );
+                let (host, port) = serve(&server).await;
+                let addr = format!("{host}:{port}");
+                let go = GoPeer::start_with_env(&bin, &["tls-client", &addr, &cli.cert, &cli.key, &cli.root, "ied1"], &env);
+                let (ok, out) = go.finish().await;
+                assert!(ok && out.iter().any(|l| l.starts_with("read ")), "{group:?} TLS {version}, the Go client: {out:?}");
+            }
+        }
     }
 }
 
