@@ -110,11 +110,6 @@ jobs:
           # 32-bit ARM covers the gateway class of substation hardware.
           - { target: armv7-unknown-linux-gnueabihf, os: ubuntu-latest, apt: gcc-arm-linux-gnueabihf libc6-dev-armhf-cross, linker: arm-linux-gnueabihf-gcc }
 
-          # macOS. The runner is Apple silicon and Xcode carries both slices,
-          # so the Intel build needs no extra setup.
-          - { target: aarch64-apple-darwin, os: macos-14 }
-          - { target: x86_64-apple-darwin, os: macos-14 }
-
           - { target: x86_64-pc-windows-msvc, os: windows-latest }
 
           # ---- optional: breadth, allowed to fail --------------------------

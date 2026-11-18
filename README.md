@@ -167,7 +167,7 @@ distribution (feature `gdoi`).
 The API may change before 1.0.
 
 GOOSE and SV raw-socket transport is Linux-only (AF_PACKET, needs
-`CAP_NET_RAW`); everything else builds on Linux, Windows and macOS. Use
+`CAP_NET_RAW`); everything else builds on Linux and Windows. Use
 `ethernet::pipe()` to exercise the process-bus protocols without a NIC.
 
 Not yet implemented: report segmentation, and GOOSE/SV capture backends for

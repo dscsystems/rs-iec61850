@@ -33,7 +33,7 @@ use iec61850::client::Client;
 - Features: `tls` (IEC 62351-3 over rustls, default MMS-over-TLS port 3782),
   `gdoi` (IEC 62351-9 key distribution, implies `tls`), `tui` (builds the
   `iedx` terminal client). None is on by default.
-- MMS works on Linux, Windows and macOS. GOOSE and SV raw sockets are Linux
+- MMS works on Linux and Windows. GOOSE and SV raw sockets are Linux
   only (AF_PACKET, needs `CAP_NET_RAW`); use `ethernet::pipe()` elsewhere.
 - The licence is source-available and non-commercial. Do not add it to a
   product without checking [LICENSE](LICENSE).
