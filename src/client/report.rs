@@ -95,38 +95,43 @@ pub struct ReportSubscription {
     domain: String,
     item: String,
     closed: AtomicBool,
-    buffered: bool,
+    disable_state: tokio::sync::Mutex<DisableState>,
+}
+
+#[derive(Debug)]
+struct DisableState {
+    disabled: bool,
+    released: bool,
 }
 
 impl ReportSubscription {
-    /// Turns the report control block off and unregisters the subscription's
-    /// callback, which stops receiving reports even if the write to the server
-    /// fails.
-    ///
-    /// Calling it twice is harmless.
+    /// Stops local report delivery and writes RptEna and, for URCBs, Resv
+    /// false. A subsequent call retries any write that did not succeed.
     pub async fn disable(&self) -> Result<()> {
-        if self.closed.swap(true, Ordering::SeqCst) {
-            return Ok(());
+        let mut state = self.disable_state.lock().await;
+        if !self.closed.swap(true, Ordering::SeqCst) {
+            self.conn.remove_handler(self.handler);
         }
-        // Unregister first: a failed write must not leave reports arriving at
-        // a caller that believes it has unsubscribed.
-        self.conn.remove_handler(self.handler);
-        let item = format!("{}$RptEna", self.item);
-        let results = self
-            .conn
-            .write(&self.domain, &[&item], &[Value::boolean(false)])
-            .await?;
-        if let Some(Err(code)) = results.into_iter().next() {
-            return Err(Error::client(format!("RCB write RptEna: {code}")));
+        let mut result = Ok(());
+        if !state.disabled {
+            result = self.write_false("RptEna").await;
+            state.disabled = result.is_ok();
         }
-        if !self.buffered {
-            let item = format!("{}$Resv", self.item);
-            let results = self.conn.write(&self.domain, &[&item], &[Value::boolean(false)]).await?;
-            if let Some(Err(code)) = results.into_iter().next() {
-                return Err(Error::client(format!("RCB write Resv: {code}")));
-            }
+        if !state.released {
+            let release = self.write_false("Resv").await;
+            state.released = release.is_ok();
+            result = result.and(release);
         }
-        Ok(())
+        result
+    }
+
+    async fn write_false(&self, attr: &str) -> Result<()> {
+        let item = format!("{}${attr}", self.item);
+        match self.conn.write(&self.domain, &[&item], &[Value::boolean(false)]).await?.as_slice() {
+            [Ok(())] => Ok(()),
+            [Err(code)] => Err(Error::client(format!("RCB write {attr}: {code}"))),
+            _ => Err(Error::client(format!("RCB write {attr}: invalid result count"))),
+        }
     }
 }
 
@@ -278,7 +283,7 @@ impl Client {
             domain: rcb.domain.clone(),
             item: rcb.item.clone(),
             closed: AtomicBool::new(false),
-            buffered: rcb.buffered,
+            disable_state: tokio::sync::Mutex::new(DisableState { disabled: false, released: rcb.buffered }),
         };
 
         if let Err(e) = self.write_rcb(rcb, "RptEna", Value::boolean(true)).await {

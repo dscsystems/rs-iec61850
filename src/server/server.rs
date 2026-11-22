@@ -8,6 +8,9 @@ use tokio::net::{TcpListener, TcpStream};
 
 use crate::mms::{self, BoxTransport, Value};
 use crate::model::{AddCause, Fc, Model, ObjectReference};
+use crate::secevent::{self, Action, Kind};
+
+use super::security::{Connection, Setup};
 
 use super::access;
 use super::control::ControlCtx;
@@ -136,6 +139,12 @@ pub struct Options {
     pub handshake_timeout: Option<Duration>,
     /// None uses a thirty-second PDU write deadline, zero disables it.
     pub write_timeout: Option<Duration>,
+    /// None uses thirty seconds to complete a TPKT. Zero disables it.
+    pub frame_timeout: Option<Duration>,
+    /// Inactivity limit for established associations. Zero disables it.
+    pub idle_timeout: Duration,
+    /// Optional dispatcher for structured MMS server security events.
+    pub security_events: Option<secevent::Dispatcher>,
     #[cfg(feature = "tls")]
     pub a_profile: Option<Arc<crate::iec62351::aprofile::Config>>,
     #[cfg(feature = "tls")]
@@ -176,6 +185,24 @@ impl Options {
     #[must_use]
     pub fn with_write_timeout(mut self, limit: Duration) -> Self {
         self.write_timeout = Some(limit);
+        self
+    }
+
+    #[must_use]
+    pub fn with_frame_timeout(mut self, limit: Duration) -> Self {
+        self.frame_timeout = Some(limit);
+        self
+    }
+
+    #[must_use]
+    pub fn with_idle_timeout(mut self, limit: Duration) -> Self {
+        self.idle_timeout = limit;
+        self
+    }
+
+    #[must_use]
+    pub fn with_security_events(mut self, dispatcher: secevent::Dispatcher) -> Self {
+        self.security_events = Some(dispatcher);
         self
     }
 
@@ -337,6 +364,10 @@ pub(crate) struct Inner {
     pub authenticator: Option<mms::Authenticator>,
     pub handshake_timeout: Option<Duration>,
     pub write_timeout: Option<Duration>,
+    pub frame_timeout: Duration,
+    pub idle_timeout: Duration,
+    pub security_events: Option<secevent::Dispatcher>,
+    pub shutdown: tokio::sync::watch::Sender<bool>,
     #[cfg(feature = "tls")]
     pub a_profile: Option<Arc<crate::iec62351::aprofile::Config>>,
     #[cfg(feature = "tls")]
@@ -360,6 +391,7 @@ pub(crate) struct Inner {
     pub writable: Vec<Fc>,
     pub max_conns: usize,
     pub open: Mutex<usize>,
+    pub open_changed: tokio::sync::Notify,
     pub next_conn: AtomicU64,
     #[cfg(feature = "tls")]
     pub tls: Option<Arc<tokio_rustls::rustls::ServerConfig>>,
@@ -466,6 +498,7 @@ impl Inner {
     fn release_slot(&self) -> usize {
         let mut open = self.open.lock().unwrap();
         *open = open.saturating_sub(1);
+        self.open_changed.notify_waiters();
         *open
     }
 
@@ -582,6 +615,10 @@ impl Server {
                 authenticator: opts.authenticator,
                 handshake_timeout: opts.handshake_timeout,
                 write_timeout: opts.write_timeout,
+                frame_timeout: opts.frame_timeout.unwrap_or(Duration::from_secs(30)),
+                idle_timeout: opts.idle_timeout,
+                security_events: opts.security_events,
+                shutdown: tokio::sync::watch::channel(false).0,
                 #[cfg(feature = "tls")]
                 a_profile: opts.a_profile,
                 #[cfg(feature = "tls")]
@@ -608,6 +645,7 @@ impl Server {
                 ),
                 max_conns: opts.max_connections,
                 open: Mutex::new(0),
+                open_changed: tokio::sync::Notify::new(),
                 next_conn: AtomicU64::new(1),
                 #[cfg(feature = "tls")]
                 tls: opts.tls,
@@ -720,8 +758,35 @@ impl Server {
 
     /// Accepts associations on `listener` until the future is dropped.
     pub async fn serve(&self, listener: TcpListener) -> Result<()> {
+        let mut shutdown = self.inner.shutdown.subscribe();
+        let mut backoff = crate::netretry::Backoff::default();
         loop {
-            let (stream, peer) = listener.accept().await?;
+            let accepted = tokio::select! {
+                biased;
+                _ = shutdown.wait_for(|closed| *closed) => return Ok(()),
+                accepted = listener.accept() => accepted,
+            };
+            let (stream, peer) = match accepted {
+                Ok(accepted) => accepted,
+                Err(error) => {
+                    let retry = crate::netretry::temporary(&error);
+                    let delay = retry.then(|| backoff.next());
+                    if let Some(events) = &self.inner.security_events {
+                        let mut e = secevent::Event::new(Kind::ConnAcceptError, Action::Observed);
+                        e.error = Some(error.to_string());
+                        e.detail = delay.map(|delay| format!("retrying in {delay:?}"));
+                        events.report(e);
+                    }
+                    let Some(delay) = delay else { return Err(error.into()) };
+                    tracing::warn!(%error, ?delay, "server: accept failed; retrying");
+                    tokio::select! {
+                        _ = shutdown.wait_for(|closed| *closed) => return Ok(()),
+                        _ = tokio::time::sleep(delay) => {}
+                    }
+                    continue;
+                }
+            };
+            backoff.reset();
             let server = self.clone();
             tokio::spawn(async move {
                 server.serve_conn(stream, peer).await;
@@ -734,37 +799,64 @@ impl Server {
     /// This is what the in-memory tests use, and the entry point for callers
     /// that bring their own transport.
     pub async fn serve_stream(&self, stream: BoxTransport, peer: Option<SocketAddr>) {
-        self.serve_transport(stream, peer, Vec::new(), None).await;
+        let cx = Connection::new(&self.inner, peer, None);
+        if let Some(slot) = self.acquire_slot(&cx) {
+            self.serve_transport(stream, cx, Vec::new(), slot).await;
+        }
+    }
+
+    fn acquire_slot(&self, cx: &Connection) -> Option<ConnectionSlot> {
+        let slot = ConnectionSlot::acquire(&self.inner, cx.peer);
+        if slot.is_none() {
+            if self.inner.closed.load(Ordering::SeqCst) {
+                cx.closed(true, &Ok(()));
+            } else {
+                cx.emit(Kind::ConnRejectedLimit, Action::Rejected, |e| {
+                    e.detail = Some(format!("connection limit reached ({})", self.inner.max_conns));
+                });
+            }
+        }
+        slot
+    }
+
+    /// Counts events at the attached dispatcher, which may be shared.
+    pub fn security_stats(&self) -> secevent::Stats {
+        self.inner.security_events.as_ref().map_or_else(Default::default, secevent::Dispatcher::stats)
     }
 
     async fn serve_conn(&self, stream: TcpStream, peer: SocketAddr) {
-        let Some(slot) = ConnectionSlot::acquire(&self.inner, Some(peer)) else { return };
+        let cx = Connection::new(&self.inner, Some(peer), stream.local_addr().ok());
+        let Some(slot) = self.acquire_slot(&cx) else { return };
         // Nagle would add latency to every response; MMS is request/response.
         let _ = stream.set_nodelay(true);
 
         #[cfg(feature = "tls")]
+        let mut cx = cx;
+        #[cfg(feature = "tls")]
         let (transport, certs): (BoxTransport, Vec<Vec<u8>>) = match &self.inner.tls {
             Some(cfg) => {
                 let acceptor = tokio_rustls::TlsAcceptor::from(Arc::clone(cfg));
-                let limit = self.inner.handshake_timeout.unwrap_or(Duration::from_secs(10));
-                let handshake = acceptor.accept(stream);
-                let tls = if limit.is_zero() { handshake.await } else {
-                    tokio::time::timeout(limit, handshake).await.unwrap_or_else(|_| Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "TLS handshake timeout")))
-                };
-                match tls {
-                    Ok(s) => {
-                        // The chain the TLS configuration verified, for the
-                        // authenticator.
-                        let certs = s
-                            .get_ref()
-                            .1
-                            .peer_certificates()
+                match cx.setup(acceptor.accept(stream)).await {
+                    Setup::Finished(Ok(s)) => {
+                        let tls = s.get_ref().1;
+                        cx.tls(tls);
+                        let certs = tls.peer_certificates()
                             .map(|c| c.iter().map(|c| c.as_ref().to_vec()).collect())
                             .unwrap_or_default();
                         (Box::new(s), certs)
                     }
-                    Err(e) => {
+                    Setup::Finished(Err(e)) => {
+                        cx.tls_failed(false, Some(&e));
                         tracing::warn!(%peer, error = %e, "server: TLS handshake failed");
+                        return;
+                    }
+                    Setup::TimedOut => {
+                        cx.tls_failed(true, None);
+                        tracing::warn!(%peer, "server: TLS handshake timed out");
+                        return;
+                    }
+                    Setup::Closing => {
+                        cx.closed(true, &Ok(()));
                         return;
                     }
                 }
@@ -774,22 +866,18 @@ impl Server {
         #[cfg(not(feature = "tls"))]
         let (transport, certs): (BoxTransport, Vec<Vec<u8>>) = (Box::new(stream), Vec::new());
 
-        self.serve_transport(transport, Some(peer), certs, Some(slot)).await;
+        self.serve_transport(transport, cx, certs, slot).await;
     }
 
     async fn serve_transport(
         &self,
         stream: BoxTransport,
-        peer: Option<SocketAddr>,
+        mut cx: Connection,
         peer_certificates: Vec<Vec<u8>>,
-        slot: Option<ConnectionSlot>,
+        mut slot: ConnectionSlot,
     ) {
         let inner = &self.inner;
-
-        let mut slot = match slot.or_else(|| ConnectionSlot::acquire(inner, peer)) {
-            Some(slot) => slot,
-            None => return,
-        };
+        let peer = cx.peer;
 
         let accept = mms::AcceptOptions {
             initiate: Some(inner.initiate()),
@@ -797,6 +885,8 @@ impl Server {
             peer_certificates,
             responding: inner.ae_identity.clone(),
             write_timeout: inner.write_timeout,
+            frame_timeout: inner.frame_timeout,
+            idle_timeout: inner.idle_timeout,
             #[cfg(feature = "tls")]
             tls_active: inner.tls.is_some(),
             #[cfg(feature = "tls")]
@@ -809,17 +899,21 @@ impl Server {
             e2e_required: inner.e2e_required,
             ..Default::default()
         };
-        let handshake = mms::accept_conn_opts(stream, peer, &accept);
-        let limit = inner.handshake_timeout.unwrap_or(Duration::from_secs(10));
-        let accepted = if limit.is_zero() {
-            handshake.await
-        } else {
-            tokio::time::timeout(limit, handshake).await.unwrap_or(Err(mms::Error::Timeout))
-        };
-        let sc = match accepted {
-            Ok(sc) => Arc::new(sc),
-            Err(e) => {
+        let handshake = mms::accept_with_traffic(stream, peer, &accept, cx.traffic.clone());
+        let sc = match cx.setup(handshake).await {
+            Setup::Finished(Ok(sc)) => Arc::new(sc),
+            Setup::Finished(Err(e)) => {
+                cx.failed(false, Some(&e));
                 tracing::warn!(?peer, error = %e, "server: association setup failed");
+                return;
+            }
+            Setup::TimedOut => {
+                cx.failed(true, None);
+                tracing::warn!(?peer, "server: association setup timed out");
+                return;
+            }
+            Setup::Closing => {
+                cx.closed(true, &Ok(()));
                 return;
             }
         };
@@ -836,8 +930,10 @@ impl Server {
         };
         let Some(open) = open else {
             let _ = sc.close().await;
+            cx.closed(true, &Ok(()));
             return;
         };
+        cx.established(&sc);
         tracing::info!(?peer, %id, "server: association established");
         inner.notify(ConnectionEvent {
             peer,
@@ -847,7 +943,8 @@ impl Server {
         });
 
         let handler = super::handler::Handler::new(Arc::clone(inner), id, peer);
-        if let Err(e) = sc.serve(&handler).await {
+        let result = sc.serve(&handler).await;
+        if let Err(e) = &result {
             tracing::debug!(?peer, %id, error = %e, "server: association ended");
         }
 
@@ -864,9 +961,11 @@ impl Server {
         };
         inner.queue_sv(sv_events);
         inner.flush_sv();
-        let open = slot.release();
+        let local = sc.closed_locally() || inner.closed.load(Ordering::SeqCst);
         inner.selections.lock().unwrap().release_conn(id);
         let _ = sc.close().await;
+        cx.closed(local, &result);
+        let open = slot.release();
         inner.notify(ConnectionEvent {
             peer,
             state: ConnectionState::Closed,
@@ -903,12 +1002,26 @@ impl Server {
     /// Closes every open association and stops the report engine.
     pub async fn close(&self) -> Result<()> {
         self.inner.closed.store(true, Ordering::SeqCst);
+        self.inner.shutdown.send_replace(true);
         self.inner.reports.shutdown();
         self.inner.logs.close();
         let conns: Vec<Arc<mms::ServerConn>> =
             self.inner.conns.lock().unwrap().values().cloned().collect();
         for sc in conns {
             let _ = sc.close().await;
+        }
+        if self.inner.security_events.is_some() {
+            // Let the sessions enqueue their final events. A stalled
+            // application handler cannot delay shutdown indefinitely.
+            let _ = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let changed = self.inner.open_changed.notified();
+                    if self.open_connections() == 0 {
+                        break;
+                    }
+                    changed.await;
+                }
+            }).await;
         }
         Ok(())
     }

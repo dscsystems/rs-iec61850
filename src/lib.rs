@@ -46,6 +46,7 @@ pub mod iec62351;
 pub mod model;
 pub mod osi;
 pub mod scl;
+pub mod secevent;
 pub mod rsession;
 pub mod server;
 pub mod sv;
@@ -55,3 +56,4 @@ pub mod x509;
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub(crate) mod time_util;
+mod netretry;

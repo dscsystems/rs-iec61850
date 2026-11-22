@@ -706,9 +706,7 @@ fn parse_dir_entry(content: &[u8]) -> Result<FileEntry> {
     let mut e = FileEntry::default();
     // fileName [0] SEQUENCE OF GraphicString
     let name_seq = dec.expect(context_constructed(0))?;
-    if let Ok(name) = Decoder::new(name_seq).expect(TAG_GRAPHIC_STRING) {
-        e.name = String::from_utf8_lossy(name).into_owned();
-    }
+    e.name = super::client_ext::parse_file_name(name_seq)?;
     // fileAttributes [1] { sizeOfFile [0] Unsigned32,
     //                      lastModified [1] GraphicString }
     if let Some(attrs) = dec.optional(context_constructed(1))? {
@@ -971,6 +969,15 @@ fn parse_journal_variables(content: &[u8], e: &mut JournalEntry) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn directory_preserves_all_filename_parts() {
+        let names = cons(context_constructed(0), [
+            prim(TAG_GRAPHIC_STRING, b"dir/".to_vec()),
+            prim(TAG_GRAPHIC_STRING, b"record.cfg".to_vec()),
+        ]);
+        assert_eq!(parse_dir_entry(&names.encode()).unwrap().name, "dir/record.cfg");
+    }
 
     /// ISO 9506-2 tags DefineNamedVariableList's listOfVariable [0]. The [1]
     /// of the attributes response is rejected by a strict server as an invalid

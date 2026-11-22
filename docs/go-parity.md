@@ -102,20 +102,45 @@ cargo test --features tls --test iec62351 tls_versions_and_mlkem_hybrid_compatib
 bash interop/go-security.sh tls_key_exchange_groups
 ```
 
+## Follow-up against Go `a1910ac`
+
+The current Go comparison includes MMS robustness and connection events through
+`a7f53e6` and `a1910ac` (21 November 2026). Rust now shares a setup deadline
+across TLS and association negotiation, backs off on transient socket failures,
+limits TPKT completion to 30 seconds by default, and offers an opt-in idle
+timeout that counts both reads and writes. Shutdown also interrupts setup.
+
+The optional [security event dispatcher](api.md#security-events) reports
+connection, TLS and association lifecycle events with stable Go event codes,
+session IDs, peer identity, and request and traffic totals. Its queue and
+repeat aggregation are bounded. It exports JSON Lines and counts dropped
+events, with no passwords, private keys or PDU bytes in its records.
+
+GOOSE and SV subscribers now deliver each frame to all matching subscriptions.
+Live and simulated traffic use separate filters, and GOOSE refresh continues
+`sqNum` while retaining the state change timestamp. SV publishers require
+`smpMod` when advertising a sample rate in samples per second. MMS report
+disable retries failed writes, file cleanup has a bounded timeout, and
+directory responses preserve multipart filenames.
+
+The feature `e2e-pki` adds the `init`, `issue`, `csr` and `show` commands
+for Annex G test credentials and CA signing requests. See the
+[E2E guide](e2e.md#creating-credentials).
+
 ## Remaining Go features
 
 **Full parity has not been reached.** These reference features require
 separate implementation and independent validation:
 
-1. Go's standalone E2E certificate issuance/CSR convenience tool is not
-   bundled in Rust; E2E credentials can be issued externally and loaded as
-   PEM or DER.
-2. **IEC 62351-4 native-mode TLS and OpenSSL engines:** Go's
+1. **IEC 62351-4 native-mode TLS and OpenSSL engines:** Go's
    `Options.NativeMode` restricts TLS to 1.2 with session resumption and
    `NativeModeCipherSuites`, which include `TLS_RSA_WITH_AES_128_CBC_SHA256`.
    rustls implements neither RSA key transport nor CBC, so Rust has no
    native mode. Go's optional OpenSSL engines add DHE and legacy static-DH
    suites. The Rust TLS profile neither enables nor advertises these.
+2. **Security event API:** Go's complete kind catalogue and generic sink
+   adapter API have a wider scope than Rust's implemented MMS lifecycle
+   events. The Go roadmap for other subsystems is still in progress.
 3. A complete symbol-by-symbol comparison of the terminal tools and optional
    configuration helpers. The library's asynchronous API intentionally uses
    Rust futures rather than mirroring Go callback signatures.
@@ -136,7 +161,7 @@ bash interop/e2e.sh
 ```
 
 The security harness includes A-profile in both directions in addition to
-R-GOOSE, R-SV, GDOI and TLS (10 tests). The MMS harness keeps the Go-against-Go
+R-GOOSE, R-SV, GDOI and TLS (11 tests). The MMS harness keeps the Go-against-Go
 control run: its file-directory sweep currently chooses a directory as a
 file and fails identically against the Go and Rust servers. That is reported
 as `KNOWN`, not counted as evidence of missing Rust services.

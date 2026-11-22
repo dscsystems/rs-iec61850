@@ -581,6 +581,41 @@ with InitializeJournal. A journal keeps `with_log_capacity(n)` entries
 configures a block through `LogEna`, `DatSet`, `TrgOps` and `IntgPd`, the
 configuration only while logging is off.
 
+### Security events
+
+A server can report structured MMS connection, TLS and association lifecycle
+events to an optional bounded dispatcher. Callbacks run on a worker thread.
+Submitters continue when the queue is full, and `security_stats` reports
+drops, delivery, repeat aggregation, and counts by kind and category.
+
+```rust
+use std::time::Duration;
+use iec61850::{secevent, server};
+
+let events = secevent::Dispatcher::new(
+    1024, secevent::json_lines(std::io::stderr()),
+)?;
+let options = server::Options::new()
+    .with_frame_timeout(Duration::from_secs(30))
+    .with_idle_timeout(Duration::from_secs(300))
+    .with_security_events(events);
+let srv = server::Server::new(model, options);
+let stats = srv.security_stats();
+```
+
+Use `Dispatcher::with_options` with a zero `aggregate_window` to deliver
+every queued observation separately. A dispatcher can be shared across
+servers. When its last handle is dropped, the worker drains pending events.
+Event records include the session identifier, setup stage, and peer
+addresses and identities when available. The closing summary includes
+confirmed requests and TPKT octets in both directions.
+
+The ten-second default setup deadline covers both TLS and MMS association
+negotiation. Once associated, a TPKT has 30 seconds from its first octet to
+completion by default. Idle supervision is disabled by default and counts
+traffic in both directions when enabled. Zero disables the corresponding
+deadline.
+
 ### Service tracking
 
 When the model has an LTRK node (IEC 61850-7-4 Ed2.1), the server records each
@@ -771,10 +806,13 @@ let subscription = goose::Subscriber::new(eth).subscribe_supervised(
 );
 ```
 
+Use one subscriber for multiple filters on the same interface. A frame is
+delivered to all matching subscriptions. Filters select live frames by
+default. Set `simulated: true` to subscribe to simulated frames only.
 Use `ethernet::pipe()` for an in-memory segment in tests.
 
 `publish` announces a state change; `refresh` repeats the current state
-without one (stNum unchanged, the timestamp of the change it repeats). stNum
+without one (stNum and timestamp stay the same, and sqNum advances). stNum
 starts at 1 and skips 0 on wrap, as sqNum does. `set_test` and `set_nds_com`
 take effect from the next publish or refresh, and `PublisherConfig::time_quality`
 states the clock's quality. A message that does not fit an Ethernet frame is
@@ -829,7 +867,9 @@ let subscription = sv::Subscriber::new(eth).subscribe_le(
 ```
 
 `subscribe` (rather than `subscribe_le`) delivers generic `sv::Asdu` with the
-raw `sample` payload, for datasets that are not 9-2LE.
+raw `sample` payload, for datasets that are not 9-2LE. Both subscription
+types can share one subscriber and each gets every matching frame. Set
+`Filter::simulated` to select simulated frames instead of live frames.
 
 The sample count wraps once per second, which is what lets a subscriber align
 streams within the second.

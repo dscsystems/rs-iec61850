@@ -184,7 +184,7 @@ impl Publisher {
     }
 
     /// Repeats the current state without announcing a change: `stNum` stays
-    /// where it is, `sqNum` resets and the retransmission schedule restarts.
+    /// where it is, `sqNum` advances and the retransmission schedule restarts.
     /// It keeps the timestamp of the change it repeats, so a receiver can tell
     /// how old the state is. Use it to re-advertise a value that has not
     /// changed, or to put a new `test` or `ndsCom` on the wire.
@@ -212,6 +212,7 @@ impl Publisher {
             (false, Some(t)) => t,
             _ => SystemTime::now(),
         };
+        let sq_num = if state_change || st.st_num == 0 { 0 } else { st.sq_num.wrapping_add(1).max(1) };
         let cfg = &self.shared.cfg;
         let msg = Message {
             go_cb_ref: cfg.go_cb_ref.clone(),
@@ -220,7 +221,7 @@ impl Publisher {
             time_allowed_to_live: self.shared.tatl(0),
             t: Some(t),
             st_num,
-            sq_num: 0,
+            sq_num,
             conf_rev: cfg.conf_rev,
             test: st.test,
             nds_com: st.nds_com,
@@ -248,7 +249,7 @@ impl Publisher {
             )));
         }
         st.st_num = st_num;
-        st.sq_num = 0;
+        st.sq_num = sq_num;
         st.t = Some(t);
         st.generation += 1;
         let generation = st.generation;

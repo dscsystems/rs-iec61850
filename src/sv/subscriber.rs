@@ -1,15 +1,18 @@
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use crate::ethernet::fanout::{Fanout, Registration};
 use crate::ethernet::{Interface, ETHER_TYPE_SV};
 
-use super::{decode_le_into, parse, Asdu, LeSample};
+use super::{decode_le_into, parse, Asdu, LeSample, Pdu};
 
-/// Selects sampled-value streams. Zero fields match everything.
+/// Selects sampled-value streams. Zero APPID and an empty stream identifier
+/// match any value. Live subscriptions exclude simulated traffic by default.
 #[derive(Debug, Clone, Default)]
 pub struct Filter {
     pub app_id: u16,
     pub sv_id: String,
+    /// Selects simulated rather than live frames.
+    pub simulated: bool,
 }
 
 impl Filter {
@@ -22,7 +25,7 @@ impl Filter {
     pub fn app_id(app_id: u16) -> Filter {
         Filter {
             app_id,
-            sv_id: String::new(),
+            ..Default::default()
         }
     }
 
@@ -40,41 +43,34 @@ impl Filter {
 /// Ends a subscription. Dropping it stops delivery.
 #[derive(Debug)]
 pub struct Subscription {
-    stopped: Arc<AtomicBool>,
-    task: Option<std::thread::JoinHandle<()>>,
+    registration: Registration<Pdu>,
 }
 
 impl Subscription {
-    /// Stops delivery. The reader thread exits on the next frame or when the
-    /// interface closes.
+    /// Stops delivery. A callback already in progress may finish.
     pub fn stop(&self) {
-        self.stopped.store(true, Ordering::SeqCst);
+        self.registration.stop();
     }
 
-    /// Stops delivery and waits for the reader thread to finish.
-    pub fn join(mut self) {
-        self.stop();
-        if let Some(t) = self.task.take() {
-            let _ = t.join();
-        }
-    }
-}
-
-impl Drop for Subscription {
-    fn drop(&mut self) {
-        self.stop();
+    /// Stops delivery and waits for a receive callback already in progress.
+    /// Call from outside the receive callback.
+    pub fn join(self) {
+        self.registration.join();
     }
 }
 
 /// Receives sampled-value APDUs from a shared interface.
+///
+/// One background reader delivers each frame to all matching subscriptions
+/// on this subscriber. Use one subscriber per interface.
 #[derive(Debug)]
 pub struct Subscriber {
-    iface: Arc<dyn Interface>,
+    fanout: Arc<Fanout<Pdu>>,
 }
 
 impl Subscriber {
     pub fn new(iface: Arc<dyn Interface>) -> Subscriber {
-        Subscriber { iface }
+        Subscriber { fanout: Fanout::new(iface, ETHER_TYPE_SV, |bytes| parse(bytes).ok()) }
     }
 
     /// Delivers each matching ASDU to `callback`, with its raw dataset
@@ -112,41 +108,18 @@ impl Subscriber {
         filter: Filter,
         mut handle: impl FnMut(u16, &Asdu, &mut LeSample) + Send + 'static,
     ) -> Subscription {
-        let stopped = Arc::new(AtomicBool::new(false));
-        let iface = Arc::clone(&self.iface);
-        let flag = Arc::clone(&stopped);
-
-        // A blocking thread rather than an async task: the raw socket read is
-        // a blocking syscall, and parking a runtime worker on it would stall
-        // every other task sharing that worker.
-        let task = std::thread::spawn(move || {
-            // One reused sample backs the zero-allocation decode path.
-            let mut sample = LeSample::default();
-            loop {
-                let Ok(frame) = iface.read_frame() else {
-                    return;
-                };
-                if flag.load(Ordering::SeqCst) {
-                    return;
-                }
-                if frame.ether_type != ETHER_TYPE_SV {
-                    continue;
-                }
-                let Ok(pdu) = parse(&frame.payload) else {
-                    continue;
-                };
-                for a in &pdu.asdus {
-                    if filter.matches(pdu.app_id, a) {
-                        handle(pdu.app_id, a, &mut sample);
-                    }
+        let mut sample = LeSample::default();
+        let registration = self.fanout.add(move |pdu| {
+            if pdu.simulation != filter.simulated {
+                return;
+            }
+            for a in &pdu.asdus {
+                if filter.matches(pdu.app_id, a) {
+                    handle(pdu.app_id, a, &mut sample);
                 }
             }
         });
-
-        Subscription {
-            stopped,
-            task: Some(task),
-        }
+        Subscription { registration }
     }
 }
 
@@ -154,7 +127,8 @@ impl Subscriber {
 mod tests {
     use super::*;
     use crate::ethernet;
-    use crate::sv::{encode_le_sample, LeConfig, LePublisher, Pdu, SMP_SYNCH_GLOBAL};
+    use crate::sv::{encode_le_sample, LeConfig, LePublisher, SMP_SYNCH_GLOBAL};
+    use std::sync::atomic::Ordering;
     use std::sync::Mutex;
     use std::time::Duration;
 
@@ -181,13 +155,48 @@ mod tests {
         let f = Filter {
             app_id: 0,
             sv_id: "MU01".into(),
+            ..Default::default()
         };
         assert!(f.matches(0x4000, &a));
         let f = Filter {
             app_id: 0,
             sv_id: "MU02".into(),
+            ..Default::default()
         };
         assert!(!f.matches(0x4000, &a));
+    }
+
+    #[test]
+    fn raw_and_decoded_subscriptions_fan_out_and_isolate_simulation() {
+        let (a, b) = ethernet::pipe();
+        let subscriber = Subscriber::new(Arc::new(b));
+        let (raw_tx, raw_rx) = std::sync::mpsc::channel();
+        let (le_tx, le_rx) = std::sync::mpsc::channel();
+        let (sim_tx, sim_rx) = std::sync::mpsc::channel();
+        let raw = subscriber.subscribe(Filter::any(), move |a| { raw_tx.send(a.smp_cnt).unwrap(); });
+        let le = subscriber.subscribe_le(Filter::app_id(0x4000), move |a| { le_tx.send(a.smp_cnt).unwrap(); });
+        let sim = subscriber.subscribe(Filter { simulated: true, ..Default::default() }, move |a| {
+            sim_tx.send(a.smp_cnt).unwrap();
+        });
+        for (simulation, count) in [(false, 1), (true, 31), (false, 2)] {
+            let pdu = Pdu { app_id: 0x4000, simulation, asdus: vec![asdu("MU01", count)] };
+            a.write_frame(&ethernet::Frame {
+                ether_type: ETHER_TYPE_SV,
+                payload: pdu.marshal(),
+                ..Default::default()
+            }).unwrap();
+        }
+        let wait = Duration::from_secs(2);
+        for rx in [raw_rx, le_rx] {
+            assert_eq!(rx.recv_timeout(wait).unwrap(), 1);
+            assert_eq!(rx.recv_timeout(wait).unwrap(), 2);
+            assert!(rx.try_recv().is_err());
+        }
+        assert_eq!(sim_rx.recv_timeout(wait).unwrap(), 31);
+        raw.join();
+        le.join();
+        sim.join();
+        a.close().unwrap();
     }
 
     #[test]
@@ -301,6 +310,7 @@ mod tests {
             Filter {
                 app_id: 0x4000,
                 sv_id: "MU01".into(),
+                ..Default::default()
             },
             move |s| {
                 sink.lock().unwrap().push(s.i);

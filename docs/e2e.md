@@ -19,9 +19,7 @@ anchors for the peer. Certificates follow the implemented Annex G profile:
 
 For example, AE `1.3.6.1.4.1.55555/2` has subject attribute value
 `1.3.6.1.4.1.55555.2`. A common-name string containing those digits does not
-satisfy this requirement. Certificate issuance remains the application's
-PKI responsibility; `tests/e2e_common` creates ephemeral test credentials.
-The path may contain up to four intermediate certificates, with each
+satisfy this requirement. The path may contain up to four intermediate certificates, with each
 certificate at most 8192 octets.
 
 The peer's certificate identity must match its ACSE AE title. A client also
@@ -36,6 +34,29 @@ Rustls's TLS cipher selection remains independent of this implementation:
 the optional OpenSSL/DHE native-mode TLS engines are still a separate Go
 parity gap. This E2E implementation is not a claim of complete native-mode
 TLS or laboratory conformance.
+
+## Creating credentials
+
+Build the standalone tool with `cargo build --features e2e-pki --bin e2e-pki`.
+For an isolated test setup:
+
+```sh
+target/debug/e2e-pki init -dir pki
+target/debug/e2e-pki issue -dir pki -ae 1.3.6.1.4.1.55555/2 -name ied
+target/debug/e2e-pki show pki/ied.pem
+```
+
+For a production CA, submit a CSR generated with:
+
+```sh
+target/debug/e2e-pki csr -ae 1.3.6.1.4.1.55555/2 -key ied.key -out ied.csr
+```
+
+The request carries the OID-valued AE title and the critical
+`digitalSignature` and `keyAgreement` key usages. The tool defaults to
+ECDSA P-256 and accepts `-rsa` for RSA-2048. It creates a new key file with
+owner-only permissions on Unix and refuses to overwrite existing files.
+Use the certificates from `init` and `issue` for local testing.
 
 ## Library API
 

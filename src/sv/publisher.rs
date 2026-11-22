@@ -118,12 +118,16 @@ impl LePublisher {
         if cfg.no_asdu == 0 {
             cfg.no_asdu = 1;
         }
-        let rate = cfg.samples_per_cycle * cfg.nominal_hz;
+        let rate = cfg.samples_per_cycle.checked_mul(cfg.nominal_hz)
+            .ok_or_else(|| Error::Config("sample rate exceeds the supported range".into()))?;
         if cfg.smp_mod == SmpMod::SecPerSmp {
             return Err(Error::Config(format!(
                 "sample mode {} cannot express a rate of {rate} samples per second",
                 cfg.smp_mod
             )));
+        }
+        if cfg.opts.sample_rate && !cfg.opts.smp_mod && cfg.smp_mod != SmpMod::SmpPerPeriod {
+            return Err(Error::Config("smpRate needs smpMod to declare its unit".into()));
         }
         let p = LePublisher {
             gm_identity: Mutex::new(cfg.gm_identity),

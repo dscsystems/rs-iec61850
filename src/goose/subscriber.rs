@@ -1,20 +1,22 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::ethernet::fanout::{Fanout, Registration};
 use crate::ethernet::{Interface, ETHER_TYPE_GOOSE};
 
 use super::{parse, Message};
 
 /// Selects GOOSE messages for a subscription.
 ///
-/// Zero fields match everything: an APPID of zero accepts any, and an empty
-/// control block reference accepts any.
+/// An APPID of zero and an empty control block reference match any value.
+/// Live subscriptions exclude simulated traffic by default.
 #[derive(Debug, Clone, Default)]
 pub struct Filter {
     pub app_id: u16,
     pub go_cb_ref: String,
+    /// Selects simulated rather than live frames.
+    pub simulated: bool,
 }
 
 impl Filter {
@@ -27,11 +29,14 @@ impl Filter {
     pub fn app_id(app_id: u16) -> Filter {
         Filter {
             app_id,
-            go_cb_ref: String::new(),
+            ..Default::default()
         }
     }
 
     pub(crate) fn matches(&self, m: &Message) -> bool {
+        if self.simulated != m.simulation {
+            return false;
+        }
         if self.app_id != 0 && m.app_id != self.app_id {
             return false;
         }
@@ -69,7 +74,7 @@ impl Anomalies {
 }
 
 /// The time-allowed-to-live deadlines of one supervised subscription.
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct Deadlines {
     /// By control block: when its data goes stale, and whether that has been
     /// reported for the current silence.
@@ -80,6 +85,7 @@ struct Deadlines {
 /// Time-allowed-to-live supervision (IEC 61850-8-1): a subscriber has to treat
 /// a control block's data as invalid once `timeAllowedToLive` passes without a
 /// message, which is how a failed publisher or a broken path is noticed.
+#[derive(Debug)]
 struct Supervision {
     deadlines: Mutex<Deadlines>,
     wake: Condvar,
@@ -230,39 +236,27 @@ impl SequenceTracker {
 ///
 /// Dropping it stops delivery just as calling [`stop`](Subscription::stop)
 /// does, so a subscription cannot outlive the scope that owns it by accident.
+#[derive(Debug)]
 pub struct Subscription {
-    stopped: Arc<AtomicBool>,
-    task: Option<std::thread::JoinHandle<()>>,
+    registration: Registration<Message>,
     supervision: Option<Arc<Supervision>>,
 }
 
-impl std::fmt::Debug for Subscription {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Subscription")
-            .field("stopped", &self.stopped)
-            .field("supervised", &self.supervision.is_some())
-            .finish()
-    }
-}
-
 impl Subscription {
-    /// Stops delivery. The reader thread exits on the next frame or when the
-    /// interface closes; supervision stops at once.
+    /// Stops delivery and time-allowed-to-live supervision. A callback
+    /// already in progress may finish.
     pub fn stop(&self) {
-        self.stopped.store(true, Ordering::SeqCst);
+        self.registration.stop();
         if let Some(s) = &self.supervision {
             s.stop();
         }
     }
 
-    /// Stops delivery and waits for the reader thread to finish.
-    ///
-    /// Close the interface first, or this blocks until the next frame arrives.
-    pub fn join(mut self) {
+    /// Stops delivery and waits for a receive callback already in progress.
+    /// Call from outside the receive callback.
+    pub fn join(self) {
         self.stop();
-        if let Some(t) = self.task.take() {
-            let _ = t.join();
-        }
+        self.registration.join();
     }
 }
 
@@ -274,17 +268,16 @@ impl Drop for Subscription {
 
 /// Receives GOOSE messages from a shared interface.
 ///
-/// Each subscription runs its own reader thread. Several concurrent
-/// subscriptions on one interface would compete for frames, so use one
-/// subscription per interface and fan out in the callback.
+/// One background reader delivers each frame to all matching subscriptions
+/// on this subscriber. Use one subscriber per interface.
 #[derive(Debug)]
 pub struct Subscriber {
-    iface: Arc<dyn Interface>,
+    fanout: Arc<Fanout<Message>>,
 }
 
 impl Subscriber {
     pub fn new(iface: Arc<dyn Interface>) -> Subscriber {
-        Subscriber { iface }
+        Subscriber { fanout: Fanout::new(iface, ETHER_TYPE_GOOSE, |bytes| parse(bytes).ok()) }
     }
 
     /// Delivers matching messages to `callback` from a background thread, with
@@ -333,46 +326,21 @@ impl Subscriber {
         callback: impl Fn(&Message) + Send + 'static,
         supervision: Option<Arc<Supervision>>,
     ) -> Subscription {
-        let stopped = Arc::new(AtomicBool::new(false));
-        let iface = Arc::clone(&self.iface);
-        let flag = Arc::clone(&stopped);
         let watch = supervision.clone();
-
-        let task = std::thread::spawn(move || {
-            let mut tracker = SequenceTracker::new();
-            loop {
-                let Ok(frame) = iface.read_frame() else {
-                    return; // the interface closed or failed
-                };
-                if flag.load(Ordering::SeqCst) {
-                    return;
-                }
-                if frame.ether_type != ETHER_TYPE_GOOSE {
-                    continue;
-                }
-                let Ok(mut m) = parse(&frame.payload) else {
-                    continue; // a malformed frame is not this subscriber's problem
-                };
-                if !filter.matches(&m) {
-                    continue;
-                }
-                m.anomalies = tracker.observe(&m, Instant::now());
-                m.anomalies.entries_mismatch = m.num_dat_set_entries as usize != m.values.len();
-                if let Some(s) = &watch {
-                    s.arrived(
-                        &m.go_cb_ref,
-                        Duration::from_millis(u64::from(m.time_allowed_to_live)),
-                    );
-                }
-                callback(&m);
+        let mut tracker = SequenceTracker::new();
+        let registration = self.fanout.add(move |message| {
+            if !filter.matches(message) {
+                return;
             }
+            let mut m = message.clone();
+            m.anomalies = tracker.observe(&m, Instant::now());
+            m.anomalies.entries_mismatch = m.num_dat_set_entries as usize != m.values.len();
+            if let Some(s) = &watch {
+                s.arrived(&m.go_cb_ref, Duration::from_millis(u64::from(m.time_allowed_to_live)));
+            }
+            callback(&m);
         });
-
-        Subscription {
-            stopped,
-            task: Some(task),
-            supervision,
-        }
+        Subscription { registration, supervision }
     }
 }
 
@@ -382,6 +350,7 @@ mod tests {
     use crate::ethernet;
     use crate::goose::{Publisher, PublisherConfig};
     use crate::mms::Value;
+    use std::sync::atomic::Ordering;
     use std::sync::Mutex;
 
     fn message(go_cb_ref: &str, st_num: u32, sq_num: u32, tatl: u32) -> Message {
@@ -495,11 +464,13 @@ mod tests {
         let f = Filter {
             app_id: 0,
             go_cb_ref: "gcb01".into(),
+            ..Default::default()
         };
         assert!(f.matches(&m));
         let f = Filter {
             app_id: 0,
             go_cb_ref: "gcb99".into(),
+            ..Default::default()
         };
         assert!(!f.matches(&m));
 
@@ -507,6 +478,7 @@ mod tests {
         let f = Filter {
             app_id: 0x2000,
             go_cb_ref: "gcb01".into(),
+            ..Default::default()
         };
         assert!(!f.matches(&m));
     }
@@ -585,6 +557,46 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(expired.load(Ordering::SeqCst), 1, "once per silence");
         sub.stop();
+    }
+
+    #[test]
+    fn overlapping_subscriptions_receive_each_frame_and_isolate_simulation() {
+        let (a, b) = ethernet::pipe();
+        let subscriber = Subscriber::new(Arc::new(b));
+        let (first_tx, first_rx) = std::sync::mpsc::channel();
+        let (second_tx, second_rx) = std::sync::mpsc::channel();
+        let (sim_tx, sim_rx) = std::sync::mpsc::channel();
+        let first = subscriber.subscribe(Filter::any(), move |m| {
+            first_tx.send(m.sq_num).unwrap();
+        });
+        let second = subscriber.subscribe(Filter::app_id(0x1000), move |m| {
+            assert!(!m.anomalies.sq_num_gap);
+            second_tx.send(m.sq_num).unwrap();
+        });
+        let simulated = subscriber.subscribe(Filter { simulated: true, ..Default::default() }, move |m| {
+            sim_tx.send(m.sq_num).unwrap();
+        });
+        for (simulation, sq_num) in [(false, 0), (true, 77), (false, 1)] {
+            let mut m = message("same-goCB", 1, sq_num, 10_000);
+            m.app_id = 0x1000;
+            m.simulation = simulation;
+            a.write_frame(&crate::ethernet::Frame {
+                ether_type: ETHER_TYPE_GOOSE,
+                payload: m.marshal(),
+                ..Default::default()
+            }).unwrap();
+        }
+        let wait = Duration::from_secs(2);
+        for rx in [first_rx, second_rx] {
+            assert_eq!(rx.recv_timeout(wait).unwrap(), 0);
+            assert_eq!(rx.recv_timeout(wait).unwrap(), 1);
+            assert!(rx.try_recv().is_err());
+        }
+        assert_eq!(sim_rx.recv_timeout(wait).unwrap(), 77);
+        first.join();
+        second.join();
+        simulated.join();
+        a.close().unwrap();
     }
 
     /// numDatSetEntries that disagrees with allData is flagged.

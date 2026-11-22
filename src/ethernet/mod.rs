@@ -9,6 +9,7 @@
 //! other platforms [`open`] returns an error; use [`pipe`] there.
 
 mod frame;
+pub(crate) mod fanout;
 #[cfg(target_os = "linux")]
 mod afpacket;
 

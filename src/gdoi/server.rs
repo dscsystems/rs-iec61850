@@ -214,11 +214,18 @@ impl Server {
     pub async fn serve(&self, sock: UdpSocket) -> Result<()> {
         self.inner.state.lock().unwrap().local = sock.local_addr().ok();
         let mut buf = vec![0u8; MAX_MESSAGE];
+        let mut backoff = crate::netretry::Backoff::default();
         loop {
             let (n, addr) = match sock.recv_from(&mut buf).await {
-                Ok(r) => r,
+                Ok(r) => {
+                    backoff.reset();
+                    r
+                },
                 // A member gone away surfaces as an ICMP error on some systems.
-                Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused || crate::netretry::temporary(&e) => {
+                    tokio::time::sleep(backoff.next()).await;
+                    continue;
+                },
                 Err(e) => return Err(e.into()),
             };
             if let Some(resp) = self.handle(&buf[..n], addr) {

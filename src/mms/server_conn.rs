@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
 use std::sync::Mutex;
@@ -106,6 +106,11 @@ pub struct AcceptOptions {
     pub tls_active: bool,
     /// Maximum duration of a PDU write. None uses 30 seconds; zero disables.
     pub write_timeout: Option<std::time::Duration>,
+    /// Time allowed to complete a TPKT after its first octet. Zero disables.
+    pub frame_timeout: std::time::Duration,
+    /// Time without reads or writes before an established association closes.
+    /// Zero disables.
+    pub idle_timeout: std::time::Duration,
     #[cfg(feature = "tls")]
     pub a_profile: Option<Arc<crate::iec62351::aprofile::Config>>,
     #[cfg(feature = "tls")]
@@ -142,6 +147,8 @@ impl AcceptOptions {
 /// the responses the handler returns. The [`crate::server`] module builds on
 /// it; most applications use that higher-level API instead.
 pub struct ServerConn {
+    traffic: Option<Arc<super::frameguard::Traffic>>,
+    local_close: AtomicBool,
     writer: Arc<AsyncMutex<FramingWriter>>,
     reader: AsyncMutex<Option<FramingReader>>,
     unconf_tx: mpsc::Sender<Vec<u8>>,
@@ -150,6 +157,8 @@ pub struct ServerConn {
     pub password: Option<String>,
     #[cfg(feature = "tls")]
     pub a_profile_peer: Option<crate::x509::Certificate>,
+    #[cfg(feature = "tls")]
+    pub(crate) a_profile_sha256: Option<String>,
     #[cfg(feature = "e2e")]
     pub e2e_peer: Option<crate::iec62351::e2e::PeerSecurity>,
     pub peer: Option<SocketAddr>,
@@ -215,16 +224,51 @@ pub async fn accept_conn_opts(
     peer: Option<SocketAddr>,
     opts: &AcceptOptions,
 ) -> Result<ServerConn> {
+    accept_with_traffic(stream, peer, opts, None).await
+}
+
+pub(crate) async fn accept_with_traffic(
+    stream: BoxTransport,
+    peer: Option<SocketAddr>,
+    opts: &AcceptOptions,
+    stats: Option<Arc<super::frameguard::Traffic>>,
+) -> Result<ServerConn> {
+    let count = stats.clone();
+    let (stream, guard) = super::frameguard::Guard::wrap(stream, opts.frame_timeout, opts.idle_timeout, stats);
+    let mut conn = accept_inner(stream, peer, opts, count.as_deref()).await?;
+    if let Some(guard) = guard {
+        guard.enable();
+    }
+    conn.traffic = count;
+    Ok(conn)
+}
+
+async fn accept_inner(
+    stream: BoxTransport,
+    peer: Option<SocketAddr>,
+    opts: &AcceptOptions,
+    traffic: Option<&super::frameguard::Traffic>,
+) -> Result<ServerConn> {
+    let stage = |name| {
+        if let Some(traffic) = traffic {
+            *traffic.stage.lock().unwrap() = Some(name);
+        }
+    };
+    stage("cotp");
     let mut ct = cotp::Conn::accept(stream).await?;
 
     // The session CONNECT carries the presentation CP with the ACSE AARQ.
+    stage("session");
     let res = session::accept_server(&mut ct).await?;
     opts.trace("rx CP", &res.user_data);
+    stage("presentation");
     let cp = presentation::parse_cp(&res.user_data)?;
     opts.trace("rx AARQ", &cp.user_data);
+    stage("acse");
     let areq = acse::parse_aarq(&cp.user_data)?;
     #[cfg(feature = "e2e")]
     if super::secure::is_native(areq.application_context.as_ref(), opts) || opts.e2e_required {
+        stage("e2e");
         return super::secure::server_handshake(ct, peer, opts, res, cp, areq).await;
     }
     // The responder's selector is the one the peer addressed, so it sees the
@@ -236,11 +280,12 @@ pub async fn accept_conn_opts(
     };
 
     #[cfg(feature = "tls")]
-    let (a_profile_peer, response_auth) = {
+    let (a_profile_peer, a_profile_sha256, response_auth) = {
         use crate::iec62351::aprofile;
         let sent = areq.authentication.as_deref().is_some_and(|v| Decoder::new(v).peek_is(context_constructed(2)));
         match &opts.a_profile {
             Some(ap) if sent || opts.a_profile_required => {
+                stage("aprofile");
                 let diagnostic = if !opts.tls_active && !ap.allow_without_tls { Some(acse::DIAG_AUTHENTICATION_FAILURE) }
                     else if areq.mechanism.is_none() { Some(12) }
                     else if !sent { Some(acse::DIAG_AUTHENTICATION_REQUIRED) } else { None };
@@ -250,8 +295,9 @@ pub async fn accept_conn_opts(
                     let _ = session::refuse(&mut ct, &cpr).await;
                     return Err(Error::AssociationRejected("A-profile authentication required".into()));
                 }
-                let verification = aprofile::Value::parse(areq.authentication.as_deref().unwrap()).and_then(|v| ap.verifier.verify(&v));
-                let cert = match verification {
+                let verification = aprofile::Value::parse(areq.authentication.as_deref().unwrap())
+                    .and_then(|v| ap.verifier.verify(&v).map(|cert| (cert, v.certificate)));
+                let (cert, der) = match verification {
                     Ok(cert) => cert,
                     Err(e) => {
                         let _ = session::abort(&mut ct, &[]).await;
@@ -259,13 +305,18 @@ pub async fn accept_conn_opts(
                     }
                 };
                 let value = ap.value().map_err(|e| Error::protocol(e.to_string()))?;
-                (Some(cert), Some((areq.mechanism.clone().unwrap(), value.encode())))
+                let fingerprint = traffic.is_some().then(|| {
+                    use sha2::{Digest, Sha256};
+                    format!("{:x}", Sha256::digest(&der))
+                });
+                (Some(cert), fingerprint, Some((areq.mechanism.clone().unwrap(), value.encode())))
             }
-            _ => (None, None),
+            _ => (None, None, None),
         }
     };
 
     if let Some(auth) = &opts.authenticate {
+        stage("auth");
         let ar = AssociationRequest {
             peer,
             password: areq.password.clone(),
@@ -292,6 +343,7 @@ pub async fn accept_conn_opts(
     }
 
     opts.trace("rx InitiateRequest", &areq.user_data);
+    stage("initiate");
     let proposed = parse_initiate_request(&areq.user_data)?;
 
     // Build the InitiateResponse -> AARE -> CPA -> session ACCEPT.
@@ -305,6 +357,7 @@ pub async fn accept_conn_opts(
     let responding = opts.responding.clone().unwrap_or_default();
     // The contexts are settled before the AARE, which names the MMS one by the
     // identifier the peer chose for it.
+    stage("context");
     let neg = presentation::negotiate(&cp.contexts);
     if !neg.has_mms() {
         // Without an agreed MMS context nothing sent after the association
@@ -328,6 +381,7 @@ pub async fn accept_conn_opts(
     opts.trace("tx AARE", &aare);
     let (_, cpa) = presentation::build_cpa(&responding_psel, &cp.contexts, &aare);
     opts.trace("tx CPA", &cpa);
+    stage("reply");
     session::reply(&mut ct, res.called_ssel.as_deref().unwrap_or(&[]), &cpa).await?;
 
     let (reader, mut writer) = transport::split(ct, neg.mms, neg.acse);
@@ -335,7 +389,10 @@ pub async fn accept_conn_opts(
     #[allow(unused_mut)]
     let mut conn = established(reader, writer, peer, areq, proposed, answer)?;
     #[cfg(feature = "tls")]
-    { conn.a_profile_peer = a_profile_peer; }
+    {
+        conn.a_profile_peer = a_profile_peer;
+        conn.a_profile_sha256 = a_profile_sha256;
+    }
     Ok(conn)
 }
 
@@ -353,6 +410,8 @@ pub(super) fn established(mut reader: FramingReader, writer: FramingWriter, peer
     let pump = tokio::spawn(pump_unconfirmed(Arc::clone(&writer), unconf_rx));
 
     Ok(ServerConn {
+        traffic: None,
+        local_close: AtomicBool::new(false),
         writer,
         reader: AsyncMutex::new(Some(reader)),
         unconf_tx,
@@ -360,6 +419,8 @@ pub(super) fn established(mut reader: FramingReader, writer: FramingWriter, peer
         password: areq.password,
         #[cfg(feature = "tls")]
         a_profile_peer: None,
+        #[cfg(feature = "tls")]
+        a_profile_sha256: None,
         #[cfg(feature = "e2e")]
         e2e_peer,
         peer,
@@ -458,6 +519,9 @@ impl ServerConn {
                 self.reject(id, 1, 4).await?;
                 return Ok(true);
             };
+            if let Some(traffic) = &self.traffic {
+                traffic.requests.fetch_add(1, Ordering::Relaxed);
+            }
             if handler.is_deferred(&req) {
                 deferred.push(Box::pin(self.run_deferred(req, handler)));
             } else {
@@ -709,6 +773,7 @@ impl ServerConn {
 
     /// Ends the association abruptly (ACSE A-ABORT) and closes the transport.
     pub async fn abort(&self) -> Result<()> {
+        self.local_close.store(true, Ordering::Release);
         if let Some(h) = self.pump.lock().unwrap().take() {
             h.abort();
         }
@@ -720,10 +785,15 @@ impl ServerConn {
 
     /// Closes the transport and stops the unconfirmed writer.
     pub async fn close(&self) -> Result<()> {
+        self.local_close.store(true, Ordering::Release);
         if let Some(h) = self.pump.lock().unwrap().take() {
             h.abort();
         }
         self.writer.lock().await.shutdown().await
+    }
+
+    pub(crate) fn closed_locally(&self) -> bool {
+        self.local_close.load(Ordering::Acquire)
     }
 }
 

@@ -1,6 +1,6 @@
 [package]
 name = "rs-iec61850"
-version = "0.7.2"
+version = "0.8.0"
 edition = "2021"
 rust-version = "1.82"
 authors = ["Ricardo Olsen", "DSC Systems"]
@@ -34,6 +34,11 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 bytes = "1"
 tracing = "0.1"
 quick-xml = "0.37"
+serde_json = "1"
+# Credential generation for the standalone E2E PKI tool.
+rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "pem", "crypto"], optional = true }
+base64 = { version = "0.22", optional = true }
+time = { version = "0.3", optional = true }
 
 # R-GOOSE and R-SV (IEC 61850-90-5) message security.
 hmac = "0.12"
@@ -63,19 +68,19 @@ rsa = { version = "0.9", optional = true }
 libc = "0.2"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["full", "test-util"] }
 # Certificates and CRLs for the TLS profile and GDOI tests.
 rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "pem", "crypto"] }
 time = "0.3"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # The JSON Lines of the mms-interop adapters and their fixtures.
-serde_json = "1"
 base64 = "0.22"
 
 [features]
 default = []
 # IEC 62351-4 native end-to-end MMS security.
 e2e = ["tls", "dep:p256", "dep:crypto-bigint"]
+e2e-pki = ["e2e", "dep:rcgen", "dep:base64", "dep:time"]
 tls = ["dep:tokio-rustls", "dep:rustls", "dep:webpki", "dep:aws-lc-rs"]
 # GDOI key distribution (IEC 62351-9) for R-GOOSE and R-SV keys. It verifies
 # certificates as the TLS profile does, so it needs that too.
@@ -110,3 +115,9 @@ required-features = ["tui"]
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+
+[[bin]]
+name = "e2e-pki"
+path = "src/bin/e2e-pki.rs"
+required-features = ["e2e-pki"]

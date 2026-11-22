@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::mms;
 
@@ -172,8 +173,8 @@ impl FileReader {
         if self.closed {
             return Ok(());
         }
+        close_handle(&self.conn, self.frsm).await?;
         self.closed = true;
-        self.conn.file_close(self.frsm).await?;
         Ok(())
     }
 }
@@ -190,8 +191,14 @@ impl Drop for FileReader {
         let frsm = self.frsm;
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
-                let _ = conn.file_close(frsm).await;
+                let _ = close_handle(&conn, frsm).await;
             });
         }
     }
+}
+
+async fn close_handle(conn: &mms::Conn, frsm: i32) -> mms::Result<()> {
+    tokio::time::timeout(Duration::from_secs(5), conn.file_close(frsm))
+        .await
+        .map_err(|_| mms::Error::Timeout)?
 }

@@ -555,15 +555,17 @@ fn join_group(ga: SocketAddr, ifi: Option<(u32, Option<Ipv4Addr>)>) -> std::io::
 /// Feeds the datagrams of one socket to the session until it closes.
 fn read_loop(sock: UdpSocket, tx: SyncSender<Datagram>, closed: Arc<AtomicBool>) {
     let mut buf = vec![0u8; 65536];
+    let mut backoff = crate::netretry::Backoff::default();
     while !closed.load(Ordering::SeqCst) {
         match sock.recv_from(&mut buf) {
             Ok((n, from)) => {
+                backoff.reset();
                 if tx.send((buf[..n].to_vec(), from)).is_err() {
                     return;
                 }
             }
             Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
-            Err(_) => std::thread::sleep(POLL),
+            Err(_) => std::thread::sleep(backoff.next()),
         }
     }
 }

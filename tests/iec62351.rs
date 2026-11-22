@@ -671,3 +671,56 @@ async fn tls_versions_and_mlkem_hybrid_compatibility() {
         (ProtocolVersion::TLSv1_3, NamedGroup::secp384r1)
     );
 }
+
+#[tokio::test]
+async fn server_security_events_record_tls_parameters_and_handshake_failure() {
+    use iec61850::secevent::{Dispatcher, Kind};
+    use tokio::io::AsyncWriteExt;
+
+    let mut root = Ca::new("tls-events");
+    let server_id = root.issue("ied1", None, &[]);
+    let client_id = root.issue("scada", None, &[]);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let events = Dispatcher::new(16, Arc::new(move |event| { let _ = tx.send(event); })).unwrap();
+    let model = scl::load_model(
+        concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/simpleIO_direct_control.cid"),
+        &scl::BuildOptions::new(),
+    ).unwrap();
+    let server = Server::new(model, ServerOptions::new()
+        .with_tls(iec62351::server_config(options(&server_id, &[&root])).unwrap())
+        .with_security_events(events));
+    let listener = server.bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    let serving = server.clone();
+    let task = tokio::spawn(async move { serving.serve(listener).await.unwrap() });
+
+    let mut raw = tokio::net::TcpStream::connect(&address).await.unwrap();
+    raw.write_all(&[3, 0, 0, 7, 2, 0xf0, 0x80]).await.unwrap();
+    raw.shutdown().await.unwrap();
+    dial(&address, options(&client_id, &[&root])).await.unwrap();
+
+    let (failed, established) = tokio::time::timeout(Duration::from_secs(3), async {
+        let (mut failed, mut established) = (None, None);
+        loop {
+            let event = rx.recv().await.unwrap();
+            match event.kind {
+                Kind::TlsHandshakeFailed => failed = Some(event),
+                Kind::AssocEstablished => established = Some(event),
+                _ => {}
+            }
+            if let (Some(failed), Some(established)) = (&failed, &established) {
+                break (failed.clone(), established.clone());
+            }
+        }
+    }).await.unwrap();
+    assert_eq!(failed.protocol, "tls");
+    assert_ne!(failed.session_id, established.session_id);
+    let tls = established.peer.unwrap().tls.unwrap();
+    assert_eq!(tls.version, Some(0x0304));
+    assert!(tls.cipher_suite.is_some());
+    use sha2::{Digest, Sha256};
+    assert_eq!(tls.fingerprint_sha256, Some(format!("{:x}", Sha256::digest(client_id.chain[0].as_ref()))));
+
+    server.close().await.unwrap();
+    task.await.unwrap();
+}

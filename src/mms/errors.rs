@@ -239,6 +239,10 @@ pub enum Error {
     Closed,
     #[error("mms: request timed out")]
     Timeout,
+    #[error("mms: TPKT frame completion timed out")]
+    FrameTimeout,
+    #[error("mms: association idle")]
+    IdleTimeout,
     /// The outbound unconfirmed queue was saturated and the report was
     /// dropped. A buffered RCB answers this by setting `BufOvfl`.
     #[error("mms: unconfirmed queue full")]
@@ -290,6 +294,8 @@ impl Error {
             Error::Aborted(s) => Error::Aborted(s.clone()),
             Error::Closed => Error::Closed,
             Error::Timeout => Error::Timeout,
+            Error::FrameTimeout => Error::FrameTimeout,
+            Error::IdleTimeout => Error::IdleTimeout,
             Error::NotDeleted => Error::NotDeleted,
             Error::ReportQueueFull => Error::ReportQueueFull,
             Error::AuthenticationRequired => Error::AuthenticationRequired,

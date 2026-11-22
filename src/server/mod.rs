@@ -12,6 +12,7 @@ mod handler;
 mod journal;
 mod rcb;
 mod reporting;
+mod security;
 #[allow(clippy::module_inception)]
 mod server;
 mod select;

@@ -12,6 +12,12 @@ use crate::{asn1::Oid, osi::acse};
 pub use association::{Association, PeerSecurity, Role};
 pub use codec::{AlgorithmIdentifier, Kind};
 pub use crypto::{Group, IcvAlgorithm, Identity};
+
+/// Checks the implemented Annex G end-entity certificate profile and returns
+/// the AE title from the subject. Chain verification is done separately.
+pub fn certificate_ae(der: &[u8]) -> Result<AeTitle> {
+    crypto::profile(der, false)
+}
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex},

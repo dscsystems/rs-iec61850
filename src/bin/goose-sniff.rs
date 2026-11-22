@@ -1,4 +1,4 @@
-//! Prints every GOOSE message seen on an interface.
+//! Prints live or simulated GOOSE messages seen on an interface.
 //!
 //! Needs CAP_NET_RAW (or root) and is Linux-only:
 //!
@@ -18,6 +18,7 @@ fn usage() -> ! {
   --iface NAME   interface to listen on (default eth0)
   --appid HEX    only show this APPID (for example 0x1000)
   --gocbref REF  only show this control block
+  --simulated    show simulated frames instead of live frames
   --quiet        one line per message, without the values
   --help"
     );
@@ -38,6 +39,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 filter.app_id = u16::from_str_radix(s, 16).unwrap_or_else(|_| usage());
             }
             "--gocbref" => filter.go_cb_ref = it.next().unwrap_or_else(|| usage()),
+            "--simulated" => filter.simulated = true,
             "--quiet" => quiet = true,
             "--help" | "-h" => usage(),
             other => {
@@ -66,6 +68,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             m.time_allowed_to_live,
             m.values.len()
         );
+        if m.simulation {
+            line.push_str(" SIMULATION");
+        }
         if m.test {
             line.push_str(" TEST");
         }

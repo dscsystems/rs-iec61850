@@ -206,7 +206,7 @@ impl FramingReader {
                     " by the peer".into()
                 }));
             }
-            Err(e) => return Err(e.into()),
+            Err(e) => return Err(super::frameguard::read_error(e)),
         };
         #[cfg(feature = "e2e")]
         if let Some(sec) = &self.security {

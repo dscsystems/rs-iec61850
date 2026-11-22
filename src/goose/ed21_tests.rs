@@ -238,6 +238,9 @@ async fn set_test_and_nds_com() {
     let flags: Vec<(bool, bool)> = m.iter().map(|m| (m.test, m.nds_com)).collect();
     assert_eq!(flags, [(false, false), (true, true), (false, true)]);
     assert_eq!(m[1].st_num, m[0].st_num);
+    assert_eq!(m[1].sq_num, m[0].sq_num + 1);
+    assert_eq!(m[1].t, m[0].t);
+    assert_eq!(m[2].sq_num, 0);
 }
 
 /// Without a goID the control block reference goes in its place.

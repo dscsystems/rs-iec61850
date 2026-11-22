@@ -227,6 +227,18 @@ fn smp_rate_follows_smp_mod() {
     .is_err());
 }
 
+#[test]
+fn a_per_second_sample_rate_requires_the_unit_on_the_wire() {
+    let (a, _) = ethernet::pipe();
+    let result = LePublisher::new(Arc::new(a), LeConfig {
+        sv_id: "MU01".into(),
+        smp_mod: SmpMod::SmpPerSec,
+        opts: AsduOpts { sample_rate: true, ..Default::default() },
+        ..Default::default()
+    });
+    assert!(matches!(result, Err(Error::Config(message)) if message.contains("smpMod")));
+}
+
 /// gmIdentity round-trips, follows set_gm_identity, and a wrong length is an
 /// error.
 #[test]

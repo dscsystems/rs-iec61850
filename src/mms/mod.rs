@@ -10,6 +10,8 @@ mod altaccess;
 mod client_ext;
 mod conn;
 mod errors;
+pub(crate) mod frameguard;
+pub(crate) use server_conn::accept_with_traffic;
 mod pdu;
 mod report;
 mod server_conn;

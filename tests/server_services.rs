@@ -290,3 +290,34 @@ async fn missing_report_blocks_are_errors_and_disable_releases_reservation() {
     second.enable_reporting(&rcb, |_| {}).await.unwrap().disable().await.unwrap();
     server.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn disable_retries_a_failed_report_write() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let (server, addr) = start(Options::new()).await;
+    let first = dial(&addr).await;
+    let blocks = first.logical_node_directory(format!("{LD}/LLN0"), iec61850::client::AcsiClass::Urcb).await.unwrap();
+    let reference = format!("{LD}/LLN0.RP.{}", blocks[0]);
+    let rcb = first.get_rcb(reference.clone()).await.unwrap();
+    let subscription = first.enable_reporting(&rcb, |_| {}).await.unwrap();
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let count = attempts.clone();
+    server.on_write(move |attribute, value| {
+        if attribute.name == "RptEna" && !value.as_bool() &&
+            count.fetch_add(1, Ordering::SeqCst) == 0
+        {
+            return Err(mms::DataAccessError::ObjectAccessDenied);
+        }
+        Ok(())
+    });
+    assert!(subscription.disable().await.is_err());
+    subscription.disable().await.unwrap();
+    subscription.disable().await.unwrap();
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    let second = dial(&addr).await;
+    let rcb = second.get_rcb(reference).await.unwrap();
+    second.enable_reporting(&rcb, |_| {}).await.unwrap().disable().await.unwrap();
+    server.close().await.unwrap();
+}
